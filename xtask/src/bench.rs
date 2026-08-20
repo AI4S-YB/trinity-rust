@@ -49,7 +49,8 @@ pub fn compute_metrics(
             let cov = te.saturating_sub(ts) as f64 / tl as f64;
             let score = cov * ident;
             let e = best.entry(t).or_insert(None);
-            if (*e).map_or(true, |(c, i)| score > c * i) {
+            #[allow(clippy::unnecessary_map_or)]
+            if e.map_or(true, |(c, i)| c * i < score) {
                 *e = Some((cov, ident));
             }
         }
