@@ -1,5 +1,7 @@
 # trinity-rust
 
+**[English](README_English.md)** | 中文
+
 Trinity RNA-Seq de novo assembler（原版 [Trinity v2.15.2](https://github.com/trinityrnaseq/trinityrnaseq)）主装配管线的 Rust 移植——从 in silico read normalization 到 Butterfly 转录本输出，端到端单二进制、无 Perl/Java/C++ 外部依赖（jellyfish / seqtk / ParaFly / Butterfly.jar 均不再需要）。
 
 ## 用法

@@ -21,7 +21,7 @@ for b in trinity-cli inchworm trinity-kmer trinity-chrysalis butterfly; do
   strip "$DIST/bin/${b}"
 done
 
-cp README.md "$DIST/"
+cp README.md README_English.md "$DIST/"
 cp docs/porting-map.md docs/benchmarks.md docs/backlog.md \
    docs/architecture-discovery.md \
    docs/athaliana-benchmark.md docs/athaliana-benchmark-hd.md \
