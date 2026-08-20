@@ -1,0 +1,16 @@
+digraph G {
+	PN1 [label="PN1^[2341, 4651, 1599]"]
+	PN1->PN3
+	PN1->PN4
+	PN10 [label="PN10^[3934, 2342]"]
+	PN2 [label="PN2^[2341, 5758, 1599]"]
+	PN2->PN3
+	PN2->PN4
+	PN3 [label="PN3^[1599, 5646, 3934]"]
+	PN3->PN9
+	PN3->PN10
+	PN4 [label="PN4^[1599, 3956, 3934]"]
+	PN4->PN9
+	PN4->PN10
+	PN9 [label="PN9^[3934, 3467]"]
+}

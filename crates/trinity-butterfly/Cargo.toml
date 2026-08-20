@@ -1,0 +1,9 @@
+[package]
+name = "trinity-butterfly"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+trinity-common = { path = "../trinity-common" }
+rustc-hash = { workspace = true }
+thiserror = { workspace = true }

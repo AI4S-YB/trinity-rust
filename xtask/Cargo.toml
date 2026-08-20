@@ -1,0 +1,11 @@
+[package]
+name = "xtask"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+
+[dependencies.trinity-butterfly]
+path = "../crates/trinity-butterfly"
+[dependencies.flate2]
+workspace = true

@@ -1,0 +1,1 @@
+number of reads threaded = 4336 (from total of 4342) which came from 2423 pairs

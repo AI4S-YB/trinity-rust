@@ -1,0 +1,12 @@
+[package]
+name = "trinity-cli"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+trinity-common = { path = "../trinity-common" }
+trinity-kmer = { path = "../trinity-kmer" }
+trinity-inchworm = { path = "../trinity-inchworm" }
+trinity-chrysalis = { path = "../trinity-chrysalis" }
+trinity-butterfly = { path = "../trinity-butterfly" }
+rayon = { workspace = true }

@@ -1,0 +1,9 @@
+[package]
+name = "trinity-kmer"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+trinity-common = { path = "../trinity-common" }
+rayon = { workspace = true }
+rustc-hash = { workspace = true }

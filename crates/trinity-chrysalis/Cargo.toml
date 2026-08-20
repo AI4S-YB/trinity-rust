@@ -1,0 +1,10 @@
+[package]
+name = "trinity-chrysalis"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+trinity-common = { path = "../trinity-common" }
+trinity-inchworm = { path = "../trinity-inchworm" }
+rayon = { workspace = true }
+rustc-hash = { workspace = true }

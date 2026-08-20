@@ -1,0 +1,8 @@
+[package]
+name = "trinity-common"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+thiserror = { workspace = true }
+flate2 = { workspace = true }

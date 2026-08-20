@@ -1,0 +1,91 @@
+EDGE_PRUNING::removeLightInEdges() removing the edge: GAGAGAATGTACGCAGTTGCACAC:W-1(V5645_D-1) GAGAGAATGTACGCAGTTGCACAC -> T:W-1(V3957_D-1) AGAGAATGTACGCAGTTGCACACT (weight: 1.0 <= e_edge_thr: 2.34, EDGE_THR=0.02
+PathNode Overlap Detected: [overlap:  1] PN3::[1599, 5646, 3934] extends or is contained by PN1::[2341, 4651, 1599]
+PathNode Overlap Detected: [overlap:  1] PN4::[1599, 3956, 3934] extends or is contained by PN1::[2341, 4651, 1599]
+PathNode Overlap Detected: [overlap:  2] PN7::[4651, 1599] extends or is contained by PN1::[2341, 4651, 1599]
+[0,10]   PathNode Overlap Detected: [overlap:  2] PN12::[2341, 4651] extends or is contained by PN1::[2341, 4651, 1599]
+PathNode Overlap Detected: [overlap:  1] PN13::[1599, 3956] extends or is contained by PN1::[2341, 4651, 1599]
+PathNode Overlap Detected: [overlap:  1] PN14::[1599, 5646] extends or is contained by PN1::[2341, 4651, 1599]
+PathNode Overlap Detected: [overlap:  1] PN16::[4651] extends or is contained by PN1::[2341, 4651, 1599]
+PathNode Overlap Detected: [overlap:  1] PN20::[2341] extends or is contained by PN1::[2341, 4651, 1599]
+[0,20]   PathNode Overlap Detected: [overlap:  1] PN21::[1599] extends or is contained by PN1::[2341, 4651, 1599]
+[1,0]   PathNode Overlap Detected: [overlap:  1] PN3::[1599, 5646, 3934] extends or is contained by PN2::[2341, 5758, 1599]
+PathNode Overlap Detected: [overlap:  1] PN4::[1599, 3956, 3934] extends or is contained by PN2::[2341, 5758, 1599]
+PathNode Overlap Detected: [overlap:  2] PN5::[5758, 1599] extends or is contained by PN2::[2341, 5758, 1599]
+[1,10]   PathNode Overlap Detected: [overlap:  2] PN11::[2341, 5758] extends or is contained by PN2::[2341, 5758, 1599]
+PathNode Overlap Detected: [overlap:  1] PN13::[1599, 3956] extends or is contained by PN2::[2341, 5758, 1599]
+PathNode Overlap Detected: [overlap:  1] PN14::[1599, 5646] extends or is contained by PN2::[2341, 5758, 1599]
+PathNode Overlap Detected: [overlap:  1] PN20::[2341] extends or is contained by PN2::[2341, 5758, 1599]
+[1,20]   PathNode Overlap Detected: [overlap:  1] PN21::[1599] extends or is contained by PN2::[2341, 5758, 1599]
+[2,0]   PathNode Overlap Detected: [overlap:  2] PN6::[5646, 3934] extends or is contained by PN3::[1599, 5646, 3934]
+PathNode Overlap Detected: [overlap:  1] PN9::[3934, 3467] extends or is contained by PN3::[1599, 5646, 3934]
+PathNode Overlap Detected: [overlap:  1] PN10::[3934, 2342] extends or is contained by PN3::[1599, 5646, 3934]
+[2,10]   PathNode Overlap Detected: [overlap:  2] PN14::[1599, 5646] extends or is contained by PN3::[1599, 5646, 3934]
+PathNode Overlap Detected: [overlap:  1] PN15::[5646] extends or is contained by PN3::[1599, 5646, 3934]
+PathNode Overlap Detected: [overlap:  1] PN17::[3934] extends or is contained by PN3::[1599, 5646, 3934]
+[2,20]   PathNode Overlap Detected: [overlap:  1] PN21::[1599] extends or is contained by PN3::[1599, 5646, 3934]
+[3,0]   PathNode Overlap Detected: [overlap:  2] PN8::[3956, 3934] extends or is contained by PN4::[1599, 3956, 3934]
+PathNode Overlap Detected: [overlap:  1] PN9::[3934, 3467] extends or is contained by PN4::[1599, 3956, 3934]
+PathNode Overlap Detected: [overlap:  1] PN10::[3934, 2342] extends or is contained by PN4::[1599, 3956, 3934]
+[3,10]   PathNode Overlap Detected: [overlap:  2] PN13::[1599, 3956] extends or is contained by PN4::[1599, 3956, 3934]
+PathNode Overlap Detected: [overlap:  1] PN17::[3934] extends or is contained by PN4::[1599, 3956, 3934]
+[3,20]   PathNode Overlap Detected: [overlap:  1] PN21::[1599] extends or is contained by PN4::[1599, 3956, 3934]
+[4,0]   PathNode Overlap Detected: [overlap:  1] PN3::[1599, 5646, 3934] extends or is contained by PN5::[5758, 1599]
+PathNode Overlap Detected: [overlap:  1] PN4::[1599, 3956, 3934] extends or is contained by PN5::[5758, 1599]
+[4,10]   PathNode Overlap Detected: [overlap:  1] PN13::[1599, 3956] extends or is contained by PN5::[5758, 1599]
+PathNode Overlap Detected: [overlap:  1] PN14::[1599, 5646] extends or is contained by PN5::[5758, 1599]
+[4,20]   PathNode Overlap Detected: [overlap:  1] PN21::[1599] extends or is contained by PN5::[5758, 1599]
+[5,0]   PathNode Overlap Detected: [overlap:  1] PN9::[3934, 3467] extends or is contained by PN6::[5646, 3934]
+PathNode Overlap Detected: [overlap:  1] PN10::[3934, 2342] extends or is contained by PN6::[5646, 3934]
+[5,10]   PathNode Overlap Detected: [overlap:  1] PN15::[5646] extends or is contained by PN6::[5646, 3934]
+PathNode Overlap Detected: [overlap:  1] PN17::[3934] extends or is contained by PN6::[5646, 3934]
+[6,0]   PathNode Overlap Detected: [overlap:  1] PN3::[1599, 5646, 3934] extends or is contained by PN7::[4651, 1599]
+PathNode Overlap Detected: [overlap:  1] PN4::[1599, 3956, 3934] extends or is contained by PN7::[4651, 1599]
+[6,10]   PathNode Overlap Detected: [overlap:  1] PN13::[1599, 3956] extends or is contained by PN7::[4651, 1599]
+PathNode Overlap Detected: [overlap:  1] PN14::[1599, 5646] extends or is contained by PN7::[4651, 1599]
+PathNode Overlap Detected: [overlap:  1] PN16::[4651] extends or is contained by PN7::[4651, 1599]
+[6,20]   PathNode Overlap Detected: [overlap:  1] PN21::[1599] extends or is contained by PN7::[4651, 1599]
+[7,0]   PathNode Overlap Detected: [overlap:  1] PN9::[3934, 3467] extends or is contained by PN8::[3956, 3934]
+PathNode Overlap Detected: [overlap:  1] PN10::[3934, 2342] extends or is contained by PN8::[3956, 3934]
+[7,10]   PathNode Overlap Detected: [overlap:  1] PN17::[3934] extends or is contained by PN8::[3956, 3934]
+[8,10]   PathNode Overlap Detected: [overlap:  1] PN17::[3934] extends or is contained by PN9::[3934, 3467]
+PathNode Overlap Detected: [overlap:  1] PN18::[3467] extends or is contained by PN9::[3934, 3467]
+[9,10]   PathNode Overlap Detected: [overlap:  1] PN17::[3934] extends or is contained by PN10::[3934, 2342]
+PathNode Overlap Detected: [overlap:  1] PN19::[2342] extends or is contained by PN10::[3934, 2342]
+[10,0]   PathNode Overlap Detected: [overlap:  1] PN5::[5758, 1599] extends or is contained by PN11::[2341, 5758]
+PathNode Overlap Detected: [overlap:  1] PN20::[2341] extends or is contained by PN11::[2341, 5758]
+[11,0]   PathNode Overlap Detected: [overlap:  1] PN7::[4651, 1599] extends or is contained by PN12::[2341, 4651]
+[11,10]   PathNode Overlap Detected: [overlap:  1] PN16::[4651] extends or is contained by PN12::[2341, 4651]
+PathNode Overlap Detected: [overlap:  1] PN20::[2341] extends or is contained by PN12::[2341, 4651]
+[12,0]   PathNode Overlap Detected: [overlap:  1] PN8::[3956, 3934] extends or is contained by PN13::[1599, 3956]
+[12,20]   PathNode Overlap Detected: [overlap:  1] PN21::[1599] extends or is contained by PN13::[1599, 3956]
+[13,0]   PathNode Overlap Detected: [overlap:  1] PN6::[5646, 3934] extends or is contained by PN14::[1599, 5646]
+[13,10]   PathNode Overlap Detected: [overlap:  1] PN15::[5646] extends or is contained by PN14::[1599, 5646]
+[13,20]   PathNode Overlap Detected: [overlap:  1] PN21::[1599] extends or is contained by PN14::[1599, 5646]
+PathNodeDescription: PN9::[3934, 3467]
+PathNodeDescription: PN10::[3934, 2342]
+PathNodeDescription: PN1::[2341, 4651, 1599]
+PathNodeDescription: PN3::[1599, 5646, 3934]
+PathNodeDescription: PN2::[2341, 5758, 1599]
+PathNodeDescription: PN4::[1599, 3956, 3934]
+# ZipMergeRounds
+## Round: 1 Zipping up.
+Zip up merged: 0 nodes.
+## Round: 2 Zipping down.
+Zip down merged: 2 nodes.
+## Round: 3 Zipping down.
+Zip down merged: 3 nodes.
+## Round: 4 Zipping down.
+Zip down merged: 3 nodes.
+## Round: 5 Zipping down.
+Zip down merged: 2 nodes.
+## Round: 6 Zipping down.
+Zip down merged: 0 nodes.
+## Round: 7 Zipping up.
+Zip up merged: 0 nodes.
+## Round: 8 Zipping down.
+Zip down merged: 0 nodes.
+# ZipMergeRounds
+## Round: 1 Zipping up.
+Zip up merged: 0 nodes.
+## Round: 2 Zipping down.
+Zip down merged: 0 nodes.

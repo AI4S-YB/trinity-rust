@@ -1,0 +1,9 @@
+acc	median_cov	mean_cov	stdev	tid
+edge_short_20bp	0	0	-0	thread:0
+edge_with_N	7	5	3.31662	thread:0
+edge_dup_a	3	3.25	0.5	thread:0
+edge_dup_b	3	3.25	0.5	thread:0
+edge_lowercase	8	7.57143	0.534522	thread:0
+edge_wrapped	1	1.30556	0.624245	thread:0
+edge_exact25	1	1	-nan	thread:0
+edge_dup_c	3	3.25	0.5	thread:0
