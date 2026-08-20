@@ -26,7 +26,7 @@ pub fn compute_metrics(
     ref_lens: &HashMap<String, usize>,
     denovo_lens: &HashMap<String, usize>,
 ) -> Metrics {
-    let mut best: HashMap<&str, (f64, f64)> = HashMap::new(); // ref -> (best cov, best ident)（按 cov*ident 取）
+    let mut best: HashMap<&str, Option<(f64, f64)>> = HashMap::new(); // ref -> best (cov, ident)（按 cov*ident 取）; None=未见命中
     let mut qhit: HashMap<&str, usize> = HashMap::new();
     for line in paf.lines() {
         let f: Vec<&str> = line.split('\t').collect();
@@ -48,9 +48,9 @@ pub fn compute_metrics(
         if let Some(&tl) = ref_lens.get(t) {
             let cov = te.saturating_sub(ts) as f64 / tl as f64;
             let score = cov * ident;
-            let e = best.entry(t).or_insert((-1.0, 0.0));
-            if score > e.0 * e.1 {
-                *e = (cov, ident);
+            let e = best.entry(t).or_insert(None);
+            if (*e).map_or(true, |(c, i)| score > c * i) {
+                *e = Some((cov, ident));
             }
         }
         if ident >= 0.95 {
@@ -64,7 +64,7 @@ pub fn compute_metrics(
     let refs_total = ref_lens.len();
     let mut r_full = 0usize;
     let mut r70 = 0usize;
-    for (_, &(cov, ident)) in best.iter() {
+    for &(cov, ident) in best.values().flatten() {
         if cov >= 0.95 && ident >= 0.95 {
             r_full += 1;
         }
@@ -255,6 +255,14 @@ pub fn run(argv: &[String]) -> i32 {
         .arg(&final_fa)
         .output()
         .expect("无法启动 minimap2");
+    if !paf.status.success() {
+        eprintln!(
+            "minimap2 失败 ({})\n{}",
+            paf.status,
+            String::from_utf8_lossy(&paf.stderr)
+        );
+        return 1;
+    }
     let paf = String::from_utf8_lossy(&paf.stdout).to_string();
     let ref_lens = read_fasta_lens(std::path::Path::new(&reff)).unwrap();
     let dn = read_fasta_lens(&final_fa).unwrap();
