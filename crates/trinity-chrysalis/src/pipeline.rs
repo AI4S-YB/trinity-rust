@@ -38,6 +38,9 @@ pub struct ChrysalisParams {
     pub max_reads: u64,
     /// `-t`：QuantifyGraph 阶段 rayon 线程池大小。
     pub threads: usize,
+    /// 跳过 QuantifyGraph（phase-2 分割点）：止于分区，保留 c*.graph.tmp /
+    /// c*.reads.tmp 供递归模式逐分区消费（默认 false，行为不变）。
+    pub skip_quantify: bool,
 }
 
 impl Default for ChrysalisParams {
@@ -49,6 +52,7 @@ impl Default for ChrysalisParams {
             graphs_per_partition: 1000,
             max_reads: 200_000,
             threads: 1,
+            skip_quantify: false,
         }
     }
 }
@@ -137,42 +141,46 @@ pub fn run_chrysalis_pipeline(
     )?;
 
     // 6. QuantifyGraph 逐组件（rayon 并行，组件独立）
-    println!(
-        "-running QuantifyGraph on {} components ({} threads)...",
-        listing.len(),
-        p.threads
-    );
-    let qg = QgParams {
-        strand: p.strand,
-        max_reads: p.max_reads as i64,
-        ..Default::default()
-    };
-    let failures: Vec<String> = {
-        let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(p.threads.max(1))
-            .build()
-            .map_err(|e| CommonError::Parse(format!("cannot build thread pool: {e}")))?;
-        pool.install(|| {
-            listing
-                .par_iter()
-                .filter_map(|(_, base)| {
-                    let g = base.with_extension("graph.tmp");
-                    let r = base.with_extension("reads.tmp");
-                    let out = base.with_extension("graph.out");
-                    match run_quantify_for_all(&g, &r, &out, &qg) {
-                        Ok(()) => None,
-                        Err(e) => Some(format!("{}: {e}", base.display())),
-                    }
-                })
-                .collect()
-        })
-    };
-    if !failures.is_empty() {
-        return Err(CommonError::Parse(format!(
-            "QuantifyGraph failed for {} components: {}",
-            failures.len(),
-            failures.join("; ")
-        )));
+    //    skip_quantify: 递归模式分割点——止于分区, 保留 .tmp（run_quantify_for_all
+    //    成功后会删 .tmp 输入, skip 分支不进入该函数）
+    if !p.skip_quantify {
+        println!(
+            "-running QuantifyGraph on {} components ({} threads)...",
+            listing.len(),
+            p.threads
+        );
+        let qg = QgParams {
+            strand: p.strand,
+            max_reads: p.max_reads as i64,
+            ..Default::default()
+        };
+        let failures: Vec<String> = {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(p.threads.max(1))
+                .build()
+                .map_err(|e| CommonError::Parse(format!("cannot build thread pool: {e}")))?;
+            pool.install(|| {
+                listing
+                    .par_iter()
+                    .filter_map(|(_, base)| {
+                        let g = base.with_extension("graph.tmp");
+                        let r = base.with_extension("reads.tmp");
+                        let out = base.with_extension("graph.out");
+                        match run_quantify_for_all(&g, &r, &out, &qg) {
+                            Ok(()) => None,
+                            Err(e) => Some(format!("{}: {e}", base.display())),
+                        }
+                    })
+                    .collect()
+            })
+        };
+        if !failures.is_empty() {
+            return Err(CommonError::Parse(format!(
+                "QuantifyGraph failed for {} components: {}",
+                failures.len(),
+                failures.join("; ")
+            )));
+        }
     }
     println!(
         "-chrysalis-all complete: {} components in {}",
@@ -195,4 +203,35 @@ fn run_quantify_for_all(g: &Path, r: &Path, out: &Path, p: &QgParams) -> Result<
     let _ = std::fs::remove_file(g);
     let _ = std::fs::remove_file(r);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn skip_quantify_stops_after_partition() {
+        // 用 fixtures/p3 的小输入（gff.iworm.fa + gff.reads.fa）
+        let root = concat!(env!("CARGO_MANIFEST_DIR"), "/../../fixtures/p3/");
+        let iworm = std::fs::read(format!("{root}gff.iworm.fa")).unwrap();
+        let reads = std::fs::read(format!("{root}gff.reads.fa")).unwrap();
+        let dir = std::env::temp_dir().join("chry_skip_quantify_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        let listing = run_chrysalis_pipeline(
+            &iworm,
+            &reads,
+            &dir,
+            &ChrysalisParams {
+                skip_quantify: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(!listing.is_empty());
+        // .tmp 在（递归模式要读）; .out 不在（quantify 未跑）; .tmp 未被清理
+        let c0 = dir.join("Component_bins/Cbin0/c0");
+        assert!(c0.with_extension("graph.tmp").exists());
+        assert!(c0.with_extension("reads.tmp").exists());
+        assert!(!c0.with_extension("graph.out").exists());
+    }
 }
