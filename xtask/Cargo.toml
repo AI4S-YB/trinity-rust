@@ -9,3 +9,5 @@ edition.workspace = true
 path = "../crates/trinity-butterfly"
 [dependencies.flate2]
 workspace = true
+[dependencies.sha2]
+version = "0.10"

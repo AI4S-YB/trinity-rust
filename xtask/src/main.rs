@@ -17,6 +17,7 @@ fn main() {
         Some("xcheck-chrysalis") => xcheck_chrysalis(&args[1..]),
         Some("xcheck-butterfly") => xcheck_butterfly(&args[1..]),
         Some("eval-trinity") => eval_trinity_cmd(&args[1..]),
+        Some("bench") => std::process::exit(crate::bench::run(&args[1..])),
         Some("xcheck-trinity") => xcheck_trinity(&args[1..]),
         Some(other) => {
             eprintln!(
