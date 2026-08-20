@@ -1,3 +1,4 @@
+<!-- 并发注意: 禁止同 key 并发 bench（缓存目录互踩） -->
 # M0 基线 F1 表（classic 默认参数，minimap2 评估）
 
 | 日期 | tag | R / P / F1 | N50 / n | 参数 |
@@ -11,3 +12,5 @@
 
 - 2026-08-20 备注数据集: dev1(chr5-hd) reads 5.8M 对, 参照 8,712 条; dev2(chr1-hd) reads 5,653,289 对, 参照 9,955 条; dev3(chr3-hd) reads 5,285,621 对, 参照 7,578 条; holdout(chr5-ld) reads 205K 对, 参照 5,364 条; StringTie 引导模式无警告
 - 口径校验: baseline-dev1 R=8.2%/P=80.5% vs 旧报告 8.3%/80.5%（docs/athaliana-benchmark-hd.md，单条最佳命中 cov×id 同口径），偏差 0.1pp，在 ±0.5pp 容差内
+| 2026-08-20 | smoke-recache | R=8.2% P=80.5% **F1=14.9%** | N50=1833 n=7826 | --max_memory 8G --CPU 8 |
+- 2026-08-20 dev1sub=dev1 前 2M 对（reads/dev1sub_{1,2}.fq.gz 各 8,000,000 行已 wc 校验）, R 数字与全量不可直接比, 仅用于组合排序

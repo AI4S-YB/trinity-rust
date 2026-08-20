@@ -215,6 +215,10 @@ pub fn run(argv: &[String]) -> i32 {
     }
     // 键与缓存
     let bin_path = concat!(env!("CARGO_MANIFEST_DIR"), "/../target/release/trinity-cli");
+    if !std::path::Path::new(bin_path).exists() {
+        eprintln!("Error: 未找到 {bin_path} —— 先 cargo build --release -p trinity-cli");
+        return 1;
+    }
     let bin = std::fs::read(bin_path).unwrap_or_default();
     let rcontents: Vec<Vec<u8>> = read_files
         .iter()
@@ -268,10 +272,35 @@ pub fn run(argv: &[String]) -> i32 {
     let ref_lens = read_fasta_lens(std::path::Path::new(&reff)).unwrap();
     let dn = read_fasta_lens(&final_fa).unwrap();
     let m = compute_metrics(&paf, &ref_lens, &dn);
+    // 指标落盘 cache/<key>/metrics.json（手写 JSON, 与 stdout 同口径; sweep 汇总用）
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("metrics.json"),
+        format!(
+            "{{\"tag\":\"{tag}\",\"date\":\"{}\",\"r_full\":{:.4},\"r70\":{:.4},\"precision\":{:.4},\"f1\":{:.4},\"n50\":{},\"n\":{},\"args\":\"{}\"}}\n",
+            chrono_free_date(),
+            m.r_full,
+            m.r70,
+            m.precision,
+            m.f1,
+            m.n50,
+            m.denovo_total,
+            passthrough.join(" ")
+        ),
+    )
+    .unwrap();
     // 报告 + 日志
     println!("== bench[{tag}] {key} ==\n  转录本 {}/{} | R={:.1}% R70={:.1}% P={:.1}% F1={:.1}% | N50={}",
         m.denovo_total, m.refs_total, 100.0*m.r_full, 100.0*m.r70, 100.0*m.precision, 100.0*m.f1, m.n50);
     let log = concat!(env!("CARGO_MANIFEST_DIR"), "/../docs/opt-log.md");
+    // 文件头并发注释（幂等: 已存在则不重复）
+    {
+        let marker = "<!-- 并发注意: 禁止同 key 并发 bench（缓存目录互踩） -->\n";
+        let cur = std::fs::read_to_string(log).unwrap_or_default();
+        if !cur.contains("禁止同 key 并发 bench") {
+            std::fs::write(log, format!("{marker}{cur}")).unwrap();
+        }
+    }
     let row = format!(
         "| {} | {} | R={:.1}% P={:.1}% **F1={:.1}%** | N50={} n={} | {} |\n",
         chrono_free_date(),
