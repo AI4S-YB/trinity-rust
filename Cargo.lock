@@ -238,7 +238,7 @@ dependencies = [
 
 [[package]]
 name = "trinity-butterfly"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "rustc-hash",
  "thiserror",
@@ -247,7 +247,7 @@ dependencies = [
 
 [[package]]
 name = "trinity-chrysalis"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "rayon",
  "rustc-hash",
@@ -257,7 +257,7 @@ dependencies = [
 
 [[package]]
 name = "trinity-cli"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "rayon",
  "trinity-butterfly",
@@ -269,7 +269,7 @@ dependencies = [
 
 [[package]]
 name = "trinity-common"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "flate2",
  "thiserror",
@@ -277,7 +277,7 @@ dependencies = [
 
 [[package]]
 name = "trinity-inchworm"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "dashmap",
  "rayon",
@@ -287,7 +287,7 @@ dependencies = [
 
 [[package]]
 name = "trinity-kmer"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "rayon",
  "rustc-hash",
@@ -308,7 +308,7 @@ checksum = "f0805222e57f7521d6a62e36fa9163bc891acd422f971defe97d64e70d0a4fe5"
 
 [[package]]
 name = "xtask"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "flate2",
  "trinity-butterfly",
