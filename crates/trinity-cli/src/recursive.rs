@@ -69,80 +69,82 @@ pub fn run_mini(reads_tmp: &[u8], p: &MiniParams) -> Result<MiniOut, CommonError
     fs::create_dir_all(&tmp)?;
     // catch_unwind: panic（深递归/数据异常）时也能落到下方 remove_dir_all
     // 清理临时目录（栈修复后分区 job 不再 abort, 该路径真正生效）。
-    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<MiniOut, CommonError> {
-        // ① inchworm from reads（phase-2: --reads 装载, 内置 kmer 目录）
-        let (mut counter, _parsed) = populate_from_reads(reads_tmp, p.k, !p.strand)?;
-        // phase-2 剪枝实参（见函数文档）: min_count=max(min_kmer_count,1),
-        // min_entropy=0.0, prune_error_kmers=true, min_ratio_non_error=0.005
-        prune_some_kmers(&mut counter, p.min_kmer_count.max(1), 0.0, true, 0.005);
-        // ② 单线程排序种子组装（NO_PARALLEL_IWORM——phase-2 强制, inchworm_cpu=1）
-        let mut buf = Vec::new();
-        compute_sequence_assemblies(
-            &mut counter,
-            &IrkeParams::default(),
-            &AssemblyParams {
-                min_assembly_length: p.k,
-                ..Default::default()
-            },
-            &Monitor::new(0),
-            true, // sort_seeds
-            &mut buf,
-        )?;
-        // ③ min100（与主线 phase-1 相同: filter_iworm_by_min_length_or_cov.pl 100 10）
-        let iworm = filter_iworm_min_len_or_cov(&buf, 100, 10)?;
-        if iworm.is_empty() {
-            return Ok(MiniOut {
-                fasta: Vec::new(),
-                n_partitions_run: 1,
-            });
-        }
-        // ④ chrysalis 全链（phase-2 pct→50 钳制 = 默认; threads 1）
-        let listing = run_chrysalis_pipeline(
-            &iworm,
-            reads_tmp,
-            &tmp.join("chry"),
-            &ChrysalisParams {
-                strand: p.strand,
-                min_contig_length: p.min_contig_length,
-                pct_required: 50,
-                threads: 1,
-                ..Default::default()
-            },
-        )?;
-        // ⑤ butterfly 每组件（run_component 自带大栈线程）; 组件名带分区前缀
-        //    → header `{name}_c{comp}_g.._i..`, 跨分区唯一且匹配 gene_trans_map 正则
-        let mut fasta = Vec::new();
-        for (_id, base) in &listing {
-            let g = fs::read_to_string(base.with_extension("graph.out"))
-                .map_err(|e| CommonError::Parse(format!("mini graph.out read: {e}")))?;
-            let r = fs::read_to_string(base.with_extension("graph.reads"))
-                .map_err(|e| CommonError::Parse(format!("mini graph.reads read: {e}")))?;
-            let comp_name = format!(
-                "{}_{}",
-                p.name,
-                base.file_name().unwrap_or_default().to_string_lossy()
-            );
-            let out = run_component(
-                &g,
-                &r,
-                &ComponentParams {
-                    n: 100_000,
-                    min_len: p.min_contig_length,
-                    max_pair_distance: p.max_pair_distance,
-                    no_em_reduce: true,
-                    path_reinforcement_distance: Some(p.path_reinforcement_distance),
-                    name: comp_name,
-                    stack_size: p.stack_size_mb.saturating_mul(1024 * 1024),
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+        || -> Result<MiniOut, CommonError> {
+            // ① inchworm from reads（phase-2: --reads 装载, 内置 kmer 目录）
+            let (mut counter, _parsed) = populate_from_reads(reads_tmp, p.k, !p.strand)?;
+            // phase-2 剪枝实参（见函数文档）: min_count=max(min_kmer_count,1),
+            // min_entropy=0.0, prune_error_kmers=true, min_ratio_non_error=0.005
+            prune_some_kmers(&mut counter, p.min_kmer_count.max(1), 0.0, true, 0.005);
+            // ② 单线程排序种子组装（NO_PARALLEL_IWORM——phase-2 强制, inchworm_cpu=1）
+            let mut buf = Vec::new();
+            compute_sequence_assemblies(
+                &mut counter,
+                &IrkeParams::default(),
+                &AssemblyParams {
+                    min_assembly_length: p.k,
+                    ..Default::default()
+                },
+                &Monitor::new(0),
+                true, // sort_seeds
+                &mut buf,
+            )?;
+            // ③ min100（与主线 phase-1 相同: filter_iworm_by_min_length_or_cov.pl 100 10）
+            let iworm = filter_iworm_min_len_or_cov(&buf, 100, 10)?;
+            if iworm.is_empty() {
+                return Ok(MiniOut {
+                    fasta: Vec::new(),
+                    n_partitions_run: 1,
+                });
+            }
+            // ④ chrysalis 全链（phase-2 pct→50 钳制 = 默认; threads 1）
+            let listing = run_chrysalis_pipeline(
+                &iworm,
+                reads_tmp,
+                &tmp.join("chry"),
+                &ChrysalisParams {
+                    strand: p.strand,
+                    min_contig_length: p.min_contig_length,
+                    pct_required: 50,
+                    threads: 1,
                     ..Default::default()
                 },
             )?;
-            fasta.extend_from_slice(out.all_prob_paths_fasta.as_bytes());
-        }
-        Ok(MiniOut {
-            fasta,
-            n_partitions_run: 1,
-        })
-    }))
+            // ⑤ butterfly 每组件（run_component 自带大栈线程）; 组件名带分区前缀
+            //    → header `{name}_c{comp}_g.._i..`, 跨分区唯一且匹配 gene_trans_map 正则
+            let mut fasta = Vec::new();
+            for (_id, base) in &listing {
+                let g = fs::read_to_string(base.with_extension("graph.out"))
+                    .map_err(|e| CommonError::Parse(format!("mini graph.out read: {e}")))?;
+                let r = fs::read_to_string(base.with_extension("graph.reads"))
+                    .map_err(|e| CommonError::Parse(format!("mini graph.reads read: {e}")))?;
+                let comp_name = format!(
+                    "{}_{}",
+                    p.name,
+                    base.file_name().unwrap_or_default().to_string_lossy()
+                );
+                let out = run_component(
+                    &g,
+                    &r,
+                    &ComponentParams {
+                        n: 100_000,
+                        min_len: p.min_contig_length,
+                        max_pair_distance: p.max_pair_distance,
+                        no_em_reduce: true,
+                        path_reinforcement_distance: Some(p.path_reinforcement_distance),
+                        name: comp_name,
+                        stack_size: p.stack_size_mb.saturating_mul(1024 * 1024),
+                        ..Default::default()
+                    },
+                )?;
+                fasta.extend_from_slice(out.all_prob_paths_fasta.as_bytes());
+            }
+            Ok(MiniOut {
+                fasta,
+                n_partitions_run: 1,
+            })
+        },
+    ))
     .unwrap_or_else(|_| {
         Err(CommonError::Parse(
             "mini pipeline panic（深递归/数据异常）".to_string(),
@@ -487,16 +489,19 @@ mod tests {
         let out = std::thread::Builder::new()
             .stack_size(256 * 1024 * 1024)
             .spawn(move || {
-                run_mini(&data2, &MiniParams {
-                    k: 25,
-                    strand: false,
-                    min_contig_length: 100,
-                    path_reinforcement_distance: 25,
-                    max_pair_distance: 500,
-                    min_kmer_count: 1,
-                    stack_size_mb: 256,
-                    name: "c1428".to_string(),
-                })
+                run_mini(
+                    &data2,
+                    &MiniParams {
+                        k: 25,
+                        strand: false,
+                        min_contig_length: 100,
+                        path_reinforcement_distance: 25,
+                        max_pair_distance: 500,
+                        min_kmer_count: 1,
+                        stack_size_mb: 256,
+                        name: "c1428".to_string(),
+                    },
+                )
             })
             .expect("spawn")
             .join()
