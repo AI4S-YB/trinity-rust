@@ -67,7 +67,9 @@ pub fn run_mini(reads_tmp: &[u8], p: &MiniParams) -> Result<MiniOut, CommonError
     let tmp = std::env::temp_dir().join(format!("mini_{}_{n}", std::process::id()));
     let _ = fs::remove_dir_all(&tmp);
     fs::create_dir_all(&tmp)?;
-    let r = (|| -> Result<MiniOut, CommonError> {
+    // catch_unwind: panic（深递归/数据异常）时也能落到下方 remove_dir_all
+    // 清理临时目录（栈修复后分区 job 不再 abort, 该路径真正生效）。
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<MiniOut, CommonError> {
         // ① inchworm from reads（phase-2: --reads 装载, 内置 kmer 目录）
         let (mut counter, _parsed) = populate_from_reads(reads_tmp, p.k, !p.strand)?;
         // phase-2 剪枝实参（见函数文档）: min_count=max(min_kmer_count,1),
@@ -140,7 +142,12 @@ pub fn run_mini(reads_tmp: &[u8], p: &MiniParams) -> Result<MiniOut, CommonError
             fasta,
             n_partitions_run: 1,
         })
-    })();
+    }))
+    .unwrap_or_else(|_| {
+        Err(CommonError::Parse(
+            "mini pipeline panic（深递归/数据异常）".to_string(),
+        ))
+    });
     let _ = fs::remove_dir_all(&tmp);
     r
 }
@@ -195,6 +202,13 @@ pub fn run_partition_pool(
         })
         .collect();
 
+    // 大分区优先（reads.tmp 字节数降序）: 最重/最易失败的任务先暴露问题,
+    // 也让长尾分区填充尾部空闲槽位。
+    let mut jobs = jobs;
+    jobs.sort_by_key(|(_, _, reads_tmp)| {
+        std::cmp::Reverse(fs::metadata(reads_tmp).map(|m| m.len()).unwrap_or(0))
+    });
+
     pool.install(|| {
         jobs.par_iter().for_each(|(id, mini_fa, reads_tmp)| {
             if mini_fa.exists() {
@@ -211,7 +225,25 @@ pub fn run_partition_pool(
                     return;
                 }
             };
-            match run_mini(&data, &mini_params_from_args(args, *id)) {
+            // 大栈线程（对齐 run_component）: rayon worker 默认 ~2MB 栈,
+            // inchworm/chrysalis 的排序与种子扩展递归在真数据分区上会溢出。
+            // rayon 池保持 args.cpu 路由; 每分区 job 由专用线程执行 run_mini。
+            let params = mini_params_from_args(args, *id);
+            let handle = std::thread::Builder::new()
+                .stack_size(256 * 1024 * 1024)
+                .spawn(move || run_mini(&data, &params));
+            let res = match handle {
+                Ok(h) => match h.join() {
+                    Ok(r) => r,
+                    Err(_) => Err(CommonError::Parse(format!(
+                        "c{id}: mini job thread panic（深递归/数据异常）"
+                    ))),
+                },
+                Err(e) => Err(CommonError::Parse(format!(
+                    "c{id}: cannot spawn mini job thread: {e}"
+                ))),
+            };
+            match res {
                 Ok(out) => {
                     if let Err(e) = fs::write(mini_fa, &out.fasta) {
                         eprintln!("-read partition {id} failed: {e}");
@@ -391,6 +423,94 @@ mod tests {
             s.contains(">c0_c"),
             "header 应带分区前缀 c0_c*: {}",
             &s[..s.len().min(120)]
+        );
+    }
+
+    /// 真实大分区单跑计时（dev1sub c1428, ~9.4MB reads.tmp）:
+    /// `cargo test -p trinity-cli --release -- --ignored real_partition_timing --nocapture`
+    /// 分阶段计时复刻 run_mini 主体（populate → assembly → chrysalis → butterfly）。
+    #[test]
+    #[ignore]
+    fn real_partition_timing() {
+        let path = std::path::PathBuf::from(
+            "/tmp/rec_smoke/trinity_out/chrysalis/Component_bins/Cbin1/c1428.reads.tmp",
+        );
+        let data = match fs::read(&path) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("skip: cannot read {}: {e}", path.display());
+                return;
+            }
+        };
+        eprintln!("reads.tmp: {} bytes", data.len());
+        // 全程在 256MB 栈线程内（与 run_partition_pool job 一致）——测试线程
+        // 默认 2MB 栈会复现被修复的栈溢出。
+        let data0 = data.clone();
+        let staged = std::thread::Builder::new()
+            .stack_size(256 * 1024 * 1024)
+            .spawn(move || {
+                let t0 = std::time::Instant::now();
+                let (mut counter, _) =
+                    populate_from_reads(&data0, 25, true).expect("populate_from_reads");
+                prune_some_kmers(&mut counter, 1, 0.0, true, 0.005);
+                let t1 = std::time::Instant::now();
+                let mut buf = Vec::new();
+                compute_sequence_assemblies(
+                    &mut counter,
+                    &IrkeParams::default(),
+                    &AssemblyParams {
+                        min_assembly_length: 25,
+                        ..Default::default()
+                    },
+                    &Monitor::new(0),
+                    true,
+                    &mut buf,
+                )
+                .expect("inchworm");
+                let t2 = std::time::Instant::now();
+                let iworm = filter_iworm_min_len_or_cov(&buf, 100, 10).expect("min100");
+                eprintln!(
+                    "inchworm: raw {} contigs ({} bytes) → min100 {} bytes",
+                    buf.iter().filter(|&&b| b == b'>').count(),
+                    buf.len(),
+                    iworm.len()
+                );
+                (t0, t1, t2)
+            })
+            .expect("spawn staged")
+            .join()
+            .expect("join staged");
+        let (t0, t1, t2) = staged;
+        // 与 run_partition_pool 的 job 线程一致（256MB 栈）——测试线程默认 2MB
+        // 会复现被修复的栈溢出。
+        let data2 = data.clone();
+        let out = std::thread::Builder::new()
+            .stack_size(256 * 1024 * 1024)
+            .spawn(move || {
+                run_mini(&data2, &MiniParams {
+                    k: 25,
+                    strand: false,
+                    min_contig_length: 100,
+                    path_reinforcement_distance: 25,
+                    max_pair_distance: 500,
+                    min_kmer_count: 1,
+                    stack_size_mb: 256,
+                    name: "c1428".to_string(),
+                })
+            })
+            .expect("spawn")
+            .join()
+            .expect("join")
+            .expect("run_mini");
+        let t3 = std::time::Instant::now();
+        eprintln!(
+            "TIMING populate+prune={:?} inchworm_asm={:?} run_mini_total={:?} (chrysalis+butterfly={:?}) fasta={} bytes n_records={}",
+            t1 - t0,
+            t2 - t1,
+            t3 - t0,
+            (t3 - t0) - (t2 - t0),
+            out.fasta.len(),
+            out.fasta.iter().filter(|&&b| b == b'>').count()
         );
     }
 
