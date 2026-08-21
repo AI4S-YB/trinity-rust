@@ -30,6 +30,7 @@ use crate::butterfly_pool::{run_butterfly_pool, ButterflyPoolParams};
 use crate::checkpoint::{checkpoint_exists, run_with_checkpoint};
 use crate::harvest::harvest;
 use crate::prep::prep_reads;
+use crate::recursive::{harvest_mini, run_partition_pool};
 
 /// 原版 L2556 `SR_flag`（super_read_mode 关闭时为 "asm"）。
 const SR_FLAG: &str = "asm";
@@ -410,6 +411,13 @@ pub fn run_trinity(args: &TrinityArgs) -> Result<PathBuf, CommonError> {
     );
     let iworm_data = fs::read(&iworm_min100)?;
     let reads_data = fs::read(&target_fa)?;
+
+    // ---- 5/6/7. 递归模式（--recursive, M1）: phase-1 止于分区 → 迷你分区池
+    // ---- → 汇总（与 classic 的 chrysalis+butterfly+harvest 段并列）。 ----
+    if args.recursive {
+        return run_recursive(a, args, &outdir, &chrysalis_dir, &iworm_data, &reads_data);
+    }
+
     let mut listing_opt: Option<Vec<(u64, PathBuf)>> = None;
     let quantify_ok = outdir.join(".quantify_graph.ok");
     run_with_checkpoint(
@@ -494,6 +502,121 @@ pub fn run_trinity(args: &TrinityArgs) -> Result<PathBuf, CommonError> {
             &target_fa,
             &counts_bin,
             &kmer_fa,
+            &outdir.join("left.fa"),
+            &outdir.join("right.fa"),
+        ] {
+            let _ = fs::remove_file(p);
+        }
+    }
+    Ok(final_fa)
+}
+
+/// 递归模式主线（`--recursive`, M1）: 取代 classic 的 chrysalis-quantify +
+/// butterfly 池 + harvest 三段。
+///
+/// - phase-1: chrysalis 止于分区（`skip_quantify: true`, pct 50 钳制,
+///   与原版 TRINITY_COMPLETE 语义一致）, checkpoint 复用 `.quantify_graph.ok`;
+/// - phase-2: rayon 分区池逐分区 `run_mini` → `read_partitions/c<id>.mini.fa`
+///   （存在即跳过 = 断点）, 整段 checkpoint `.recursive.ok`;
+/// - 汇总: mini.fa 拼接 → min_len 过滤 + 全序列去重 → `Trinity.tmp.fasta`
+///   → 最终命名/gene_trans_map 与 classic 尾段一致（无 checkpoint, 每次重汇总）。
+fn run_recursive(
+    a: TrinityArgs,
+    args: &TrinityArgs,
+    outdir: &Path,
+    chrysalis_dir: &Path,
+    iworm_data: &[u8],
+    reads_data: &[u8],
+) -> Result<PathBuf, CommonError> {
+    let ss = a.ss_lib_type.as_deref();
+    warn_memory(
+        args.max_memory,
+        iworm_data.len() as u64 + reads_data.len() as u64,
+        "Chrysalis (recursive phase-1)",
+    );
+    // ---- phase-1: chrysalis 止于分区（.tmp 保留, 供分区池消费）----
+    let mut listing_opt: Option<Vec<(u64, PathBuf)>> = None;
+    let quantify_ok = outdir.join(".quantify_graph.ok");
+    run_with_checkpoint(
+        &quantify_ok,
+        "Chrysalis (recursive phase-1: clustering & partitioning)",
+        || {
+            let listing = run_chrysalis_pipeline(
+                iworm_data,
+                reads_data,
+                chrysalis_dir,
+                &ChrysalisParams {
+                    skip_quantify: true,
+                    strand: ss.is_some(),
+                    min_contig_length: args.min_contig_length,
+                    pct_required: 50,
+                    max_reads: args.max_reads_per_graph,
+                    threads: args.cpu.max(1),
+                    graphs_per_partition: 1000,
+                },
+            )?;
+            listing_opt = Some(listing);
+            Ok(())
+        },
+    )?;
+    let listing = match listing_opt {
+        Some(l) => l,
+        None => read_component_base_listing(
+            &chrysalis_dir
+                .join("Component_bins")
+                .join("component_base_listing.txt"),
+        )?,
+    };
+    if listing.is_empty() {
+        return Err(CommonError::Parse(
+            "WARNING, component base listing file is empty - likely sparse data".to_string(),
+        ));
+    }
+
+    // ---- phase-2: 分区池（checkpoint .recursive.ok; 命中时直接从 mini.fa 重汇总）----
+    warn_memory(
+        args.max_memory,
+        reads_data.len() as u64,
+        "Recursive mini pool",
+    );
+    let mini_dir = outdir.join("read_partitions");
+    run_with_checkpoint(
+        &outdir.join(".recursive.ok"),
+        "Recursive mini partition pool",
+        || run_partition_pool(&listing, chrysalis_dir, args, &mini_dir).map(|_| ()),
+    )?;
+    let mini_files: Vec<PathBuf> = listing
+        .iter()
+        .map(|(id, _)| mini_dir.join(format!("c{id}.mini.fa")))
+        .collect();
+
+    // ---- 汇总: min_len 过滤 + 全局去重（print_butterfly_assemblies 语义）----
+    let trinity_tmp = outdir.join("Trinity.tmp.fasta");
+    let n_transcripts = harvest_mini(&mini_files, args.min_contig_length, &trinity_tmp)?;
+    if n_transcripts == 0 {
+        return Err(CommonError::Parse(
+            "WARNING: no transcripts harvested from recursive partition output".to_string(),
+        ));
+    }
+
+    // 最终命名与 gene_trans_map: 与 classic 尾段一致。
+    let final_fa = PathBuf::from(format!("{}.Trinity.fasta", outdir.display()));
+    fs::rename(&trinity_tmp, &final_fa)?;
+    write_gene_trans_map(
+        &final_fa,
+        &final_fa.with_file_name(format!(
+            "{}.gene_trans_map",
+            final_fa.file_name().unwrap_or_default().to_string_lossy()
+        )),
+    )?;
+
+    // 收尾清理与 classic 相同集合（mini.fa 与 chrysalis 产物保留——断点依赖）。
+    if !args.no_cleanup {
+        let target_fa = outdir.join("both.fa");
+        for p in [
+            &target_fa,
+            &outdir.join(format!("mer_counts.{}.{}.rs.bin", args.kmer_size, SR_FLAG)),
+            &outdir.join(format!("jellyfish.kmers.{}.{}.fa", args.kmer_size, SR_FLAG)),
             &outdir.join("left.fa"),
             &outdir.join("right.fa"),
         ] {

@@ -61,7 +61,10 @@ pub struct MiniOut {
 /// - `--minKmerCount` 在 phase-2 的 `--reads` 装载路径仅当 min_kmer_cov > 1
 ///   时追加（L2670-2672）; ≤1 时 inchworm 自身默认即 1, 等价。
 pub fn run_mini(reads_tmp: &[u8], p: &MiniParams) -> Result<MiniOut, CommonError> {
-    let tmp = std::env::temp_dir().join(format!("mini_{}", std::process::id()));
+    // 分区池并行调用 → 临时目录须逐调用唯一（pid + 单调序号）。
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = std::env::temp_dir().join(format!("mini_{}_{n}", std::process::id()));
     let _ = fs::remove_dir_all(&tmp);
     fs::create_dir_all(&tmp)?;
     let r = (|| -> Result<MiniOut, CommonError> {

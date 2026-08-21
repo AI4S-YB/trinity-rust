@@ -318,6 +318,7 @@ dependencies = [
 name = "trinity-cli"
 version = "0.0.1"
 dependencies = [
+ "flate2",
  "rayon",
  "trinity-butterfly",
  "trinity-chrysalis",

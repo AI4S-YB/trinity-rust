@@ -50,6 +50,10 @@ pub struct TrinityArgs {
     pub max_reads_per_graph: u64,
     /// 收尾不删中间文件。
     pub no_cleanup: bool,
+    /// `--recursive`（M1）: 递归分区模式——phase-1 chrysalis 止于分区
+    /// （skip_quantify）, 逐分区进程内迷你 Trinity, 产物落
+    /// `read_partitions/c<id>.mini.fa`（存在即跳过 = 断点）。
+    pub recursive: bool,
 }
 
 /// `--max_memory 10G` → 字节。镜像原版 L1156 `^(\d+)G`（大小写不敏感）;
@@ -129,6 +133,7 @@ pub fn parse_args(argv: &[String]) -> Result<TrinityArgs, CliError> {
     let bfly_stack_mb: usize = cli.uint_flag("--bfly_stack_mb", 256)?;
     let max_reads_per_graph: u64 = cli.uint_flag("--max_reads_per_graph", 200000)?;
     let no_cleanup = cli.bool_flag("--no_cleanup");
+    let recursive = cli.bool_flag("--recursive");
 
     cli.finish()?;
 
@@ -198,5 +203,6 @@ pub fn parse_args(argv: &[String]) -> Result<TrinityArgs, CliError> {
         bfly_stack_mb,
         max_reads_per_graph,
         no_cleanup,
+        recursive,
     })
 }
