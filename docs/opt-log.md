@@ -40,3 +40,37 @@
 - 2026-08-22 终审 Issue 2 修复：递归分支 checkpoint 改名 `.recursive_phase1.ok`（防 classic↔recursive 同 outdir 切换时的 checkpoint 污染）
 - 2026-08-22 **M2-T6 flow-dev1: FAIL——未出指标（Butterfly 池 SIGABRT 栈溢出）**。`--path-engine flow` 全量 dev1 跑到 QuantifyGraph 完（6387 分量）后在组件池阶段 `fatal runtime error: stack overflow, aborting`。复现与根因（终审实测, cache/86c238503041efb2）: `peel.rs::handle_cycle` 为**递归**实现且每层克隆全图; dev1 有 129/6387 个 graph.out 含 >50 节点的有环分量（最大 5398 节点, 如 Cbin0/c11: 6155 节点/6228 边单分量有环）。classic 引擎跑在 `--bfly_stack_mb` 专用大栈线程上, flow 分支直接跑在 rayon 池线程（默认小栈）→ 深递归溢出。c0/c30 等无环或浅环分量在 flow 下正常（c30 12.9s/17 条）, 单测/fixture 全过但真实数据的深环分量未覆盖。Gate 判定: flow 无 dev1 指标, **不可与 classic 比较, M2 不满足合并条件**。M2.1 方向: handle_cycle 去递归（改为迭代 + Tarjan SCC 缩点或一次性多边剪断）, 消除每层全图克隆; 修复后 flow 也应走专用栈线程或验证无递归后保持池线程。未改算法, 如实记录
 | 2026-08-22 | flow-fix-dev1 | R=3.1% P=78.0% **F1=5.9%** | N50=1580 n=4206 | --path-engine flow --max_memory 8G --CPU 8 |
+| 2026-08-22 | flow-kmfix-dev1 | R=3.1% P=78.0% **F1=5.9%** | N50=1580 n=4206 | --path-engine flow --max_memory 8G --CPU 8 |
+| 2026-08-22 | flow-kmfix2-dev1 | R=6.9% P=78.7% **F1=12.6%** | N50=1611 n=8579 | --path-engine flow --max_memory 8G --CPU 8 |
+| 2026-08-22 | flow-dev2 | R=6.3% P=78.5% **F1=11.7%** | N50=1541 n=10079 | --path-engine flow --max_memory 8G --CPU 8 |
+| 2026-08-22 | flow-dev3 | R=6.0% P=83.7% **F1=11.3%** | N50=1588 n=6898 | --path-engine flow --max_memory 8G --CPU 8 |
+| 2026-08-22 | flow-holdout | R=1.9% P=84.1% **F1=3.8%** | N50=583 n=4619 | --path-engine flow --max_memory 2G --CPU 8 |
+## M2 flow 引擎验收（2026-08-22, --path-engine flow）
+
+| 日期 | tag | 指标 | 其他 | 参数 |
+|---|---|---|---|---|
+| 2026-08-22 | flow-dev1 | R=6.9% P=78.7% **F1=12.6%** | N50=1611 n=8579 | --path-engine flow --max_memory 8G --CPU 8 |
+| 2026-08-22 | flow-dev2 | R=6.3% P=78.5% **F1=11.7%** | N50=1541 n=10079 | 同上 |
+| 2026-08-22 | flow-dev3 | R=6.0% P=83.7% **F1=11.3%** | N50=1588 n=6898 | 同上 |
+| 2026-08-22 | flow-holdout | R=1.9% P=84.1% **F1=3.8%** | N50=583 n=4619 | --max_memory 2G |
+
+### M2 Gate 判定: FAIL（flow 三集一致低于 classic 约 2.3pp F1）
+
+| 集 | classic F1 | flow F1 | 差 |
+|---|---|---|---|
+| dev1 | 14.9% | 12.6% | -2.3pp |
+| dev2 | 14.1% | 11.7% | -2.4pp |
+| dev3 | 13.5% | 11.3% | -2.2pp |
+| holdout | 4.0% | 3.8% | -0.2pp |
+
+### 过程发现与修复
+
+- **初始 SCC 缩点递归栈溢出**（dev1 129/6387 分量含环, 最大 5398 环节点）→ 显式栈 Tarjan + SCC 缩点修复
+- **graph.out 节点先以 prev 身份出现时 kmer 为空**（1969 个大组件 0 产出的根因）→ 覆写修复（4206→8579 条, F1 5.9→12.6%）
+- **低支持路径 break 阻断**→改为消耗不产出
+
+### 差距分析（kmer 修复后, 终审数据）
+
+- 环静默丢弃仅 0.5% 节点（非主因）
+- max 杠杆: min_support 已=1（接线层硬编码, 终审+2000 条已含）; **min_len=200 拦截约 3,150 条**（min_len=100 时 n=9650）和 N50 1611 vs 1838 的路径延伸不足是剩余主因
+- M2.1 迭代方向: ① 路径端点延伸（5'/3' k-mer 链延续, 直击 N50 差距） ② min_len 自适应/分级 ③ SCC 内部受限展开
