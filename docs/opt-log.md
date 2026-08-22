@@ -45,6 +45,8 @@
 | 2026-08-22 | flow-dev2 | R=6.3% P=78.5% **F1=11.7%** | N50=1541 n=10079 | --path-engine flow --max_memory 8G --CPU 8 |
 | 2026-08-22 | flow-dev3 | R=6.0% P=83.7% **F1=11.3%** | N50=1588 n=6898 | --path-engine flow --max_memory 8G --CPU 8 |
 | 2026-08-22 | flow-holdout | R=1.9% P=84.1% **F1=3.8%** | N50=583 n=4619 | --path-engine flow --max_memory 2G --CPU 8 |
+| 2026-08-22 | pogflow-dev1 | R=8.1% R70=35.8% P=86.0% **F1=14.8%** | N50=1705 n=7561 | --path-engine pogflow --max_memory 8G --CPU 8 |
+- 2026-08-22 M2.1 pogflow-dev1 对照（classic R=8.2 P=80.5-81.1 F1=14.9-15.0; flow 原始图 F1=12.6）: pogflow P 提升 +5~+5.5pp（86.0 vs 80.5-81.1）但 R 持平略低（8.1 vs 8.2）, F1=14.8 与 classic 14.9-15.0 差 -0.1~-0.2pp（噪声带内, n=7561 vs 7787, N50 1705 vs 1833）。Gate "pogflow F1 > classic" **未达成但持平**——远优于 flow 原始图（+2.2pp）。pogflow 跑在 POG 大栈线程内（无 M2 flow 的栈溢出问题）, 全量 dev1 正常完成。实现备注: 单节点 POG 分量（zipping 完全线性化）直接输出节点序列（comp.len()==1 分支）, 否则合成集 e2e 会零产出
 ## M2 flow 引擎验收（2026-08-22, --path-engine flow）
 
 | 日期 | tag | 指标 | 其他 | 参数 |
@@ -81,3 +83,4 @@
   flow 引擎直接消费原始量化图，天然受限于图长度。
   → 真正差距 = POG 扩展贡献的额外长度。修复需在流分解前做 read-path 聚合（或直接消费 graph.reads 做路径增强）
   → 零权边→1 的收益有限（该图贪心仍 128bp）；min_len 降为 150 可恢复部分短转录本但无法弥补 POG 长度
+| 2026-08-22 | pogflow-dev1 | R=8.1% P=86.0% **F1=14.8%** | N50=1705 n=7561 | --path-engine pogflow --max_memory 8G --CPU 8 |
