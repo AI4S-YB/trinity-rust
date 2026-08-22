@@ -481,7 +481,14 @@ pub fn run_trinity(args: &TrinityArgs) -> Result<PathBuf, CommonError> {
     // ---- 5/6/7. 递归模式（--recursive, M1）: phase-1 止于分区 → 迷你分区池
     // ---- → 汇总（与 classic 的 chrysalis+butterfly+harvest 段并列）。 ----
     if args.recursive {
-        return run_recursive(a, args, &outdir, &chrysalis_dir, &iworm_data, &chrysalis_reads);
+        return run_recursive(
+            a,
+            args,
+            &outdir,
+            &chrysalis_dir,
+            &iworm_data,
+            &chrysalis_reads,
+        );
     }
 
     let mut listing_opt: Option<Vec<(u64, PathBuf)>> = None;
@@ -894,8 +901,8 @@ pub fn filter_min_len(data: &[u8], min_len: usize) -> Result<Vec<u8>, CommonErro
     Ok(out)
 }
 
-/// >aN;cov total_counts:... → >sr_N（M4: 超级 read 无 PE 后缀, 防 Butterfly
-/// 配对 `/1`//`/2` 解析干扰; 序列行照抄）。
+/// aN;cov total_counts:... 变为 sr_N（M4: 超级 read 无 PE 后缀, 防 Butterfly
+/// 配对 /1 与 /2 解析干扰; 序列行照抄）。
 pub fn rewrite_super_read_headers(data: &[u8]) -> Result<Vec<u8>, CommonError> {
     let text = std::str::from_utf8(data)
         .map_err(|e| CommonError::Parse(format!("super reads UTF-8: {e}")))?;
@@ -903,7 +910,7 @@ pub fn rewrite_super_read_headers(data: &[u8]) -> Result<Vec<u8>, CommonError> {
     for line in text.lines() {
         if line.starts_with('>') {
             // >a123;45 → >sr_123
-            let acc = line[1..].split(';').next().unwrap_or("");
+            let acc = line.strip_prefix('>').unwrap_or(line).split(';').next().unwrap_or("");
             let num = acc.strip_prefix('a').unwrap_or(acc);
             out.extend_from_slice(format!(">sr_{num}\n").as_bytes());
         } else {

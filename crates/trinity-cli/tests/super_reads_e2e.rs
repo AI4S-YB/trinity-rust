@@ -109,7 +109,10 @@ fn super_reads_e2e_on_off_and_classic_unaffected() {
     let final_on = run_trinity(&with_flag(base_args(&r1, &r2, &out_on), "--super_reads")).unwrap();
     let sr = out_on.join("super_reads.fa");
     assert!(sr.exists(), "super_reads.fa 应存在");
-    assert!(out_on.join(".k19_preasm.ok").exists(), ".k19_preasm.ok 缺失");
+    assert!(
+        out_on.join(".k19_preasm.ok").exists(),
+        ".k19_preasm.ok 缺失"
+    );
     let sr_text = fs::read_to_string(&sr).unwrap();
     assert!(sr_text.contains(">sr_"), "header 应含 >sr_: {sr_text}");
     let text_on = fs::read_to_string(&final_on).unwrap();
