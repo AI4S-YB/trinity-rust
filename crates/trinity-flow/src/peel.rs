@@ -144,8 +144,10 @@ fn peel_dag(
 fn handle_cycle(g: &FlowGraph, comp: &[i64], p: &PeelParams) -> Vec<Vec<i64>> {
     let sccs = g.scc_component(comp);
     let mut rep_of: HashMap<i64, i64> = HashMap::with_capacity(comp.len());
-    let mut condensed = FlowGraph::default();
-    condensed.component_id = g.component_id;
+    let mut condensed = FlowGraph {
+        component_id: g.component_id,
+        ..Default::default()
+    };
     // silent = 多节点 SCC 的代表节点: 穿过它的路径不产出
     let mut silent = std::collections::HashSet::new();
     for scc in &sccs {
@@ -175,7 +177,7 @@ fn handle_cycle(g: &FlowGraph, comp: &[i64], p: &PeelParams) -> Vec<Vec<i64>> {
     }
     let mut comp2: Vec<i64> = condensed.nodes.keys().copied().collect();
     comp2.sort_unstable();
-    let order = match condensed.toposort_component(&comp2) {
+    let order = match condensed.toposort_component(comp2.as_slice()) {
         Some(o) => o,
         // 缩点图必为 DAG; 到达此处说明逻辑错误, 保守返回空而非死循环
         None => return Vec::new(),
