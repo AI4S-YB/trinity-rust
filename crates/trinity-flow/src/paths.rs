@@ -33,7 +33,7 @@ pub fn path_to_seq(path: &[i64], kmers: &[(i64, Vec<u8>)], _k: usize) -> Vec<u8>
 /// 简化 cd-hit 式去冗余: 逐位同一率 ≥ threshold → 保留高 support
 pub fn dedup_similar(paths: Vec<PathOutput>, threshold: f64) -> Vec<PathOutput> {
     let mut sorted = paths;
-    sorted.sort_by(|a, b| b.support.cmp(&a.support));
+    sorted.sort_by_key(|p| std::cmp::Reverse(p.support));
     let mut out: Vec<PathOutput> = Vec::new();
     for p in sorted {
         let dup = out.iter().any(|q| {
