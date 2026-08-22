@@ -314,8 +314,10 @@ pub fn run_trinity(args: &TrinityArgs) -> Result<PathBuf, CommonError> {
                 true,
                 &mut buf,
             )?;
-            // ≥200bp 过滤（spec: super read 定义; cov 门槛 0）。
-            let filtered = filter_iworm_min_len_or_cov(&buf, 200, 0)?;
+            // ≥200bp 纯长度过滤（spec: super read 定义）。注意不能用
+            // filter_iworm_min_len_or_cov(200, 0)——那是 len OR cov 判定,
+            // cov>=0 恒真会放行全部 contig。
+            let filtered = filter_min_len(&buf, 200)?;
             // header 改写: >aN;cov → >sr_N（无 PE 后缀, 防 Butterfly 配对干扰）。
             let sr = rewrite_super_read_headers(&filtered)?;
             fs::write(sr_fa_ref, &sr)?;
@@ -852,6 +854,46 @@ pub fn filter_iworm_min_len_or_cov(
     Ok(out)
 }
 
+/// 纯长度过滤: 保留序列长度 >= min_len 的 FASTA 记录（M4 超级 read 定义
+/// ≥200bp, 无 cov 逃生门——`filter_iworm_min_len_or_cov` 是 len OR cov 判定,
+/// min_cov=0 时恒真, 不适用于此处）。
+pub fn filter_min_len(data: &[u8], min_len: usize) -> Result<Vec<u8>, CommonError> {
+    let mut out = Vec::with_capacity(data.len());
+    let mut i = 0usize;
+    while i < data.len() {
+        let hdr_end = data[i..]
+            .iter()
+            .position(|&b| b == b'\n')
+            .map(|p| i + p)
+            .unwrap_or(data.len());
+        let header = &data[i..hdr_end];
+        let mut j = hdr_end + 1;
+        let body_end = loop {
+            if j >= data.len() {
+                break data.len();
+            }
+            if data[j] == b'>' {
+                break j;
+            }
+            let nl = data[j..]
+                .iter()
+                .position(|&b| b == b'\n')
+                .map(|p| j + p + 1)
+                .unwrap_or(data.len());
+            j = nl;
+        };
+        let body = &data[hdr_end + 1..body_end];
+        let seq_len = body.iter().filter(|&&b| b != b'\n' && b != b'\r').count();
+        if seq_len >= min_len {
+            out.extend_from_slice(header);
+            out.push(b'\n');
+            out.extend_from_slice(body);
+        }
+        i = body_end;
+    }
+    Ok(out)
+}
+
 /// >aN;cov total_counts:... → >sr_N（M4: 超级 read 无 PE 后缀, 防 Butterfly
 /// 配对 `/1`//`/2` 解析干扰; 序列行照抄）。
 pub fn rewrite_super_read_headers(data: &[u8]) -> Result<Vec<u8>, CommonError> {
@@ -902,7 +944,18 @@ mod min100_tests {
 
 #[cfg(test)]
 mod super_read_tests {
-    use super::rewrite_super_read_headers;
+    use super::{filter_min_len, rewrite_super_read_headers};
+
+    #[test]
+    fn filter_min_len_strict() {
+        // 纯长度判定: 短序列即使 cov 很高也剔除（区别于 min100 的 OR 语义）。
+        let seq250 = "ACGT".repeat(63); // 252
+        let fa = format!(">a1;99 length: 250\n{seq250}\n>a2;999 length: 50\nACGT\n");
+        let out = filter_min_len(fa.as_bytes(), 200).unwrap();
+        let s = String::from_utf8(out).unwrap();
+        assert!(s.contains(">a1;"));
+        assert!(!s.contains(">a2;"));
+    }
 
     #[test]
     fn rewrites_header_strips_cov_keeps_seq() {
