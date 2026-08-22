@@ -1,0 +1,7 @@
+[package]
+name = "trinity-flow"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+trinity-common = { path = "../trinity-common" }

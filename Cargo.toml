@@ -6,6 +6,7 @@ members = [
     "crates/trinity-inchworm",
     "crates/trinity-chrysalis",
     "crates/trinity-butterfly",
+    "crates/trinity-flow",
     "crates/trinity-cli",
     "xtask",
 ]

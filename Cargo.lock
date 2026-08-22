@@ -336,6 +336,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "trinity-flow"
+version = "0.0.1"
+dependencies = [
+ "trinity-common",
+]
+
+[[package]]
 name = "trinity-inchworm"
 version = "0.0.1"
 dependencies = [
