@@ -124,3 +124,19 @@
 
 - POG 图的 PairPath id 与原始图 id 不同域——需用 `result.combined_read_hash`（POG 重映射后）而非原始 `suff`
 - 单节点 POG 分量的支持数改为真实 read 支持计数（替代 M2.1 的 u64::MAX 哨兵）
+
+## M4 超级 read 递进（2026-08-23, --super_reads）
+
+| 日期 | tag | 指标 | 其他 | 参数 |
+|---|---|---|---|---|
+| 2026-08-22 | m4-dev1 | R=8.2% P=84.2% **F1=14.9%** | N50=1725 n=7866 | --path-engine pogflow --super_reads（过滤 bug: min_cov=0 恒真, 112,666 条全量 super reads 进入 reads 池, 见下） |
+| 2026-08-23 | m4-dev1 | R=8.1% R70=36.4% P=84.1% **F1=14.8%** | N50=1727 n=7874 | --path-engine pogflow --super_reads --max_memory 8G --CPU 8（修复后, 7,684 条 ≥200bp） |
+
+### M4 Gate 判定: FAIL（F1 14.8% < 15.4%, 且 < M3 基线 15.1%）
+
+- 与 M3（R=8.3 P=84.5 F1=15.1 N50=1734 n=7898）对照: R -0.2pp、P -0.4pp、F1 -0.3pp、n -24——超级 read 在 dev1 上**中性偏负**, 未达成 Gate, 按计划记录分析、不跑 dev2/3
+- 超级 read 数量/长度: 7,684 条 ≥200bp, 总 6.97Mb, 中位 560bp, 最长 10,599bp（K19 inchworm 全量 112,666 条 contig 中 ≥200bp 占 6.8%）
+- **首跑踩坑**: 计划骨架的 `filter_iworm_min_len_or_cov(buf, 200, 0)` 是 len OR cov 判定, cov>=0 恒真 → 112,666 条（中位 37bp）全进 Chrysalis reads 池, F1 掉到 14.9%（且 P 84.2 未崩——多数碎片被 RTT/量化丢弃）。修复: 新增 `filter_min_len` 纯长度判定（u128/`u32::MAX` hack 都不如显式函数）。修复后 F1 14.8%——过滤本身不是全部原因, 超级 read 对 dev1 没有净增益
+- **分析（为何无增益）**: dev1 reads 已深覆盖（归一化后 both.fa 本身信息充分）, K19 预组装 contig ≈ K25 inchworm contig 的前体——对 RTT 投票的增量信息主要在跨越 K25 contig 断点的连接, 但这些连接 dev1 的 PE 距离信息已提供; 超级 read 同时引入自身错误延伸（K19 更易跨错误连接）, 增益与噪声近似抵消
+- classic 回归: `--super_reads` 关闭时代码路径零变化（K19 段整体在 `if args.super_reads` 内; e2e 断言 off 时无 super_reads.fa/.k19_preasm.ok）; 全部 37 个 CLI 测试通过
+- 断点: `.k19_preasm.ok` 命中时从盘上读回 super_reads.fa（闭包内变量在 skip 分支不生效, 需 checkpoint 后补读）
