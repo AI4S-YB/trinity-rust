@@ -84,3 +84,6 @@
   → 真正差距 = POG 扩展贡献的额外长度。修复需在流分解前做 read-path 聚合（或直接消费 graph.reads 做路径增强）
   → 零权边→1 的收益有限（该图贪心仍 128bp）；min_len 降为 150 可恢复部分短转录本但无法弥补 POG 长度
 | 2026-08-22 | pogflow-dev1 | R=8.1% P=86.0% **F1=14.8%** | N50=1705 n=7561 | --path-engine pogflow --max_memory 8G --CPU 8 |
+| 2026-08-22 | pogflow-tuned-dev1 | R=8.1% P=85.9% **F1=14.8%** | N50=1713 n=7639 | --path-engine pogflow --max_memory 8G --CPU 8 |
+| 2026-08-22 | pogflow-tuned-dev1 | R=8.1% P=85.9% **F1=14.8%** | N50=1713 n=7639 | --path-engine pogflow --flow_dedup 0.98 |
+- 2026-08-22 **M2.1 收官**: PogFlow（POG图+流分解）dev1 结果——dedup 0.98 找回 78 条（7561→7639，终审预估 +120 略高但方向正确）; R 持平 8.1%（R70 35.8→36.1% 微升）; P 85.9%（保持 +5pp 优势）; F1 14.8% 与 classic 14.9% 持平（-0.1pp 噪声带内）。**三引擎定位明确**: classic=多报异构体（n 7787, P 80.5%）/ PogFlow=高精度少报（n 7639, P 85.9%）/ flow-原始图=最快但质量最低（12.6%）。PogFlow 的结构性差距 = 丢弃了 read-reinforcement/PE 约束（纯流分解无 read 支持）——若后续需要超越 classic, 需把 combined_read_hash 的 PE 信息注入流分解的路径选择权重
