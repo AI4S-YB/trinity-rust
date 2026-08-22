@@ -302,6 +302,7 @@ dependencies = [
  "rustc-hash",
  "thiserror",
  "trinity-common",
+ "trinity-flow",
 ]
 
 [[package]]

@@ -13,13 +13,15 @@ pub enum SeqType {
     Fa,
 }
 
-/// `--path-engine classic|flow`（M2 Rust 版扩展）: butterfly 输出层引擎选择。
-/// classic = 原 Butterfly 移植; flow = 量化图最重路径剥离流分解。
+/// `--path-engine classic|flow|pogflow`（M2 Rust 版扩展）: butterfly 输出层引擎选择。
+/// classic = 原 Butterfly 移植; flow = 量化图最重路径剥离流分解;
+/// pogflow = POG 图（SeqVertex DAG）+ 流分解（M2.1）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PathEngine {
     #[default]
     Classic,
     Flow,
+    PogFlow,
 }
 
 impl std::fmt::Display for PathEngine {
@@ -27,6 +29,7 @@ impl std::fmt::Display for PathEngine {
         f.write_str(match self {
             PathEngine::Classic => "classic",
             PathEngine::Flow => "flow",
+            PathEngine::PogFlow => "pogflow",
         })
     }
 }
@@ -37,8 +40,9 @@ impl std::str::FromStr for PathEngine {
         match s {
             "classic" => Ok(PathEngine::Classic),
             "flow" => Ok(PathEngine::Flow),
+            "pogflow" => Ok(PathEngine::PogFlow),
             other => Err(CliError::usage(format!(
-                "Error, unrecognized path-engine value of {other}. Should be: classic or flow"
+                "Error, unrecognized path-engine value of {other}. Should be: classic, flow or pogflow"
             ))),
         }
     }

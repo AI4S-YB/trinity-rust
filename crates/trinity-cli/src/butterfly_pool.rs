@@ -117,6 +117,15 @@ fn run_one(base: &Path, params: &ButterflyPoolParams) -> Result<(), CommonError>
             fs::write(&out, &result.all_prob_paths_fasta)
                 .map_err(|e| CommonError::Parse(format!("cannot write {}: {e}", out.display())))?;
         }
+        PathEngine::PogFlow => {
+            // M2.1: 走 run_component（POG 递归需要 butterfly 的大栈线程），
+            // 引擎参数切 PogFlow——create_dag_from_overlap_layout 后流分解。
+            let mut cp = component_params(base, params);
+            cp.path_engine = trinity_butterfly::PathEngine::PogFlow;
+            let result = run_component(&g, &r, &cp)?;
+            fs::write(&out, &result.all_prob_paths_fasta)
+                .map_err(|e| CommonError::Parse(format!("cannot write {}: {e}", out.display())))?;
+        }
         PathEngine::Flow => {
             // 流分解引擎: 纯 Rust 无递归（不需大栈线程）; 输出同为
             // allProbPaths 格式（header `{comp}_g1_i{n}`, 由 to_fasta 产生）。
