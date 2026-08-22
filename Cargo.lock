@@ -323,6 +323,7 @@ dependencies = [
  "trinity-butterfly",
  "trinity-chrysalis",
  "trinity-common",
+ "trinity-flow",
  "trinity-inchworm",
  "trinity-kmer",
 ]

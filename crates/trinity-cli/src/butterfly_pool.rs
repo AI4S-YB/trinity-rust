@@ -19,6 +19,9 @@ use std::sync::Mutex;
 use rayon::prelude::*;
 use trinity_butterfly::{run_component, ComponentParams};
 use trinity_common::error::CommonError;
+use trinity_flow::{run_flow_component, FlowParams};
+
+use crate::args::PathEngine;
 
 /// 组件池参数（从 TrinityArgs 收敛）。
 #[derive(Debug, Clone)]
@@ -31,6 +34,10 @@ pub struct ButterflyPoolParams {
     pub group_pairs_distance: usize,
     /// 专用组件线程栈（--bfly_stack_mb）。
     pub stack_size_mb: usize,
+    /// 输出层引擎（--path-engine; flow 为纯 Rust 无递归, 不走大栈线程）。
+    pub path_engine: PathEngine,
+    /// kmer 长（flow 引擎 path_to_seq 用; classic 不消费）。
+    pub kmer_size: usize,
 }
 
 /// 原版 butterfly 命令实参（L2363-2388）:
@@ -103,8 +110,28 @@ fn run_one(base: &Path, params: &ButterflyPoolParams) -> Result<(), CommonError>
         .map_err(|e| CommonError::Parse(format!("cannot read {}: {e}", graph_out.display())))?;
     let r = fs::read_to_string(&graph_reads)
         .map_err(|e| CommonError::Parse(format!("cannot read {}: {e}", graph_reads.display())))?;
-    let result = run_component(&g, &r, &component_params(base, params))?;
-    fs::write(&out, &result.all_prob_paths_fasta)
-        .map_err(|e| CommonError::Parse(format!("cannot write {}: {e}", out.display())))?;
+    match params.path_engine {
+        PathEngine::Classic => {
+            let result = run_component(&g, &r, &component_params(base, params))?;
+            fs::write(&out, &result.all_prob_paths_fasta)
+                .map_err(|e| CommonError::Parse(format!("cannot write {}: {e}", out.display())))?;
+        }
+        PathEngine::Flow => {
+            // 流分解引擎: 纯 Rust 无递归（不需大栈线程）; 输出同为
+            // allProbPaths 格式（header `{comp}_g1_i{n}`, 由 to_fasta 产生）。
+            let fasta = run_flow_component(
+                &g,
+                &r,
+                &FlowParams {
+                    min_len: params.min_contig_length,
+                    min_support: 1,
+                    dedup_threshold: 0.95,
+                    k: params.kmer_size,
+                },
+            )?;
+            fs::write(&out, &fasta)
+                .map_err(|e| CommonError::Parse(format!("cannot write {}: {e}", out.display())))?;
+        }
+    }
     Ok(())
 }

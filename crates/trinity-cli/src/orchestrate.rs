@@ -468,6 +468,8 @@ pub fn run_trinity(args: &TrinityArgs) -> Result<PathBuf, CommonError> {
                     min_contig_length: args.min_contig_length,
                     group_pairs_distance: args.group_pairs_distance,
                     stack_size_mb: args.bfly_stack_mb,
+                    path_engine: args.path_engine,
+                    kmer_size: args.kmer_size,
                 },
             )
         },

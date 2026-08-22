@@ -13,6 +13,37 @@ pub enum SeqType {
     Fa,
 }
 
+/// `--path-engine classic|flow`（M2 Rust 版扩展）: butterfly 输出层引擎选择。
+/// classic = 原 Butterfly 移植; flow = 量化图最重路径剥离流分解。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PathEngine {
+    #[default]
+    Classic,
+    Flow,
+}
+
+impl std::fmt::Display for PathEngine {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            PathEngine::Classic => "classic",
+            PathEngine::Flow => "flow",
+        })
+    }
+}
+
+impl std::str::FromStr for PathEngine {
+    type Err = CliError;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "classic" => Ok(PathEngine::Classic),
+            "flow" => Ok(PathEngine::Flow),
+            other => Err(CliError::usage(format!(
+                "Error, unrecognized path-engine value of {other}. Should be: classic or flow"
+            ))),
+        }
+    }
+}
+
 /// 主线参数集（原版 17 个同名 flag + Rust 版扩展 `--bfly_stack_mb`）。
 ///
 /// 继续性: workdir 既有 outdir 恢复（`.ok` 断点）天然支持，无 `--resume`
@@ -50,6 +81,8 @@ pub struct TrinityArgs {
     pub max_reads_per_graph: u64,
     /// 收尾不删中间文件。
     pub no_cleanup: bool,
+    /// `--path-engine`（M2）: butterfly 输出层引擎（默认 classic）。
+    pub path_engine: PathEngine,
     /// `--recursive`（M1）: 递归分区模式——phase-1 chrysalis 止于分区
     /// （skip_quantify）, 逐分区进程内迷你 Trinity, 产物落
     /// `read_partitions/c<id>.mini.fa`（存在即跳过 = 断点）。
@@ -134,6 +167,12 @@ pub fn parse_args(argv: &[String]) -> Result<TrinityArgs, CliError> {
     let max_reads_per_graph: u64 = cli.uint_flag("--max_reads_per_graph", 200000)?;
     let no_cleanup = cli.bool_flag("--no_cleanup");
     let recursive = cli.bool_flag("--recursive");
+    let path_engine: PathEngine = match cli.value_flag("--path-engine")? {
+        None => PathEngine::Classic,
+        Some(v) => v
+            .parse()
+            .map_err(|_| CliError::usage(format!("invalid --path-engine value: {v}")))?,
+    };
 
     cli.finish()?;
 
@@ -204,5 +243,6 @@ pub fn parse_args(argv: &[String]) -> Result<TrinityArgs, CliError> {
         max_reads_per_graph,
         no_cleanup,
         recursive,
+        path_engine,
     })
 }

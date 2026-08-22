@@ -180,6 +180,8 @@ fn butterfly_pool_isolates_failures() {
             min_contig_length: 100,
             group_pairs_distance: 500,
             stack_size_mb: 16,
+            path_engine: trinity_cli::args::PathEngine::Classic,
+            kmer_size: 25,
         },
     )
     .unwrap_err();
