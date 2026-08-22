@@ -13,7 +13,7 @@ use std::io::Write;
 use rustc_hash::FxHashMap;
 
 use crate::postprocess::PostProcessParams;
-use crate::PathSearchParams;
+use crate::{DiGraph, PathSearchParams};
 use trinity_common::error::CommonError;
 
 use crate::{
@@ -45,6 +45,8 @@ pub struct ComponentParams {
     pub name: String,
     /// 专用线程栈大小（递归逃生口；默认 256MB）。
     pub stack_size: usize,
+    /// 输出层路径引擎（M2.1；默认 Classic 不变）。
+    pub path_engine: PathEngine,
 }
 
 impl Default for ComponentParams {
@@ -59,8 +61,41 @@ impl Default for ComponentParams {
             path_reinforcement_distance: None,
             name: "component".to_string(),
             stack_size: 256 * 1024 * 1024,
+            path_engine: PathEngine::Classic,
         }
     }
+}
+
+/// 输出层路径引擎（M2.1）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PathEngine {
+    /// 原 `run_butterfly_all_prob_paths` 路径（不变）。
+    #[default]
+    Classic,
+    /// POG 图（zipping 后 SeqVertex DAG）+ 最重路径剥离流分解（M2.1）。
+    PogFlow,
+}
+
+/// butterfly DiGraph → flow FlowGraph。
+/// 节点 kmer = SeqVertex.name（zipping 后全长序列，不等长）；边权 = SimpleEdge.weight
+/// （f64 read 支持，max(0) round 防 NaN/负）。
+fn digraph_to_flow(g: &DiGraph) -> trinity_flow::graph::FlowGraph {
+    let mut fg = trinity_flow::graph::FlowGraph::default();
+    for &vid in g.vertex_ids() {
+        if let Some(v) = g.get_vertex(vid) {
+            fg.nodes.insert(
+                vid as i64,
+                trinity_flow::graph::FlowNode {
+                    kmer: v.name.as_bytes().to_vec(),
+                },
+            );
+        }
+    }
+    for ((u, v), e) in g.edges_sorted() {
+        let w = e.weight.max(0.0).round() as u64;
+        fg.edges.insert((u as i64, v as i64), w);
+    }
+    fg
 }
 
 /// 单组件运行结果。
@@ -142,6 +177,60 @@ fn run_component_inner(
         get_read_starts_ordered(&graph, &ctx, &orig_id_map, &orig_kmer_to_node, &raw_reads);
     let suff = get_suff_stats_w_pairs(&graph, &ordered);
     let result = create_dag_from_overlap_layout(&graph, &mut ctx, &suff);
+
+    // M2.1 PogFlow：POG 图上流分解，不进 run_butterfly_all_prob_paths。
+    if params.path_engine == PathEngine::PogFlow {
+        let flow_g = digraph_to_flow(&result.seqvertex_graph);
+        let kmers: Vec<(i64, Vec<u8>)> = flow_g
+            .nodes
+            .iter()
+            .map(|(&id, n)| (id, n.kmer.clone()))
+            .collect();
+        let mut all: Vec<trinity_flow::paths::PathOutput> = Vec::new();
+        for comp in flow_g.weak_components() {
+            if comp.is_empty() {
+                continue;
+            }
+            // 单节点分量（zipping 完全线性化）：节点自身即转录本候选。
+            if comp.len() == 1 {
+                let seq = trinity_flow::paths::path_to_seq(&comp, &kmers, ctx.kmer_size);
+                if seq.len() >= params.min_len {
+                    all.push(trinity_flow::paths::PathOutput {
+                        seq,
+                        support: u64::MAX,
+                        path: comp,
+                    });
+                }
+                continue;
+            }
+            let paths = trinity_flow::peel::peel_component(
+                &flow_g,
+                &comp,
+                &trinity_flow::peel::PeelParams {
+                    min_support: 1,
+                    min_path_nodes: 2,
+                },
+            );
+            for path in paths {
+                let seq = trinity_flow::paths::path_to_seq(&path, &kmers, ctx.kmer_size);
+                if seq.len() < params.min_len {
+                    continue;
+                }
+                let support = path
+                    .windows(2)
+                    .map(|w| flow_g.edge_weight(w[0], w[1]).unwrap_or(0))
+                    .min()
+                    .unwrap_or(0);
+                all.push(trinity_flow::paths::PathOutput { seq, support, path });
+            }
+        }
+        let deduped = trinity_flow::paths::dedup_similar(all, 0.95);
+        let fasta = trinity_flow::paths::to_fasta(&deduped, &params.name, 0, 60);
+        return Ok(ComponentResult {
+            all_prob_paths_fasta: fasta,
+            num_paths: deduped.len(),
+        });
+    }
 
     let sp = PathSearchParams {
         kmer_size: ctx.kmer_size,

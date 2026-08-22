@@ -17,7 +17,7 @@ pub mod postprocess;
 pub mod prune;
 pub mod threading;
 
-pub use component::{run_component, ComponentParams, ComponentResult};
+pub use component::{run_component, ComponentParams, ComponentResult, PathEngine};
 pub use context::BflyContext;
 pub use dfs::{get_topological_order, run_dfs2};
 pub use graph::{DiGraph, SeqVertex, SimpleEdge, T_VERTEX_ID, VERTEX_ROOT_ID};
