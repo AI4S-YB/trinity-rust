@@ -26,7 +26,8 @@ pub use graph_io::{
     write_dot_string, BuildResult, RawRead, ReadParseError,
 };
 pub use pair_paths::{
-    get_suff_stats_w_pairs, individual_paths_are_compatible, trim_sink_nodes, PairPath, SuffStats,
+    edge_read_coverage, get_suff_stats_w_pairs, individual_paths_are_compatible, path_read_support,
+    trim_sink_nodes, PairPath, SuffStats,
 };
 pub use paths::{
     add_s_and_t, divide_into_components, extract_complex_path_prefixes_from_reads,

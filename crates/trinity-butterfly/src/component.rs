@@ -13,15 +13,15 @@ use std::io::Write;
 use rustc_hash::FxHashMap;
 
 use crate::postprocess::PostProcessParams;
-use crate::{DiGraph, PathSearchParams};
+use crate::{DiGraph, PathSearchParams, SuffStats};
 use trinity_common::error::CommonError;
 
 use crate::{
     build_new_graph_use_kmers, calc_sub_components_stats, compact_linear_paths,
-    create_dag_from_overlap_layout, fix_extremely_high_single_edges,
+    create_dag_from_overlap_layout, edge_read_coverage, fix_extremely_high_single_edges,
     get_original_ver_ids_mapping_hash, get_read_starts_ordered, get_suff_stats_w_pairs,
-    parse_graph_reads, pre_process_graph_file, print_final_paths, remove_light_edges,
-    remove_single_nt_bubbles, run_butterfly_all_prob_paths_with, run_dfs2,
+    parse_graph_reads, path_read_support, pre_process_graph_file, print_final_paths,
+    remove_light_edges, remove_single_nt_bubbles, run_butterfly_all_prob_paths_with, run_dfs2,
 };
 
 /// 组件驱动参数（镜像 Butterfly.jar getopt 面的库层子集）。
@@ -81,8 +81,12 @@ pub enum PathEngine {
 
 /// butterfly DiGraph → flow FlowGraph。
 /// 节点 kmer = SeqVertex.name（zipping 后全长序列，不等长）；边权 = SimpleEdge.weight
-/// （f64 read 支持，max(0) round 防 NaN/负）。
-fn digraph_to_flow(g: &DiGraph) -> trinity_flow::graph::FlowGraph {
+/// （f64 read 支持，max(0) round 防 NaN/负）与 PairPath read 边覆盖取 max 融合
+/// （M3：read 覆盖高的边不被 POG 低权截断），下限 1。
+fn digraph_to_flow(
+    g: &DiGraph,
+    read_cov: &FxHashMap<(i32, i32), i64>,
+) -> trinity_flow::graph::FlowGraph {
     let mut fg = trinity_flow::graph::FlowGraph::default();
     for &vid in g.vertex_ids() {
         if let Some(v) = g.get_vertex(vid) {
@@ -95,7 +99,9 @@ fn digraph_to_flow(g: &DiGraph) -> trinity_flow::graph::FlowGraph {
         }
     }
     for ((u, v), e) in g.edges_sorted() {
-        let w = e.weight.max(0.0).round() as u64;
+        let pog_w = e.weight.max(0.0).round() as u64;
+        let read_w = read_cov.get(&(u, v)).copied().unwrap_or(0) as u64;
+        let w = pog_w.max(read_w).max(1);
         fg.edges.insert((u as i64, v as i64), w);
     }
     fg
@@ -179,11 +185,19 @@ fn run_component_inner(
     let ordered =
         get_read_starts_ordered(&graph, &ctx, &orig_id_map, &orig_kmer_to_node, &raw_reads);
     let suff = get_suff_stats_w_pairs(&graph, &ordered);
-    let result = create_dag_from_overlap_layout(&graph, &mut ctx, &suff);
+    let mut result = create_dag_from_overlap_layout(&graph, &mut ctx, &suff);
 
     // M2.1 PogFlow：POG 图上流分解，不进 run_butterfly_all_prob_paths。
+    // M3：PairPath read 边覆盖注入流权重 + 产出路径 read 支持过滤。
     if params.path_engine == PathEngine::PogFlow {
-        let flow_g = digraph_to_flow(&result.seqvertex_graph);
+        // PairPath 已重映射到 seqvertex 新 id（result.combined_read_hash），
+        // 与流图节点 id 同域；suff 本身的路径是旧图 id，不能直接用。
+        let suff_pog = SuffStats {
+            combined_read_hash: std::mem::take(&mut result.combined_read_hash),
+            ..Default::default()
+        };
+        let read_cov = edge_read_coverage(&suff_pog);
+        let flow_g = digraph_to_flow(&result.seqvertex_graph, &read_cov);
         let kmers: Vec<(i64, Vec<u8>)> = flow_g
             .nodes
             .iter()
@@ -198,11 +212,16 @@ fn run_component_inner(
             if comp.len() == 1 {
                 let seq = trinity_flow::paths::path_to_seq(&comp, &kmers, ctx.kmer_size);
                 if seq.len() >= params.min_len {
-                    all.push(trinity_flow::paths::PathOutput {
-                        seq,
-                        support: u64::MAX,
-                        path: comp,
-                    });
+                    // M3：单节点分量同样做 read 支持过滤（替代 u64::MAX 哨兵）
+                    let comp_i32: Vec<i32> = comp.iter().map(|&x| x as i32).collect();
+                    let support = path_read_support(&suff_pog, &comp_i32);
+                    if support >= params.min_read_support {
+                        all.push(trinity_flow::paths::PathOutput {
+                            seq,
+                            support: support as u64,
+                            path: comp,
+                        });
+                    }
                 }
                 continue;
             }
@@ -219,12 +238,17 @@ fn run_component_inner(
                 if seq.len() < params.min_len {
                     continue;
                 }
-                let support = path
-                    .windows(2)
-                    .map(|w| flow_g.edge_weight(w[0], w[1]).unwrap_or(0))
-                    .min()
-                    .unwrap_or(0);
-                all.push(trinity_flow::paths::PathOutput { seq, support, path });
+                // M3 核心变更：PairPath 兼容计数替代边权最小值
+                let path_i32: Vec<i32> = path.iter().map(|&x| x as i32).collect();
+                let support = path_read_support(&suff_pog, &path_i32);
+                if support < params.min_read_support {
+                    continue;
+                }
+                all.push(trinity_flow::paths::PathOutput {
+                    seq,
+                    support: support as u64,
+                    path,
+                });
             }
         }
         let deduped = trinity_flow::paths::dedup_similar(all, params.flow_dedup_threshold);
