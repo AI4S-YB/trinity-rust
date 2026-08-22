@@ -91,6 +91,11 @@ pub struct TrinityArgs {
     /// （skip_quantify）, 逐分区进程内迷你 Trinity, 产物落
     /// `read_partitions/c<id>.mini.fa`（存在即跳过 = 断点）。
     pub recursive: bool,
+    /// `--super_reads`（M4）: K19 预组装超级 read 递进——归一化后以 K=19
+    /// 预组装（inchworm, ≥200bp 过滤）产出 `super_reads.fa`，作为超级
+    /// read 追加进 K25 Chrysalis reads 池（参与 RTT 投票 + QuantifyGraph
+    /// 边权）。默认 false。
+    pub super_reads: bool,
 }
 
 /// `--max_memory 10G` → 字节。镜像原版 L1156 `^(\d+)G`（大小写不敏感）;
@@ -171,6 +176,7 @@ pub fn parse_args(argv: &[String]) -> Result<TrinityArgs, CliError> {
     let max_reads_per_graph: u64 = cli.uint_flag("--max_reads_per_graph", 200000)?;
     let no_cleanup = cli.bool_flag("--no_cleanup");
     let recursive = cli.bool_flag("--recursive");
+    let super_reads = cli.bool_flag("--super_reads");
     let path_engine: PathEngine = match cli.value_flag("--path-engine")? {
         None => PathEngine::Classic,
         Some(v) => v
@@ -247,6 +253,7 @@ pub fn parse_args(argv: &[String]) -> Result<TrinityArgs, CliError> {
         max_reads_per_graph,
         no_cleanup,
         recursive,
+        super_reads,
         path_engine,
     })
 }
