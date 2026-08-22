@@ -84,7 +84,7 @@ impl FlowGraph {
         let mut v: Vec<i64> = self
             .edges
             .keys()
-            .filter(|&(_, c)| c == id)
+            .filter(|&(_, c)| *c == id)
             .map(|&(p, _)| p)
             .collect();
         v.sort_unstable();
