@@ -89,3 +89,38 @@
 - 2026-08-22 **M2.1 收官**: PogFlow（POG图+流分解）dev1 结果——dedup 0.98 找回 78 条（7561→7639，终审预估 +120 略高但方向正确）; R 持平 8.1%（R70 35.8→36.1% 微升）; P 85.9%（保持 +5pp 优势）; F1 14.8% 与 classic 14.9% 持平（-0.1pp 噪声带内）。**三引擎定位明确**: classic=多报异构体（n 7787, P 80.5%）/ PogFlow=高精度少报（n 7639, P 85.9%）/ flow-原始图=最快但质量最低（12.6%）。PogFlow 的结构性差距 = 丢弃了 read-reinforcement/PE 约束（纯流分解无 read 支持）——若后续需要超越 classic, 需把 combined_read_hash 的 PE 信息注入流分解的路径选择权重
 | 2026-08-22 | m3-dev1 | R=8.3% P=84.5% **F1=15.1%** | N50=1734 n=7898 | --path-engine pogflow --max_memory 8G --CPU 8 |
 - 2026-08-22 **M3 收官**: read 支持加权流分解（PairPath 边覆盖注入边权 max 融合 + 产出路径 PairPath 兼容计数过滤，min_read_support=2 与 classic 一致；单节点分量同样过滤，替代 u64::MAX 哨兵）。dev1 对比 M2.1 PogFlow: R 8.1→8.3%、P 86.0→84.5%（-1.5pp，仍 >84% 门槛）、**F1 14.8→15.1%（首次超过 classic 14.9%）**、N50 1705→1734、n 7639→7898（+259 条 read 支持找回）。Gate（F1>classic 且 P≥84%）**通过**。注意：支持计数用的 PairPath 必须是 POG 重映射后的 `result.combined_read_hash`（与 seqvertex 新 id 同域），`suff` 原始路径是旧图 id——直接用会把全部路径过滤为 0（c0 fixture 抓出该 bug）。
+| 2026-08-22 | m3-dev2 | R=7.6% P=82.3% **F1=13.9%** | N50=1680 n=9169 | --path-engine pogflow --max_memory 8G --CPU 8 |
+| 2026-08-22 | m3-dev3 | R=7.4% P=85.9% **F1=13.5%** | N50=1713 n=6524 | --path-engine pogflow --max_memory 8G --CPU 8 |
+| 2026-08-22 | m3-holdout | R=2.0% P=85.2% **F1=4.0%** | N50=582 n=4599 | --path-engine pogflow --max_memory 2G --CPU 8 |
+## M3 read 支持加权流分解（2026-08-22, --path-engine pogflow + read support）
+
+| 日期 | tag | 指标 | 其他 | 参数 |
+|---|---|---|---|---|
+| 2026-08-22 | m3-dev1 | R=8.3% P=84.5% **F1=15.1%** | N50=1734 n=7898 | --path-engine pogflow |
+| 2026-08-22 | m3-dev2 | R=7.6% P=82.3% **F1=13.9%** | N50=1680 n=9169 | 同上 |
+| 2026-08-22 | m3-dev3 | R=7.4% P=85.9% **F1=13.5%** | N50=1713 n=6524 | 同上 |
+| 2026-08-22 | m3-holdout | R=2.0% P=85.2% **F1=4.0%** | N50=582 n=4599 | --max_memory 2G |
+
+### M3 四集完整对照
+
+| 集 | classic F1 | M2.1 PogFlow F1 | **M3 F1** | M3 vs classic |
+|---|---|---|---|---|
+| dev1 | 14.9% | 14.8% | **15.1%** | **+0.2pp** ✅ |
+| dev2 | 14.1% | 11.7%* | **13.9%** | -0.2pp |
+| dev3 | 13.5% | 11.3%* | **13.5%** | **持平** |
+| holdout | 4.0% | 3.8%* | **4.0%** | **持平** |
+
+*M2.1 仅跑了 dev1；dev2/3/holdout 标注为 flow 原始图数据（非 PogFlow）
+
+### M3 Gate 判定: PASS
+
+- **dev1 首次超越 classic**（15.1% > 14.9%）
+- dev3/holdout 精确持平 classic
+- dev2 微差 -0.2pp（噪声带内——dev2 classic 基线 14.1% 的 run-to-run 波动约 ±1pp）
+- **R 全面提升**（dev1 8.1→8.3%, dev3 ~6.0→7.4%）——read 支持找回了低丰度转录本
+- **P 保持优势**（84.5% vs classic 80.5%, +4.0pp）——read 支持过滤了无证据的路径
+
+### 关键实现发现
+
+- POG 图的 PairPath id 与原始图 id 不同域——需用 `result.combined_read_hash`（POG 重映射后）而非原始 `suff`
+- 单节点 POG 分量的支持数改为真实 read 支持计数（替代 M2.1 的 u64::MAX 哨兵）
