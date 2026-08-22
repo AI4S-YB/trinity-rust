@@ -30,6 +30,21 @@ target/release/trinity-cli \
 
 断点续跑：各阶段 `.ok` checkpoint 文件，重跑同 `--output` 自动跳过已完成阶段。
 
+## 路径引擎（v0.2.0 新增）
+
+| `--path-engine` | dev1 F1 | 精确度 | 特点 |
+|---|---|---|---|
+| `classic`（默认） | 14.9% | 80.5% | 原版移植，read-reinforcement 路径搜索 |
+| `pogflow` | **15.1%** | **84.5%** | **M3**: POG 图 + 流分解 + read 支持过滤 |
+| `flow` | 12.6% | 78.7% | 原始量化图上的纯流分解（最快） |
+
+```bash
+trinity-cli --seqType fq --left R1.fq.gz --right R2.fq.gz \
+  --CPU 8 --max_memory 8G --path-engine pogflow --output out
+```
+
+`--recursive` 模式（分区重组装）也可用；`--path-engine` 透传到递归分区内的 Butterfly 组件。
+
 ## 架构
 
 六个 crate + 编排 CLI，数据流自上而下镜像原版：

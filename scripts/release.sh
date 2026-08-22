@@ -22,7 +22,7 @@ for b in trinity-cli inchworm trinity-kmer trinity-chrysalis butterfly; do
 done
 
 cp README.md README_English.md "$DIST/"
-cp docs/porting-map.md docs/benchmarks.md docs/backlog.md \
+cp docs/porting-map.md docs/benchmarks.md docs/backlog.md docs/opt-log.md \
    docs/architecture-discovery.md \
    docs/athaliana-benchmark.md docs/athaliana-benchmark-hd.md \
    docs/rep10-report.md "$DIST/docs/" 2>/dev/null || true
