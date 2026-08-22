@@ -515,7 +515,7 @@ pub fn run_trinity(args: &TrinityArgs) -> Result<PathBuf, CommonError> {
 /// butterfly 池 + harvest 三段。
 ///
 /// - phase-1: chrysalis 止于分区（`skip_quantify: true`, pct 50 钳制,
-///   与原版 TRINITY_COMPLETE 语义一致）, checkpoint 复用 `.quantify_graph.ok`;
+///   与原版 TRINITY_COMPLETE 语义一致）, checkpoint 用 `.recursive_phase1.ok`（防跨模式污染, M1 终审 Issue 2）;
 /// - phase-2: rayon 分区池逐分区 `run_mini` → `read_partitions/c<id>.mini.fa`
 ///   （存在即跳过 = 断点）, 整段 checkpoint `.recursive.ok`;
 /// - 汇总: mini.fa 拼接 → min_len 过滤 + 全序列去重 → `Trinity.tmp.fasta`
@@ -536,7 +536,7 @@ fn run_recursive(
     );
     // ---- phase-1: chrysalis 止于分区（.tmp 保留, 供分区池消费）----
     let mut listing_opt: Option<Vec<(u64, PathBuf)>> = None;
-    let quantify_ok = outdir.join(".quantify_graph.ok");
+    let quantify_ok = outdir.join(".recursive_phase1.ok");
     run_with_checkpoint(
         &quantify_ok,
         "Chrysalis (recursive phase-1: clustering & partitioning)",
