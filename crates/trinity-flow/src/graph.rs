@@ -41,9 +41,13 @@ impl FlowGraph {
                 .parse()
                 .map_err(|_| CommonError::Parse(format!("prev id: {}", f[1])))?;
             let w: u64 = f[2].parse().unwrap_or(0);
-            g.nodes.entry(node).or_insert(FlowNode {
-                kmer: f[3].as_bytes().to_vec(),
-            });
+            // 节点可能先以 prev 身份被插入（空 kmer）, 其自身行后到——
+            // 必须覆写而非 or_insert, 否则 kmer 永久丢失（dev1 实数据
+            // c162: 9021 节点中 8654 个 kmer 为空 → 路径序列 0bp → 全滤空）
+            let n = g.nodes.entry(node).or_insert(FlowNode { kmer: Vec::new() });
+            if n.kmer.is_empty() {
+                n.kmer = f[3].as_bytes().to_vec();
+            }
             if prev >= 0 {
                 g.nodes.entry(prev).or_insert(FlowNode { kmer: Vec::new() });
                 g.edges.insert((prev, node), w);
