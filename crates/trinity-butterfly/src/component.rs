@@ -47,6 +47,8 @@ pub struct ComponentParams {
     pub stack_size: usize,
     /// 输出层路径引擎（M2.1；默认 Classic 不变）。
     pub path_engine: PathEngine,
+    /// PogFlow 流分解的去冗余阈值（M2.1 终审微调: 0.95→0.98 找回 ~120 条近缘 isoform）。
+    pub flow_dedup_threshold: f64,
 }
 
 impl Default for ComponentParams {
@@ -61,6 +63,7 @@ impl Default for ComponentParams {
             path_reinforcement_distance: None,
             name: "component".to_string(),
             stack_size: 256 * 1024 * 1024,
+            flow_dedup_threshold: 0.98,
             path_engine: PathEngine::Classic,
         }
     }
@@ -224,7 +227,7 @@ fn run_component_inner(
                 all.push(trinity_flow::paths::PathOutput { seq, support, path });
             }
         }
-        let deduped = trinity_flow::paths::dedup_similar(all, 0.95);
+        let deduped = trinity_flow::paths::dedup_similar(all, params.flow_dedup_threshold);
         let fasta = trinity_flow::paths::to_fasta(&deduped, &params.name, 0, 60);
         return Ok(ComponentResult {
             all_prob_paths_fasta: fasta,
