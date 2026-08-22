@@ -30,9 +30,27 @@ pub fn path_to_seq(path: &[i64], kmers: &[(i64, Vec<u8>)], _k: usize) -> Vec<u8>
     seq
 }
 
-/// 简化 cd-hit 式去冗余: 逐位同一率 ≥ threshold → 保留高 support
+/// 简化 cd-hit 式去冗余, 两级:
+/// 1. 包含淘汰: 序列是某条**更长**路径的子串 → 剥离残余（源/汇中途起止的
+///    残余流）, 丢弃（长度降序处理, 保长不保 support）;
+/// 2. 逐位同一率 ≥ threshold → 保留高 support。
 pub fn dedup_similar(paths: Vec<PathOutput>, threshold: f64) -> Vec<PathOutput> {
-    let mut sorted = paths;
+    // --- 1. 包含淘汰（长度降序）---
+    let mut by_len = paths;
+    by_len.sort_by_key(|p| std::cmp::Reverse(p.seq.len()));
+    let mut survivors: Vec<PathOutput> = Vec::new();
+    for p in by_len {
+        let contained = survivors.iter().any(|q| {
+            p.seq.len() <= q.seq.len()
+                && !p.seq.is_empty()
+                && q.seq.windows(p.seq.len()).any(|w| w == p.seq.as_slice())
+        });
+        if !contained {
+            survivors.push(p);
+        }
+    }
+    // --- 2. 同一率去冗余（support 降序）---
+    let mut sorted = survivors;
     sorted.sort_by_key(|p| std::cmp::Reverse(p.support));
     let mut out: Vec<PathOutput> = Vec::new();
     for p in sorted {
@@ -60,11 +78,12 @@ pub fn to_fasta(paths: &[PathOutput], comp: &str, gene: usize, wrap: usize) -> S
     let mut s = String::new();
     for (i, p) in paths.iter().enumerate() {
         s.push_str(&format!(
-            ">{}_g{}_i{} len={} path=[{}]\n",
+            ">{}_g{}_i{} len={} support={} path=[{}]\n",
             comp,
             gene + 1,
             i + 1,
             p.seq.len(),
+            p.support,
             p.path
                 .iter()
                 .map(|x| x.to_string())
@@ -122,6 +141,24 @@ mod tests {
         let out = super::dedup_similar(seqs, 0.95);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].support, 10);
+    }
+
+    #[test]
+    fn dedup_drops_contained_peel_residue() {
+        // 剥离残余: 短路径是长路径的子串（support 更高也仍丢弃——保长）
+        let mk = |seq: &[u8], support: u64| PathOutput {
+            seq: seq.to_vec(),
+            support,
+            path: vec![1, 2],
+        };
+        let long = b"AAAACCCCGGGGTTTTAAAACCCC";
+        let out = super::dedup_similar(
+            vec![mk(&long[..10], 5), mk(long, 1)],
+            0.95,
+        );
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].seq, long);
+        assert_eq!(out[0].support, 1);
     }
 
     #[test]

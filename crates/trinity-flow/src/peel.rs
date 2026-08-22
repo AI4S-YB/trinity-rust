@@ -10,89 +10,104 @@ pub struct PeelParams {
 
 /// 分量内剥离。返回路径列表（node id 序列, 源→汇）。
 /// 注：graph 自身不被修改（在副本的 capacity 上操作）。
+///
+/// 性能: 邻接表 + 边容量用紧凑索引数组（一次构建, 剥离循环内零哈希查找——
+/// 逐迭代 O(V+E) 而非原 HashMap 边表全扫描的 O(V*E)）。
+/// 语义: 瓶颈 < min_support 的路径仍消耗其流量（流分解完整收敛）但不产出
+/// （否则单条低权边会阻断整条分量, 见 c0 fixture: 起点首边权重 1）。
 pub fn peel_component(g: &FlowGraph, comp: &[i64], p: &PeelParams) -> Vec<Vec<i64>> {
     let order = match g.toposort_component(comp) {
         Some(o) => o,
         None => return handle_cycle(g, comp, p), // 环 → 剪最小边重试
     };
     let set: std::collections::HashSet<i64> = comp.iter().copied().collect();
-    // 剩余容量
-    let mut cap: HashMap<(i64, i64), u64> = g
-        .edges
-        .iter()
-        .filter(|((u, v), _)| set.contains(u) && set.contains(v))
-        .map(|(&k, &w)| (k, w))
-        .collect();
 
-    let mut paths = Vec::new();
+    // 索引空间: 节点 → usize, 边 → usize。边按 (u, v) 排序保证确定性。
+    let idx: HashMap<i64, usize> = comp.iter().enumerate().map(|(i, &id)| (id, i)).collect();
+    let n = comp.len();
+    let mut edge_list: Vec<(i64, i64)> = g
+        .edges
+        .keys()
+        .filter(|&&(u, v)| set.contains(&u) && set.contains(&v))
+        .copied()
+        .collect();
+    edge_list.sort_unstable();
+    let mut cap: Vec<u64> = edge_list
+        .iter()
+        .map(|&(u, v)| g.edges.get(&(u, v)).copied().unwrap_or(0))
+        .collect();
+    let mut edge_pos: HashMap<(usize, usize), usize> = HashMap::with_capacity(edge_list.len());
+    let mut out_edges: Vec<Vec<usize>> = vec![Vec::new(); n];
+    let mut in_edges: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for (i, &(u, v)) in edge_list.iter().enumerate() {
+        let (ui, vi) = (idx[&u], idx[&v]);
+        edge_pos.insert((ui, vi), i);
+        out_edges[ui].push(i);
+        in_edges[vi].push(i);
+    }
+
+    let mut paths: Vec<Vec<i64>> = Vec::new();
     loop {
-        // DAG DP: best[v] = (最大总权, 前驱)
-        let mut best: HashMap<i64, (u64, Option<i64>)> = HashMap::new();
+        // DAG DP: best[v] = (最大总权, 前驱边)
+        let mut best: Vec<(u64, Option<usize>)> = vec![(0, None); n];
         for &v in &order {
+            let vi = idx[&v];
             let mut bv = (0u64, None);
-            for pred in g.predecessors(v) {
-                if let Some(&c) = cap.get(&(pred, v)) {
-                    if c == 0 {
-                        continue;
-                    }
-                    if let Some(&(bp, _)) = best.get(&pred) {
-                        let tot = bp.saturating_add(c);
-                        if tot > bv.0 {
-                            bv = (tot, Some(pred));
-                        }
-                    }
+            for &e in &in_edges[vi] {
+                let c = cap[e];
+                if c == 0 {
+                    continue;
+                }
+                let pred = edge_list[e].0;
+                let tot = best[idx[&pred]].0.saturating_add(c);
+                if tot > bv.0 {
+                    bv = (tot, Some(e));
                 }
             }
-            best.insert(v, bv);
+            best[vi] = bv;
         }
-        // 汇 = 分量中无后继（或后继容量全 0）且 best > 0 的节点中 best 最大者
+        // 汇 = 分量中无正容量后继且 best > 0 的节点中 best 最大者
         let mut sink = None;
         let mut sink_w = 0u64;
         for &v in &order {
-            let succs: Vec<i64> = g
-                .successors(v)
-                .into_iter()
-                .filter(|s| cap.get(&(v, *s)).copied().unwrap_or(0) > 0)
-                .collect();
-            if succs.is_empty() {
-                if let Some(&(bv, _)) = best.get(&v) {
-                    if bv > sink_w {
-                        sink_w = bv;
-                        sink = Some(v);
-                    }
-                }
+            let vi = idx[&v];
+            let has_succ = out_edges[vi].iter().any(|&e| cap[e] > 0);
+            if !has_succ && best[vi].0 > sink_w {
+                sink_w = best[vi].0;
+                sink = Some(vi);
             }
         }
         let sink = match sink {
             Some(s) if sink_w > 0 => s,
             _ => break,
         };
-        // 回溯路径
+        // 回溯路径（边 → 节点, 索引空间）
         let mut path = vec![sink];
         let mut cur = sink;
-        while let Some(Some(pred)) = best.get(&cur).map(|(_, p)| *p) {
-            path.push(pred);
-            cur = pred;
+        while let Some(e) = best[cur].1 {
+            cur = idx[&edge_list[e].0];
+            path.push(cur);
         }
         path.reverse();
         // 瓶颈 = 路径相邻对的最小剩余容量
         let mut bottleneck = u64::MAX;
         for w in path.windows(2) {
-            let c = cap.get(&(w[0], w[1])).copied().unwrap_or(0);
+            let c = cap[edge_pos[&(w[0], w[1])]];
             if c < bottleneck {
                 bottleneck = c;
             }
         }
-        if bottleneck == u64::MAX || bottleneck < p.min_support || path.len() < p.min_path_nodes {
+        if bottleneck == u64::MAX || path.len() < p.min_path_nodes {
             break;
         }
-        // 减流
+        // 减流（< min_support 时仍消耗但不产出——低权边不再阻断分量）
         for w in path.windows(2) {
-            if let Some(c) = cap.get_mut(&(w[0], w[1])) {
-                *c = c.saturating_sub(bottleneck);
-            }
+            let e = edge_pos[&(w[0], w[1])];
+            cap[e] = cap[e].saturating_sub(bottleneck);
         }
-        paths.push(path);
+        if bottleneck >= p.min_support {
+            paths.push(path.iter().map(|&i| comp[i]).collect());
+        }
     }
     paths
 }
