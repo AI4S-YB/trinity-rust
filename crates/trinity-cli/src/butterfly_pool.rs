@@ -34,7 +34,8 @@ pub struct ButterflyPoolParams {
     pub group_pairs_distance: usize,
     /// 专用组件线程栈（--bfly_stack_mb）。
     pub stack_size_mb: usize,
-    /// 输出层引擎（--path-engine; flow 为纯 Rust 无递归, 不走大栈线程）。
+    /// 输出层引擎（--path-engine; flow 全程迭代/显式栈——DP 剥离为循环,
+    /// Tarjan SCC 用显式栈——不依赖大栈线程, 但仍受 stack_size 保守配置）。
     pub path_engine: PathEngine,
     /// kmer 长（flow 引擎 path_to_seq 用; classic 不消费）。
     pub kmer_size: usize,

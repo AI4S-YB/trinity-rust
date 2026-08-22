@@ -97,7 +97,8 @@ fn flow_e2e_produces_trinity_fasta_and_gene_trans_map() {
     assert!(!text.is_empty() && text.contains('>'), "Trinity.fasta 空");
     // header 命名 `{comp}_g{gene}_i{iso}`（flow 的 to_fasta 产生）
     assert!(
-        text.lines().any(|l| l.starts_with('>') && l.contains("_g1_i1")),
+        text.lines()
+            .any(|l| l.starts_with('>') && l.contains("_g1_i1")),
         "缺 flow 命名 header: {text}"
     );
     // butterfly 池 checkpoint 走通（复用 classic 的组件池结构）
@@ -117,10 +118,14 @@ fn flow_e2e_produces_trinity_fasta_and_gene_trans_map() {
 #[test]
 fn path_engine_default_classic_and_validation() {
     let base = [
-        "--seqType", "fa",
-        "--single", "s.fa",
-        "--max_memory", "1G",
-        "--output", "out",
+        "--seqType",
+        "fa",
+        "--single",
+        "s.fa",
+        "--max_memory",
+        "1G",
+        "--output",
+        "out",
     ];
     let mk = |extra: &[&str]| -> Vec<String> {
         base.iter()

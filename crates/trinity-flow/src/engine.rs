@@ -64,6 +64,9 @@ pub fn run_flow_component(
             if seq.len() < p.min_len {
                 continue;
             }
+            // support 上报口径: 路径上**原始**边权的最小值（非剥离时的剩余
+            // 容量/瓶颈）——同一物理转录本的多条残余路径各自报满 support,
+            // 由 dedup 取高者; 保守高估而非低估。
             let support = path
                 .windows(2)
                 .map(|w| g.edge_weight(w[0], w[1]).unwrap_or(0))
@@ -115,5 +118,57 @@ mod tests {
     fn empty_input_yields_empty_output() {
         let out = run_flow_component("Component 7\n", "", &FlowParams::default()).unwrap();
         assert!(out.is_empty());
+    }
+
+    /// dev1 Cbin0/c11 实数据截取的 ~100 节点有环子图
+    /// （fixtures/p3/quantify/c11cyc/, 源分量 6155 节点含环——曾触发
+    /// 递归剪环的栈溢出/O(E²) 内存）。回归: SCC 缩点后不死锁、
+    /// 有环分量被识别且剥离终止。
+    #[test]
+    fn flow_on_c11_cyclic_fixture() {
+        let root = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../fixtures/p3/quantify/c11cyc/"
+        );
+        let g_text = std::fs::read_to_string(format!("{root}orig.graph.out")).unwrap();
+        let g = crate::graph::FlowGraph::parse(g_text.as_bytes()).unwrap();
+        let mut n_cyclic = 0;
+        for comp in g.weak_components() {
+            if g.toposort_component(&comp).is_none() {
+                n_cyclic += 1;
+            }
+        }
+        assert!(n_cyclic > 0, "fixture 应含环");
+        // min_len=1: 该子图的 DAG 尾巴路径短（24bp/节点）, 默认 200bp 会滤空;
+        // 回归点是「不死锁不崩溃 + DAG 部分产出」, 非全长过滤。
+        let out = run_flow_component(
+            &g_text,
+            "",
+            &FlowParams {
+                min_len: 1,
+                ..FlowParams::default()
+            },
+        )
+        .unwrap();
+        assert!(!out.is_empty(), "c11 有环子图应产出非空 FASTA");
+    }
+
+    /// dev1 全量 Cbin0/c11（6155 节点, 含 6155 节点环分量——曾触发栈溢出）。
+    /// 需 chrysalis 缓存: `TRINITY_C11_FULL=<path>/Cbin0/c11.graph.out cargo test -- --ignored`
+    #[test]
+    #[ignore]
+    fn flow_on_c11_full_component() {
+        let path = std::env::var("TRINITY_C11_FULL").expect("set TRINITY_C11_FULL");
+        let g_text = std::fs::read_to_string(&path).unwrap();
+        let out = run_flow_component(
+            &g_text,
+            "",
+            &FlowParams {
+                min_len: 1,
+                ..FlowParams::default()
+            },
+        )
+        .unwrap();
+        assert!(!out.is_empty());
     }
 }

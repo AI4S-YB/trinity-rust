@@ -125,6 +125,82 @@ impl FlowGraph {
         out
     }
 
+    /// 分量内强连通分量（Tarjan, **显式栈**——dev1 实数据有 5398 节点的环,
+    /// 递归实现会栈溢出）。返回各 SCC 内节点有序（确定性）。
+    pub fn scc_component(&self, comp: &[i64]) -> Vec<Vec<i64>> {
+        let set: std::collections::HashSet<i64> = comp.iter().copied().collect();
+        let mut adj: HashMap<i64, Vec<i64>> = HashMap::new();
+        for &(u, v) in self.edges.keys() {
+            if set.contains(&u) && set.contains(&v) {
+                adj.entry(u).or_default().push(v);
+            }
+        }
+        for v in adj.values_mut() {
+            v.sort_unstable();
+        }
+
+        let mut index: HashMap<i64, usize> = HashMap::new();
+        let mut low: HashMap<i64, usize> = HashMap::new();
+        let mut on_stack: std::collections::HashSet<i64> = std::collections::HashSet::new();
+        let mut tarjan_stack: Vec<i64> = Vec::new();
+        let mut sccs: Vec<Vec<i64>> = Vec::new();
+        let mut counter = 0usize;
+        // 调用帧 (节点, 下一未处理后继下标)——显式栈替代递归
+        let mut call: Vec<(i64, usize)> = Vec::new();
+
+        for &root in comp {
+            if index.contains_key(&root) {
+                continue;
+            }
+            call.push((root, 0));
+            while let Some(&(v, i)) = call.last() {
+                if i == 0 {
+                    // 首次进入
+                    index.insert(v, counter);
+                    low.insert(v, counter);
+                    counter += 1;
+                    tarjan_stack.push(v);
+                    on_stack.insert(v);
+                }
+                let succs = adj.get(&v).map(|s| s.as_slice()).unwrap_or(&[]);
+                if i < succs.len() {
+                    let w = succs[i];
+                    call.last_mut().unwrap().1 += 1;
+                    if !index.contains_key(&w) {
+                        call.push((w, 0));
+                    } else if on_stack.contains(&w) {
+                        let li = index[&w];
+                        if li < low[&v] {
+                            low.insert(v, li);
+                        }
+                    }
+                } else {
+                    // 后继处理完 → 回退
+                    call.pop();
+                    if let Some(&(p, _)) = call.last() {
+                        let lv = low[&v];
+                        if lv < low[&p] {
+                            low.insert(p, lv);
+                        }
+                    }
+                    if low[&v] == index[&v] {
+                        let mut scc = Vec::new();
+                        while let Some(w) = tarjan_stack.pop() {
+                            on_stack.remove(&w);
+                            scc.push(w);
+                            if w == v {
+                                break;
+                            }
+                        }
+                        scc.sort_unstable();
+                        sccs.push(scc);
+                    }
+                }
+            }
+        }
+        sccs
+    }
+
     /// 分量内 Kahn 拓扑排序（有环返回 None）
     pub fn toposort_component(&self, comp: &[i64]) -> Option<Vec<i64>> {
         let set: std::collections::HashSet<i64> = comp.iter().copied().collect();

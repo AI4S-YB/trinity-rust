@@ -25,6 +25,9 @@ pub fn path_to_seq(path: &[i64], kmers: &[(i64, Vec<u8>)], _k: usize) -> Vec<u8>
         while ov > 0 && seq[seq.len() - ov..] != kmer[..ov] {
             ov -= 1;
         }
+        // 零重叠（图上相邻但序列无后缀-前缀匹配, 如误差/缩点桥接边）:
+        // 静默直接续接（ov=0 时拼上全长 kmer）——保守不丢节点,
+        // 可能在接缝处引入 1 个错位碱基对, 而非截断路径。
         seq.extend_from_slice(&kmer[ov..]);
     }
     seq
@@ -152,10 +155,7 @@ mod tests {
             path: vec![1, 2],
         };
         let long = b"AAAACCCCGGGGTTTTAAAACCCC";
-        let out = super::dedup_similar(
-            vec![mk(&long[..10], 5), mk(long, 1)],
-            0.95,
-        );
+        let out = super::dedup_similar(vec![mk(&long[..10], 5), mk(long, 1)], 0.95);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].seq, long);
         assert_eq!(out[0].support, 1);
