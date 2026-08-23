@@ -9,6 +9,7 @@ pub mod args;
 pub mod butterfly_pool;
 pub mod checkpoint;
 pub mod harvest;
+pub mod model_guided;
 pub mod orchestrate;
 pub mod prep;
 pub mod recursive;

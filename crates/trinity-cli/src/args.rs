@@ -96,6 +96,12 @@ pub struct TrinityArgs {
     /// read 追加进 K25 Chrysalis reads 池（参与 RTT 投票 + QuantifyGraph
     /// 边权）。默认 false。
     pub super_reads: bool,
+    /// `--model-guided`（M5）: reads 招募到模型转录本的基因分组 →
+    /// 每组定向重组装 → 合并。模型来自 `--model <fa>` 或自引导
+    /// （first_pass/ 全流程产物）。
+    pub model_guided: bool,
+    /// `--model <fa>`: 模型转录本 fasta（--model-guided 的外部模型）。
+    pub model: Option<PathBuf>,
 }
 
 /// `--max_memory 10G` → 字节。镜像原版 L1156 `^(\d+)G`（大小写不敏感）;
@@ -177,6 +183,8 @@ pub fn parse_args(argv: &[String]) -> Result<TrinityArgs, CliError> {
     let no_cleanup = cli.bool_flag("--no_cleanup");
     let recursive = cli.bool_flag("--recursive");
     let super_reads = cli.bool_flag("--super_reads");
+    let model_guided = cli.bool_flag("--model-guided");
+    let model = cli.value_flag("--model")?.map(PathBuf::from);
     let path_engine: PathEngine = match cli.value_flag("--path-engine")? {
         None => PathEngine::Classic,
         Some(v) => v
@@ -232,6 +240,22 @@ pub fn parse_args(argv: &[String]) -> Result<TrinityArgs, CliError> {
     }
     // 原版: inchworm_cpu 默认 6，但 CPU 更小时收敛到 CPU（L1233 语义）。
     let inchworm_cpu = inchworm_cpu_in.unwrap_or(6).min(cpu.max(1));
+    if let Some(m) = &model {
+        if !m.exists() {
+            return Err(CliError::usage(format!(
+                "Error, --model file not found: {}",
+                m.display()
+            )));
+        }
+    }
+    if let Some(m) = &model {
+        if !model_guided {
+            eprintln!(
+                "WARNING: --model is only used with --model-guided; ignoring --model {}",
+                m.display()
+            );
+        }
+    }
 
     Ok(TrinityArgs {
         seq_type,
@@ -255,5 +279,7 @@ pub fn parse_args(argv: &[String]) -> Result<TrinityArgs, CliError> {
         recursive,
         super_reads,
         path_engine,
+        model_guided,
+        model,
     })
 }

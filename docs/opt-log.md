@@ -147,3 +147,35 @@
   反而稀释了 read 投票质量。`--super_reads` 保留为 opt-in flag（默认 off）。
   **过程 bug 修复**: 计划的 `filter_iworm_min_len_or_cov(buf, 200, 0)` 因 cov>=0 恒真
   导致全部 112,666 条 K19 contig（中位 37bp）通过——已改用专用 `filter_min_len` 严格长度过滤。
+| 2026-08-23 | m5-dev1 | R=8.6% P=83.6% **F1=15.5%** | N50=1735 n=8165 | --path-engine pogflow --model-guided --max_memory 16G --CPU 8 |
+
+## M5 模型引导组装（2026-08-23, --model-guided）
+
+| 日期 | tag | 指标 | 其他 | 参数 |
+|---|---|---|---|---|
+| 2026-08-23 | m5-dev1 | R=8.6% R70=36.9% P=83.6% **F1=15.52%** | N50=1735 n=8165 | --path-engine pogflow --model-guided --max_memory 16G --CPU 8 |
+
+### M5 Gate 创定: PASS（F1 15.52% ≥ 15.5%, 历史最佳）
+
+- 对照最强基线 M3（R=8.3 P=84.5 F1=15.11 n=7898）: R +0.3pp、P -0.9pp（仍 >80%）、
+  **F1 +0.4pp**、n +267; 亦超 classic baseline（14.96%）
+- 自引导流程: first_pass/（classic+PogFlow 全流程, 复用 run_trinity, checkpoint
+  `.model_first_pass.ok`）→ 7,877 条模型转录本 → 6816 基因组（minimap2 asm5
+  self-alignment, identity≥80% 且覆盖≥50%）→ reads 招募（minimap2 -x sr,
+  best hit = identity×qcov 最高）: 7,568,828/7,621,206 条 read 记录入组
+  （**99.3% 分配率**, orphan 仅 52,378）→ 每组 run_mini 定向重组装 → harvest_mini
+  合并去冗余
+- 基因分组粒度: 7877 转录本 → 6816 组（平均 1.16 条/组——dev1 模型本身近单 isoform,
+  分组主要起 reads 分区作用, 把全局大图切成 6817 个独立小问题）
+- **实现坑**:
+  1. minimap2 self-alignment 不能加 `--secondary=no`——交叉命中（T0↔T1）是自身
+     命中的 secondary, 会被抑制导致聚类全部退化为单转录本组; reads 招募则要加
+     （只要 best hit）;
+  2. minimap2 `-x sr` 对 /1 /2 配对后缀的处理因输入排布而异（both.fa 场景保持
+     "r0/1" 原样, 交错小文件场景回填成 "x/2/2"）——best-hit 表同时以原始 qname 与
+     剥后缀名为键双写
+- classic 回归: `--model-guided` 关闭时仅一个 `if` 分支接入, classic/PogFlow/recursive
+  路径零改动; workspace 测试全绿 + clippy/fmt clean; 合成集 e2e（外部模型）:
+  3 转录本 → 2 基因组, 150/150 reads 入组, 产出 3 条转录本 + gene_trans_map
+- 断点: `.model_guided.ok` / `.model_first_pass.ok` / `model_guided_groups/g{i}.mini.fa`
+  （存在即跳过）

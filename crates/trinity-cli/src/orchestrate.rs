@@ -271,6 +271,13 @@ pub fn run_trinity(args: &TrinityArgs) -> Result<PathBuf, CommonError> {
     }
     let _ = read_count;
 
+    // ---- 2.6 模型引导组装分支（M5, --model-guided）----
+    // 归一化 + prep 已就绪（both.fa/single.fa 字节在 target_fa）→
+    // 招募到模型基因分组 → 每组定向重组装 → 合并。
+    if args.model_guided {
+        return crate::model_guided::run_model_guided(args, &outdir, &target_fa);
+    }
+
     // ---- 2.5 K19 预组装（M4 超级 read 递进, --super_reads）----
     // 归一化 + prep 之后的 both.fa/single.fa 字节 → K=19 计数 → inchworm
     // （排序种子单线程, 预组装无需并行）→ ≥200bp 过滤 → header 改写
@@ -703,7 +710,7 @@ fn run_recursive(
 
 /// get_Trinity_gene_to_trans_map.pl: header 正则 `^(.*c\d+_g\d+)(_i\d+)` →
 /// `gene\ttrans`; 不匹配的 header 警告跳过。
-fn write_gene_trans_map(fasta: &Path, map_path: &Path) -> Result<(), CommonError> {
+pub(crate) fn write_gene_trans_map(fasta: &Path, map_path: &Path) -> Result<(), CommonError> {
     let text = fs::read_to_string(fasta)?;
     let mut out = String::new();
     for line in text.lines() {
@@ -910,7 +917,12 @@ pub fn rewrite_super_read_headers(data: &[u8]) -> Result<Vec<u8>, CommonError> {
     for line in text.lines() {
         if line.starts_with('>') {
             // >a123;45 → >sr_123
-            let acc = line.strip_prefix('>').unwrap_or(line).split(';').next().unwrap_or("");
+            let acc = line
+                .strip_prefix('>')
+                .unwrap_or(line)
+                .split(';')
+                .next()
+                .unwrap_or("");
             let num = acc.strip_prefix('a').unwrap_or(acc);
             out.extend_from_slice(format!(">sr_{num}\n").as_bytes());
         } else {
