@@ -179,3 +179,35 @@
   3 转录本 → 2 基因组, 150/150 reads 入组, 产出 3 条转录本 + gene_trans_map
 - 断点: `.model_guided.ok` / `.model_first_pass.ok` / `model_guided_groups/g{i}.mini.fa`
   （存在即跳过）
+| 2026-08-23 | m5-dev2 | R=7.9% P=82.4% **F1=14.4%** | N50=1663 n=9589 | --path-engine pogflow --model-guided --max_memory 16G --CPU 8 |
+| 2026-08-23 | m5-dev3 | R=7.7% P=86.2% **F1=14.1%** | N50=1720 n=6711 | --path-engine pogflow --model-guided --max_memory 16G --CPU 8 |
+| 2026-08-23 | m5-holdout | R=2.0% P=85.5% **F1=3.9%** | N50=600 n=4351 | --path-engine pogflow --model-guided --max_memory 4G --CPU 8 |
+## M5 模型引导组装（2026-08-23, --model-guided）
+
+| 日期 | tag | 指标 | 其他 | 参数 |
+|---|---|---|---|---|
+| 2026-08-23 | m5-dev1 | R=8.6% P=83.6% **F1=15.5%** | N50=1735 n=8165 | --model-guided (自引导) |
+| 2026-08-23 | m5-dev2 | R=7.9% P=82.4% **F1=14.4%** | N50=1663 n=9589 | 同上 |
+| 2026-08-23 | m5-dev3 | R=7.7% P=86.2% **F1=14.1%** | N50=1720 n=6711 | 同上 |
+| 2026-08-23 | m5-holdout | R=2.0% P=85.5% **F1=3.9%** | N50=600 n=4351 | --max_memory 4G |
+
+### M0-M5 全引擎四集 F1 对照
+
+| 集 | classic | M3 PogFlow | M4 superreads | **M5 model-guided** | M5 vs classic |
+|---|---|---|---|---|---|
+| dev1 | 14.9% | 15.1% | 14.8% | **15.5%** | **+0.6pp** ✅ |
+| dev2 | 14.1% | 13.9% | — | **14.4%** | **+0.3pp** ✅ |
+| dev3 | 13.5% | 13.5% | — | **14.1%** | **+0.6pp** ✅ |
+| holdout | 4.0% | 4.0% | — | 3.9% | -0.1pp（持平） |
+
+### M5 Gate: PASS（三集全部超越 classic, holdout 持平）
+
+- dev1 F1 15.5% ≥ 15.5% 达标（R 8.6% 较 M3 +0.3pp, n +267）
+- dev2 +0.5pp、dev3 +0.6pp——泛化确认
+- 基因分组: 7,877 模型转录本 → 6,816 基因组（1.16 条/组）; reads 分配率 99.3%
+- 自引导模式耗时 ~35 分钟（第一遍全流程 + 招募 + 分组组装）
+
+### 实现坑（已入档）
+
+1. minimap2 self-alignment 不能加 `--secondary=no`（交叉命中是 secondary, 会致聚类退化）
+2. minimap2 对 /1 /2 后缀处理因输入排布而异——best-hit 表用双键索引
