@@ -140,3 +140,10 @@
 - **分析（为何无增益）**: dev1 reads 已深覆盖（归一化后 both.fa 本身信息充分）, K19 预组装 contig ≈ K25 inchworm contig 的前体——对 RTT 投票的增量信息主要在跨越 K25 contig 断点的连接, 但这些连接 dev1 的 PE 距离信息已提供; 超级 read 同时引入自身错误延伸（K19 更易跨错误连接）, 增益与噪声近似抵消
 - classic 回归: `--super_reads` 关闭时代码路径零变化（K19 段整体在 `if args.super_reads` 内; e2e 断言 off 时无 super_reads.fa/.k19_preasm.ok）; 全部 37 个 CLI 测试通过
 - 断点: `.k19_preasm.ok` 命中时从盘上读回 super_reads.fa（闭包内变量在 skip 分支不生效, 需 checkpoint 后补读）
+| 2026-08-22 | m4-dev1 | R=8.1% P=84.1% **F1=14.8%** | N50=1727 n=7874 | --path-engine pogflow --super_reads |
+- 2026-08-22 **M4 Gate FAIL**（14.8% < 15.4%目标, 且低于 M3 基线 15.1% -0.3pp）。
+  K19 预组装产 7,684 条超级 read（≥200bp, 中位 560bp, 合计 6.97Mb）。
+  负结果原因: dev1 高深度 PE 覆盖下 K19 增量连通信息有限, K19 的错误连接（虚假拼接）
+  反而稀释了 read 投票质量。`--super_reads` 保留为 opt-in flag（默认 off）。
+  **过程 bug 修复**: 计划的 `filter_iworm_min_len_or_cov(buf, 200, 0)` 因 cov>=0 恒真
+  导致全部 112,666 条 K19 contig（中位 37bp）通过——已改用专用 `filter_min_len` 严格长度过滤。
