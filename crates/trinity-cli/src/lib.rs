@@ -11,5 +11,6 @@ pub mod checkpoint;
 pub mod harvest;
 pub mod orchestrate;
 pub mod prep;
+pub mod recursive;
 
 pub use args::{parse_args, SeqType, TrinityArgs};

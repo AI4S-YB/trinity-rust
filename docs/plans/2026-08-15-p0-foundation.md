@@ -1,10 +1,8 @@
 # P0 基础工程 — Trinity Rust 复刻实施计划
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
-
 **Goal:** 搭建 Cargo workspace 脚手架（6 crates + xtask）、实现 `trinity-common`（2-bit k-mer 编码/revcomp/熵 + FASTA/FASTQ IO）、编译原版 Trinity 供交叉验证，并通过黄金向量测试证明 Rust 与原版 C++ 行为位级一致。
 
-**Architecture:** 镜像式 Cargo workspace。本计划只覆盖 spec（`docs/superpowers/specs/2026-08-15-trinity-rust-design.md`）的 P0 阶段；P1（trinity-kmer）在 P0 验证门通过后另写计划。trinity-common 的每个函数直译原版 `Inchworm/src/sequenceUtil.cpp`，注释标注原版行号。
+**Architecture:** 镜像式 Cargo workspace。本计划只覆盖 spec（`docs/specs/2026-08-15-trinity-rust-design.md`）的 P0 阶段；P1（trinity-kmer）在 P0 验证门通过后另写计划。trinity-common 的每个函数直译原版 `Inchworm/src/sequenceUtil.cpp`，注释标注原版行号。
 
 **Tech Stack:** Rust (edition 2021, stable)、thiserror、flate2（rust backend = miniz_oxide，纯 Rust）、原版 Trinity v2.15.2（g++ 编译，仅供交叉验证）。
 
@@ -184,7 +182,7 @@ edition.workspace = true
 
 每个 crate 的 `src/lib.rs`（trinity-common 除外，它在 Task 3 重写）：
 ```rust
-//! P0 占位 — 将在后续阶段填充（见 docs/superpowers/specs/2026-08-15-trinity-rust-design.md §5）。
+//! P0 占位 — 将在后续阶段填充（见 docs/specs/2026-08-15-trinity-rust-design.md §5）。
 ```
 
 trinity-common 的 `src/lib.rs` 初始为：
@@ -1438,4 +1436,4 @@ git log --oneline
 3. `cargo xtask gen-fixtures` 确定性地重建黄金向量
 4. 原版 Trinity 二进制可用（inchworm smoke 已跑通）
 
-通过后进入 P1（trinity-kmer：并行计数 + dump + DigiNorm），届时另写 `docs/superpowers/plans/<日期>-p1-kmer.md`。
+通过后进入 P1（trinity-kmer：并行计数 + dump + DigiNorm），届时另写 `docs/plans/<日期>-p1-kmer.md`。

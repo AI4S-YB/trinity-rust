@@ -12,6 +12,7 @@
 
 use std::io::{BufReader, Write};
 
+use rayon::prelude::*;
 use trinity_common::error::CommonError;
 use trinity_common::fasta::FastaReader;
 use trinity_common::kmer::{base_to_int, get_ds_kmer_val, kmer_to_intval, KmerId};
@@ -83,23 +84,41 @@ pub fn kmer_coverage_vector(seq: &[u8], counts: &CountMap, k: usize, ds: bool) -
     let mut coverage = Vec::with_capacity(seq.len() - k + 1);
     let mut kmer: KmerId = 0;
     let mut valid = 0usize; // 当前位置为止连续 gatc 计数; < k ⇒ 窗口含非 gatc
+                            // M7-norm: 滚动 revcomp（数值恒等见 counter::for_each_kmer 注记）。
+    let use_rolling = ds && k <= 32;
+    let rev_shift: u32 = (2 * k - 2) as u32;
+    let mut rev: KmerId = 0;
     for (i, &c) in seq.iter().enumerate() {
         match base_to_int(c) {
             Some(v) => {
                 kmer = ((kmer << 2) | v as KmerId) & mask;
+                if use_rolling {
+                    rev = ((rev >> 2) | (((v ^ 3) as KmerId) << rev_shift)) & mask;
+                }
                 if valid < k {
                     valid += 1;
                 }
             }
             None => {
                 kmer = 0;
+                rev = 0;
                 valid = 0;
             }
         }
         if i + 1 >= k {
             // i+1 = 窗口右端（含）⇒ 窗口 [i+1-k, i]
             let count = if valid == k {
-                let key = if ds { get_ds_kmer_val(kmer, k) } else { kmer };
+                let key = if use_rolling {
+                    if rev > kmer {
+                        rev
+                    } else {
+                        kmer
+                    }
+                } else if ds {
+                    get_ds_kmer_val(kmer, k)
+                } else {
+                    kmer
+                };
                 counts.get(&key).copied().unwrap_or(0)
             } else {
                 0 // cpp: 非 gatc 窗口保持 0 → 下面 clamp 到 1
@@ -155,9 +174,123 @@ fn atoi_prefix(s: &str) -> u32 {
     signed as i32 as u32 // int → unsigned int 按位回绕（-1 → u32::MAX）
 }
 
-/// cpp L122-172 主循环（单线程形态）: 逐 read 计算统计; 空 seq 记录跳过（continue）。
+/// cpp L122-172 主循环: 逐 read 计算统计; 空 seq 记录跳过（continue）。
 /// 原版对畸形 FASTA throw → exit(1)，此处 Err 对应致命失败。
+///
+/// 性能路径（M7-norm）: 字节级记录切分 + rayon 并行逐 read 统计（行序保持——
+/// rows 按记录顺序 collect）。切分语义逐条镜像 [`FastaReader`]（跳空行/剥 \r\n/
+/// 序列去空白 + 大写 / accession 取首非空 token）; 遇到切分层无法表达的输入
+/// （首个非空行非 '>'）时**回落到串行 FastaReader 路径**以产出逐字一致的错误。
 pub fn coverage_stats_rows(
+    reads_fa: &[u8],
+    counts: &CountMap,
+    k: usize,
+    ds: bool,
+) -> Result<Vec<CoverageStatsRow>, CommonError> {
+    match split_fasta_line_records(reads_fa) {
+        Some(records) => Ok(records
+            .par_iter()
+            .filter_map(|(hdr_range, seq_range)| {
+                // 序列行集合 → 去空白 + 大写（镜像 FastaReader 的逐字符处理）
+                let mut seq: Vec<u8> = Vec::with_capacity(seq_range.len());
+                for &b in &reads_fa[seq_range.clone()] {
+                    if !b.is_ascii_whitespace() {
+                        seq.push(b.to_ascii_uppercase());
+                    }
+                }
+                if seq.is_empty() {
+                    return None; // 空 seq 记录跳过（原版 continue）
+                }
+                let cov = kmer_coverage_vector(&seq, counts, k, ds);
+                // cpp median_coverage 按值传参——排序发生在副本上; mean/stDev 用**原序**向量
+                // （f32 累加对顺序敏感，先排序会改变 stdev 舍入，实测 3 ulp 差异）
+                let mut sorted = cov.clone();
+                let acc = fasta_accession(&reads_fa[hdr_range.clone()]);
+                Some(CoverageStatsRow {
+                    acc,
+                    median: median_cov(&mut sorted),
+                    mean: mean_f32(&cov),
+                    stdev: stdev_f32(&cov),
+                })
+            })
+            .collect()),
+        None => coverage_stats_rows_serial(reads_fa, counts, k, ds),
+    }
+}
+
+/// FastaReader 语义的字节级行切分: 返回每记录 (header 行 Range, 序列行拼接 Range)。
+/// None = 首个非空行非 '>'（调用方回落串行路径报逐字错误）。
+fn split_fasta_line_records(
+    data: &[u8],
+) -> Option<Vec<(std::ops::Range<usize>, std::ops::Range<usize>)>> {
+    let mut records = Vec::new();
+    let mut pos = 0usize;
+    // 找 header 行（跳过空白行——read_line_trimmed(true) 的 trim().is_empty() 语义）
+    loop {
+        let Some(line) = next_line(data, pos) else {
+            return Some(records); // EOF
+        };
+        let (line_start, content_end, next) = line;
+        let content = &data[line_start..content_end];
+        if content.trim_ascii().is_empty() {
+            pos = next;
+            continue;
+        }
+        if content.first() != Some(&b'>') {
+            return None; // 非 '>' 起始 → 回落串行路径（逐字错误消息）
+        }
+        let hdr = line_start..content_end;
+        // 序列行: 到下一个 '>' 起始行或 EOF
+        let seq_start = next;
+        let mut seq_end = next;
+        let mut p = next;
+        while let Some((ls, ce, np)) = next_line(data, p) {
+            if data[ls] == b'>' {
+                break;
+            }
+            seq_end = ce; // 序列跨度取到当前行内容尾（多行时中间的 \n 在滤空白时剔除）
+            p = np;
+        }
+        records.push((hdr, seq_start..seq_end));
+        pos = p;
+        if p >= data.len() && seq_start == p {
+            break;
+        }
+    }
+    Some(records)
+}
+
+/// 行切片: 返回 (内容起始, 内容尾(不含 \n\r), 下一行起始)。EOF 返回 None。
+/// 空行返回 (start, start, next)。
+fn next_line(data: &[u8], pos: usize) -> Option<(usize, usize, usize)> {
+    if pos >= data.len() {
+        return None;
+    }
+    let mut end = pos;
+    while end < data.len() && data[end] != b'\n' {
+        end += 1;
+    }
+    let content_end = if end > pos && data[end - 1] == b'\r' {
+        end - 1
+    } else {
+        end
+    };
+    let next = (end + 1).min(data.len());
+    Some((pos, content_end, next))
+}
+
+/// FastaRecord::new 的 accession 语义: header 行剥可选 '>' 后按 ' '/'\t' 切的首个非空 token。
+fn fasta_accession(header_line: &[u8]) -> String {
+    let h = header_line.strip_prefix(b">").unwrap_or(header_line);
+    let s = String::from_utf8_lossy(h);
+    s.split([' ', '\t'])
+        .find(|t| !t.is_empty())
+        .unwrap_or("")
+        .to_string()
+}
+
+/// 串行原路径（错误逐字保真 + oracle 对拍基准）。
+fn coverage_stats_rows_serial(
     reads_fa: &[u8],
     counts: &CountMap,
     k: usize,
@@ -170,8 +303,6 @@ pub fn coverage_stats_rows(
             continue;
         }
         let cov = kmer_coverage_vector(rec.sequence.as_bytes(), counts, k, ds);
-        // cpp median_coverage 按值传参——排序发生在副本上; mean/stDev 用**原序**向量
-        // （f32 累加对顺序敏感，先排序会改变 stdev 舍入，实测 3 ulp 差异）
         let mut sorted = cov.clone();
         rows.push(CoverageStatsRow {
             acc: rec.accession,
@@ -371,5 +502,40 @@ mod tests {
     fn malformed_reads_fa_is_err() {
         let m: CountMap = Default::default();
         assert!(coverage_stats_rows(b"notafasta\nACGT\n", &m, 25, false).is_err());
+    }
+
+    /// M7-norm oracle: 并行快路径与串行 FastaReader 路径逐字段一致
+    /// （含空行、多行序列、空白、空 seq 记录、CRLF、无尾换行 header、小写、短 read）。
+    #[test]
+    fn parallel_rows_match_serial_oracle() {
+        let mut m: CountMap = Default::default();
+        m.insert(key("ACGTACGTACGTACGTACGTACGTA"), 7);
+        m.insert(key("TTTTGGGGCCCCAAAATTTTGGGGC"), 9);
+        let reads = b">a desc\nACGTacgt\nacgt\n\n>b\nTTTTGGGGCCCCAAAATTTTGGGGCTTT\r\n\
+                     >c\nACGTACGTACGTACGTACGTACGTACG\n\
+                     >d\r\nAC GT\tACGT ACGT ACGT ACGT acgt\n\
+                     >e\n>b2\nACG\n\
+                     >f\nacgtacgtacgtacgtacgtacgt\n";
+        let par = coverage_stats_rows(reads, &m, 25, false).unwrap();
+        let ser = coverage_stats_rows_serial(reads, &m, 25, false).unwrap();
+        assert_eq!(par, ser);
+        assert_eq!(par.len(), 6); // e 空 seq 跳过, b2/f 各 1 行
+        assert_eq!(par[0].acc, "a");
+        // 空白剔除 + 大写: d 的序列与 a 的多行拼接语义
+        assert_eq!(par[3].acc, "d");
+        // 短 read（ACG < k）行仍在（cov 空 → median 0）
+        assert_eq!(par[4].acc, "b2");
+        assert_eq!(par[4].median, 0);
+    }
+
+    /// 无尾换行的最后 header → 空序列记录（FastaReader 实证行为）。
+    #[test]
+    fn parallel_trailing_header_without_newline() {
+        let m: CountMap = Default::default();
+        let reads = b">a\nACGTACGTACGTACGTACGTACGTACG\n>b";
+        let par = coverage_stats_rows(reads, &m, 25, false).unwrap();
+        let ser = coverage_stats_rows_serial(reads, &m, 25, false).unwrap();
+        assert_eq!(par, ser);
+        assert_eq!(par.len(), 1);
     }
 }

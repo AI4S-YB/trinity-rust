@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 use rayon::prelude::*;
 use trinity_common::error::CommonError;
 use trinity_common::fasta::FastaReader;
+use trinity_common::timer::timed;
 use trinity_inchworm::debruijn::graph_per_record;
 
 use crate::bubble_up::{bubble_up_clustering, BubbleParams};
@@ -38,6 +39,9 @@ pub struct ChrysalisParams {
     pub max_reads: u64,
     /// `-t`：QuantifyGraph 阶段 rayon 线程池大小。
     pub threads: usize,
+    /// 跳过 QuantifyGraph（phase-2 分割点）：止于分区，保留 c*.graph.tmp /
+    /// c*.reads.tmp 供递归模式逐分区消费（默认 false，行为不变）。
+    pub skip_quantify: bool,
 }
 
 impl Default for ChrysalisParams {
@@ -49,6 +53,7 @@ impl Default for ChrysalisParams {
             graphs_per_partition: 1000,
             max_reads: 200_000,
             threads: 1,
+            skip_quantify: false,
         }
     }
 }
@@ -68,111 +73,134 @@ pub fn run_chrysalis_pipeline(
 
     // 1. GraphFromFasta → weld 图 → sort
     println!("-running GraphFromFasta...");
-    let iworm_seqs = read_fasta_bytes(iworm_fa, false);
-    let reads_text = String::from_utf8_lossy(reads_fa).into_owned();
-    let reads_streamed = stream_fasta_records(&reads_text);
-    let welds = graph_from_fasta(
-        &iworm_seqs,
-        &reads_streamed,
-        &GffParams {
-            strand: p.strand,
-            threads: p.threads.max(1),
-            ..Default::default()
-        },
-    )?;
-    let welds_sorted = sort_weld_graph(&welds);
+    let (iworm_seqs, welds_sorted) = timed(out_dir, "gff", || {
+        let iworm_seqs = read_fasta_bytes(iworm_fa, false);
+        let reads_text = String::from_utf8_lossy(reads_fa).into_owned();
+        let reads_streamed = stream_fasta_records(&reads_text);
+        let welds = graph_from_fasta(
+            &iworm_seqs,
+            &reads_streamed,
+            &GffParams {
+                strand: p.strand,
+                threads: p.threads.max(1),
+                ..Default::default()
+            },
+        )?;
+        let welds_sorted = sort_weld_graph(&welds);
+        Ok::<_, CommonError>((iworm_seqs, welds_sorted))
+    })?;
 
     // 2. BubbleUpClustering → component.out → bundle
-    println!("-running BubbleUpClustering...");
-    let comps = bubble_up_clustering(
-        &iworm_seqs,
-        &welds_sorted,
-        &BubbleParams {
-            min_contig_length: p.min_contig_length,
-            ..Default::default()
-        },
-    )?;
-    println!("-running CreateIwormFastaBundle...");
-    let bundle = create_iworm_fasta_bundle(&comps, 200)?;
-    let bundle_path = out_dir.join("bundled_iworm_contigs.fasta");
-    std::fs::write(&bundle_path, &bundle)?;
+    let comps = timed(out_dir, "bubble", || {
+        println!("-running BubbleUpClustering...");
+        bubble_up_clustering(
+            &iworm_seqs,
+            &welds_sorted,
+            &BubbleParams {
+                min_contig_length: p.min_contig_length,
+                ..Default::default()
+            },
+        )
+    })?;
+    let (bundle, bundle_path) = timed(out_dir, "bundle", || {
+        println!("-running CreateIwormFastaBundle...");
+        let bundle = create_iworm_fasta_bundle(&comps, 200)?;
+        let bundle_path = out_dir.join("bundled_iworm_contigs.fasta");
+        std::fs::write(&bundle_path, &bundle)?;
+        Ok::<_, CommonError>((bundle, bundle_path))
+    })?;
 
     // 3. ReadsToTranscripts → sort
-    println!("-running ReadsToTranscripts...");
-    let bundles = read_fasta_bytes(bundle.as_bytes(), false);
-    let reads_seqs = read_fasta_bytes(reads_fa, true);
-    let rtt = reads_to_transcripts(
-        &reads_seqs,
-        &bundles,
-        &RttParams {
-            strand: p.strand,
-            pct_required: p.pct_required,
-            threads: p.threads.max(1),
-            ..Default::default()
-        },
-    )?;
-    let rtt_sorted = sort_reads_to_components(&rtt.text);
+    let rtt_sorted = timed(out_dir, "rtt", || {
+        println!("-running ReadsToTranscripts...");
+        let bundles = read_fasta_bytes(bundle.as_bytes(), false);
+        let reads_seqs = read_fasta_bytes(reads_fa, true);
+        let rtt = reads_to_transcripts(
+            &reads_seqs,
+            &bundles,
+            &RttParams {
+                strand: p.strand,
+                pct_required: p.pct_required,
+                threads: p.threads.max(1),
+                ..Default::default()
+            },
+        )?;
+        Ok::<_, CommonError>(sort_reads_to_components(&rtt.text))
+    })?;
 
     // 4. FastaToDeBruijn（Trinity 实参 -K 24）
-    println!("-running FastaToDeBruijn...");
-    let f = std::fs::File::open(&bundle_path)?;
-    let mut reader = FastaReader::new(std::io::BufReader::new(f));
-    let mut recs = Vec::new();
-    while let Some(r) = reader.next_record()? {
-        recs.push(r);
-    }
-    let debruijn = graph_per_record(&recs, 24, p.strand)?;
+    let debruijn = timed(out_dir, "f2db", || {
+        println!("-running FastaToDeBruijn...");
+        let f = std::fs::File::open(&bundle_path)?;
+        let mut reader = FastaReader::new(std::io::BufReader::new(f));
+        let mut recs = Vec::new();
+        while let Some(r) = reader.next_record()? {
+            recs.push(r);
+        }
+        graph_per_record(&recs, 24, p.strand)
+    })?;
 
     // 5. partition → Component_bins/Cbin_*/c*.{graph.tmp,reads.tmp}
-    println!("-running partition...");
-    let bins = out_dir.join("Component_bins");
-    let listing = partition(
-        &debruijn,
-        &rtt_sorted,
-        &bins,
-        &PartParams {
-            graphs_per_partition: p.graphs_per_partition,
-            min_contig_length: p.min_contig_length,
-        },
-    )?;
+    let (bins, listing) = timed(out_dir, "partition", || {
+        println!("-running partition...");
+        let bins = out_dir.join("Component_bins");
+        let listing = partition(
+            &debruijn,
+            &rtt_sorted,
+            &bins,
+            &PartParams {
+                graphs_per_partition: p.graphs_per_partition,
+                min_contig_length: p.min_contig_length,
+            },
+        )?;
+        Ok::<_, CommonError>((bins, listing))
+    })?;
 
     // 6. QuantifyGraph 逐组件（rayon 并行，组件独立）
-    println!(
-        "-running QuantifyGraph on {} components ({} threads)...",
-        listing.len(),
-        p.threads
-    );
-    let qg = QgParams {
-        strand: p.strand,
-        max_reads: p.max_reads as i64,
-        ..Default::default()
-    };
-    let failures: Vec<String> = {
-        let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(p.threads.max(1))
-            .build()
-            .map_err(|e| CommonError::Parse(format!("cannot build thread pool: {e}")))?;
-        pool.install(|| {
-            listing
-                .par_iter()
-                .filter_map(|(_, base)| {
-                    let g = base.with_extension("graph.tmp");
-                    let r = base.with_extension("reads.tmp");
-                    let out = base.with_extension("graph.out");
-                    match run_quantify_for_all(&g, &r, &out, &qg) {
-                        Ok(()) => None,
-                        Err(e) => Some(format!("{}: {e}", base.display())),
-                    }
-                })
-                .collect()
-        })
-    };
-    if !failures.is_empty() {
-        return Err(CommonError::Parse(format!(
-            "QuantifyGraph failed for {} components: {}",
-            failures.len(),
-            failures.join("; ")
-        )));
+    //    skip_quantify: 递归模式分割点——止于分区, 保留 .tmp（run_quantify_for_all
+    //    成功后会删 .tmp 输入, skip 分支不进入该函数）
+    if !p.skip_quantify {
+        println!(
+            "-running QuantifyGraph on {} components ({} threads)...",
+            listing.len(),
+            p.threads
+        );
+        let qg = QgParams {
+            strand: p.strand,
+            max_reads: p.max_reads as i64,
+            ..Default::default()
+        };
+        let failures: Vec<String> = timed(
+            out_dir,
+            "quantify",
+            || -> Result<Vec<String>, CommonError> {
+                let pool = rayon::ThreadPoolBuilder::new()
+                    .num_threads(p.threads.max(1))
+                    .build()
+                    .map_err(|e| CommonError::Parse(format!("cannot build thread pool: {e}")))?;
+                Ok(pool.install(|| {
+                    listing
+                        .par_iter()
+                        .filter_map(|(_, base)| {
+                            let g = base.with_extension("graph.tmp");
+                            let r = base.with_extension("reads.tmp");
+                            let out = base.with_extension("graph.out");
+                            match run_quantify_for_all(&g, &r, &out, &qg) {
+                                Ok(()) => None,
+                                Err(e) => Some(format!("{}: {e}", base.display())),
+                            }
+                        })
+                        .collect()
+                }))
+            },
+        )?;
+        if !failures.is_empty() {
+            return Err(CommonError::Parse(format!(
+                "QuantifyGraph failed for {} components: {}",
+                failures.len(),
+                failures.join("; ")
+            )));
+        }
     }
     println!(
         "-chrysalis-all complete: {} components in {}",
@@ -195,4 +223,35 @@ fn run_quantify_for_all(g: &Path, r: &Path, out: &Path, p: &QgParams) -> Result<
     let _ = std::fs::remove_file(g);
     let _ = std::fs::remove_file(r);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn skip_quantify_stops_after_partition() {
+        // 用 fixtures/p3 的小输入（gff.iworm.fa + gff.reads.fa）
+        let root = concat!(env!("CARGO_MANIFEST_DIR"), "/../../fixtures/p3/");
+        let iworm = std::fs::read(format!("{root}gff.iworm.fa")).unwrap();
+        let reads = std::fs::read(format!("{root}gff.reads.fa")).unwrap();
+        let dir = std::env::temp_dir().join("chry_skip_quantify_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        let listing = run_chrysalis_pipeline(
+            &iworm,
+            &reads,
+            &dir,
+            &ChrysalisParams {
+                skip_quantify: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(!listing.is_empty());
+        // .tmp 在（递归模式要读）; .out 不在（quantify 未跑）; .tmp 未被清理
+        let c0 = dir.join("Component_bins/Cbin0/c0");
+        assert!(c0.with_extension("graph.tmp").exists());
+        assert!(c0.with_extension("reads.tmp").exists());
+        assert!(!c0.with_extension("graph.out").exists());
+    }
 }

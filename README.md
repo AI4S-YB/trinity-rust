@@ -30,9 +30,11 @@ target/release/trinity-cli \
 
 断点续跑：各阶段 `.ok` checkpoint 文件，重跑同 `--output` 自动跳过已完成阶段。
 
+`--recursive` 模式（分区重组装）也可用。
+
 ## 架构
 
-六个 crate + 编排 CLI，数据流自上而下镜像原版：
+五个 crate + 编排 CLI，数据流自上而下镜像原版：
 
 ```
                  trinity-cli（编排：参数面 / checkpoint / 逐阶段调用 / 汇总）
@@ -70,14 +72,24 @@ target/release/trinity-cli \
 
 ## 性能摘要
 
-详见 `docs/benchmarks.md`。代表数据（sample_data PE 100k reads，4 线程）：
+详见 `docs/benchmarks.md`（分阶段对拍）与 `docs/opt-log.md`（端到端优化记录）。
 
-- k-mer 计数+dump：比 jellyfish count+dump 快 ~3.2×、峰值内存 ~1/7，输出多重集逐字节等价。
+**相较原版 Trinity v2.15.2（C++/Perl/Java 工具链）：**
+
+- k-mer 计数+dump：比 jellyfish count+dump 快 ~3.2×、峰值内存 ~1/7，输出多重集逐字节等价（sample_data PE 100k reads，4 线程）。
+- inchworm：约 2× 快，峰值内存低 ~14%（单线程）。
+- chrysalis 全链：峰值内存 ~1/3.2（147 MB vs 466 MB）。
+- butterfly：小组件快近一个量级、峰值内存低 ~27×（无 JVM 启动与基线开销）。
 - 端到端 sample_data 全量（30575 PE reads，8 线程）：本实现 ~9 s vs 原版（含 Perl/JVM）~26 s。
+
+**相较本项目的 v0.0.1 移植版（当前版本的端到端速度优化）：**
+
+- 拟南芥真实数据（PE，`--CPU 8`）端到端 wall time **54 min → 17 min（-69%）**，组装指标与基线一致。
+- 四项优化：k-mer dump 落盘消除（二进制直桥，省 ~8 min）、ReadsToTranscripts 查询结构 16.3×、归一化 3.6×、组件分区写出 5.5×；全部带 oracle/字节级等价验证。
 
 ## 验证
 
-- `cargo test --workspace`：509 项单测/组件对拍全绿。
+- `cargo test --workspace`：534 项单测/组件对拍全绿。
 - 三层交叉验证（`cargo xtask`）：
   - `xcheck-kmer / xcheck-inchworm / xcheck-chrysalis / xcheck-butterfly`——第 1、2 层（单元/管线级，对拍原版二进制或黄金）；
   - `xcheck-trinity [--full]`——第 3 层端到端：截断（默认 50000 PE reads）/全量双侧全管线对拍 + eval 统计 + both.fa 互喂抽查 + SS(RF) 合成小集；判定阈值与校准依据见 `docs/xcheck-trinity-report.md`。
@@ -91,4 +103,4 @@ target/release/trinity-cli \
 - `docs/benchmarks.md`——基准记录
 - `docs/backlog.md`——积压与裁定记录
 - `docs/setup.md`——环境与原版工具链准备
-- 阶段 spec / plans（P1–P5 工作集）不在仓库内，随会话归档；结论均已落上述文档。
+- `docs/plans/` / `docs/specs/`——阶段实施计划与设计文档（P0–P5 移植、M0/M1 基准与递归分区、M7 速度优化）

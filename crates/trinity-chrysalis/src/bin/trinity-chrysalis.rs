@@ -292,6 +292,7 @@ fn cmd_chrysalis_all(cli: &mut Cli) -> Result<(), CliError> {
             graphs_per_partition: graphs_per,
             max_reads: max_reads.max(0) as u64,
             threads: threads as usize,
+            skip_quantify: false,
         },
     )?;
     Ok(())

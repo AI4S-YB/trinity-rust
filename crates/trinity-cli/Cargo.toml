@@ -10,3 +10,6 @@ trinity-inchworm = { path = "../trinity-inchworm" }
 trinity-chrysalis = { path = "../trinity-chrysalis" }
 trinity-butterfly = { path = "../trinity-butterfly" }
 rayon = { workspace = true }
+
+[dev-dependencies]
+flate2 = { workspace = true }

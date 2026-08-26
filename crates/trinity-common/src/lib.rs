@@ -7,3 +7,4 @@ pub mod fastq;
 pub mod io_util;
 pub mod kmer;
 pub mod seq_hash;
+pub mod timer;

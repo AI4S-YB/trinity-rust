@@ -35,12 +35,13 @@ use std::collections::HashSet;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
+use rayon::prelude::*;
 use trinity_common::error::CommonError;
 use trinity_common::io_util::open_maybe_gz;
 use trinity_common::kmer::get_ds_kmer_val;
 
 use crate::counter::{CountMap, KmerCountTable};
-use crate::coverage_stats::{coverage_stats_rows, write_stats_tsv, CoverageStatsRow};
+use crate::coverage_stats::{coverage_stats_rows, CoverageStatsRow};
 use crate::drand48::Drand48;
 use crate::nbkc::{merge_pairs, select, MergedRow, NbkcParams, StatsRow};
 use crate::read_names::{core_read_name, fq_records_to_fa, ReadType};
@@ -162,8 +163,7 @@ pub fn run(
                 lf
             };
             let left_fa = prep_side(&left_raw, fmt, ReadType::R1, params.ss_revcomp_left)?;
-            let right_fa = prep_side(&right_raw, fmt, ReadType::R2, params.ss_revcomp_right)?;
-            // both.fa = left.fa 字节后接 right.fa 字节（原版 `cat left.fa right.fa` L350）
+            let right_fa = prep_side(&right_raw, fmt, ReadType::R2, params.ss_revcomp_right)?; // both.fa = left.fa 字节后接 right.fa 字节（原版 `cat left.fa right.fa` L350）
             let mut both = left_fa.clone();
             both.extend_from_slice(&right_fa);
             let table = stats_query_table(&both, params);
@@ -377,11 +377,14 @@ fn stats_query_table(both_fa: &[u8], params: &DigiNormParams) -> CountMap {
 /// 完整计数后过滤 count < min_kmer_cov_const（计数 1 的不进表 → 查表侧缺失按 1，
 /// 与"全表 + 查表 clamp"数学等价，此处按原版路径走以保证语义保真）。
 /// DS 计数得 canonical 键、SS 得 literal 键——过滤均作用在**该表**的计数上。
+///
+/// M7-norm: 过滤用 retain 原地删（避免重建第二张表）; 预留 per-thread 槽位
+/// （count_fasta_data_with_capacity）减少生长 rehash。两者与旧路径多重集等价
+/// （KmerCountTable::count_fasta_data_with_capacity 的等价测试）。
 fn filtered_counts(both_fa: &[u8], params: &DigiNormParams) -> CountMap {
-    KmerCountTable::count_fasta_data(both_fa, params.k, params.ds)
-        .into_iter()
-        .filter(|&(_, c)| c >= params.min_kmer_cov_const)
-        .collect()
+    let mut table = KmerCountTable::count_fasta_data_with_capacity(both_fa, params.k, params.ds, 0);
+    table.retain(|_, c| *c >= params.min_kmer_cov_const);
+    table
 }
 
 /// KmerCounter.cpp:476-487 add_kmer 的 DS 装载语义: 键 canonical 化（get_DS_kmer_val）
@@ -420,20 +423,30 @@ fn sorted_stats_rows(
 ) -> Result<Vec<StatsRow>, CommonError> {
     let rows = coverage_stats_rows(reads_fa, counts, params.k, true)?;
     let mut lines = stats_lines(&rows);
-    lines.sort_by(|a, b| {
+    // M7-norm: 并行排序 + 并行 parse 回（行序由比较器全序决定，acc 唯一 → 结果确定）。
+    lines.par_sort_by(|a, b| {
         acc_field(a)
             .cmp(acc_field(b))
             .then_with(|| a.as_bytes().cmp(b.as_bytes()))
     });
-    Ok(lines.iter().map(|l| parse_stats_line(l)).collect())
+    Ok(lines.par_iter().map(|l| parse_stats_line(l)).collect())
 }
 
-/// 渲染 stats 行文本（无表头; 与 write_stats_tsv 的数据行逐字节一致）。
+/// 渲染 stats 行文本（无表头; 与 write_stats_tsv 的数据行逐字节一致——
+/// 本函数与 write_stats_tsv 的 writeln! 格式串逐字符相同，oracle 测试锁定）。
 fn stats_lines(rows: &[CoverageStatsRow]) -> Vec<String> {
-    let mut buf = Vec::new();
-    write_stats_tsv(&mut buf, rows).expect("Vec<u8> 写入不会失败");
-    let text = String::from_utf8(buf).expect("stats 行均为 ASCII/UTF-8");
-    text.lines().skip(1).map(str::to_string).collect()
+    use rayon::prelude::*;
+    rows.par_iter()
+        .map(|r| {
+            format!(
+                "{}\t{}\t{}\t{}\tthread:0",
+                r.acc,
+                r.median,
+                crate::fmt::format_g6(r.mean),
+                crate::fmt::format_g6(r.stdev)
+            )
+        })
+        .collect()
 }
 
 fn acc_field(line: &str) -> &str {
@@ -557,17 +570,23 @@ fn extract_to_file(
 /// P5 字节路径的前置）: 每次取 4 条原始行（空行也是一行、\r 保留、末行可无 \n）;
 /// 首 token（'@' 后、kseq isspace 前）经 [`core_read_name`] 查名单; 命中输出原始 4 行。
 /// 错误镜像 Perl confess: 少于 4 行 / 首行不以 '@' 开始。
+///
+/// M7-norm: 记录互独立 → 先串行定位各记录起点（行扫描），再 rayon 并行逐记录
+/// 判定/拷贝，最后按原顺序串行拼接（out 字节序、found 集合与串行版恒等;
+/// 错误取最低记录序——rayon Result collect 的 leftmost 语义）。
 fn extract_fq_records(
     data: &[u8],
     index: &HashSet<String>,
     out: &mut Vec<u8>,
     found: &mut HashSet<String>,
 ) -> Result<(), CommonError> {
+    // pass 1: 记录起点（每记录 4 行; 残尾也是一条记录 → 错误路径）
+    let mut starts: Vec<usize> = Vec::new();
     let mut pos = 0usize;
     while pos < data.len() {
-        let mut lines: [Option<&[u8]>; 4] = [None; 4];
+        starts.push(pos);
         let mut p = pos;
-        for slot in lines.iter_mut() {
+        for _ in 0..4 {
             if p >= data.len() {
                 break;
             }
@@ -575,37 +594,63 @@ fn extract_fq_records(
                 .iter()
                 .position(|&b| b == b'\n')
                 .map_or(data.len(), |i| p + i + 1);
-            *slot = Some(&data[p..end]);
             p = end;
         }
-        let n_lines = lines.iter().filter(|l| l.is_some()).count();
-        let record: Vec<&[u8]> = lines.iter().flatten().copied().collect();
-        if record.is_empty() {
-            break;
-        }
-        if n_lines < 4 {
-            return Err(CommonError::FastqFormat(format!(
-                "Error, fastQ entry doesn't have 4 lines: {}",
-                String::from_utf8_lossy(&record.concat())
-            )));
-        }
-        let name_line = trim_line_end(record[0]);
-        if !name_line.starts_with(b"@") {
-            return Err(CommonError::FastqFormat(format!(
-                "Error, cannot identify first line as read name line: {}",
-                String::from_utf8_lossy(record[0])
-            )));
-        }
-        // Fastq_record.pm: read_name = split(/\s+/, $name_line)[0] 去 '@'
-        let token = first_token(&name_line[1..]);
-        let acc = core_read_name(&String::from_utf8_lossy(token));
-        if index.contains(&acc) {
-            found.insert(acc);
-            for l in record {
-                out.extend_from_slice(l);
-            }
-        }
         pos = p;
+    }
+    // pass 2: 并行逐记录（逻辑与串行版逐行同构）
+    type MaybeHit = Option<(String, Vec<u8>)>;
+    let hits: Result<Vec<MaybeHit>, CommonError> = starts
+        .par_iter()
+        .map(|&pos| {
+            let mut lines: [Option<&[u8]>; 4] = [None; 4];
+            let mut p = pos;
+            for slot in lines.iter_mut() {
+                if p >= data.len() {
+                    break;
+                }
+                let end = data[p..]
+                    .iter()
+                    .position(|&b| b == b'\n')
+                    .map_or(data.len(), |i| p + i + 1);
+                *slot = Some(&data[p..end]);
+                p = end;
+            }
+            let n_lines = lines.iter().filter(|l| l.is_some()).count();
+            let record: Vec<&[u8]> = lines.iter().flatten().copied().collect();
+            if record.is_empty() {
+                return Ok(None);
+            }
+            if n_lines < 4 {
+                return Err(CommonError::FastqFormat(format!(
+                    "Error, fastQ entry doesn't have 4 lines: {}",
+                    String::from_utf8_lossy(&record.concat())
+                )));
+            }
+            let name_line = trim_line_end(record[0]);
+            if !name_line.starts_with(b"@") {
+                return Err(CommonError::FastqFormat(format!(
+                    "Error, cannot identify first line as read name line: {}",
+                    String::from_utf8_lossy(record[0])
+                )));
+            }
+            // Fastq_record.pm: read_name = split(/\s+/, $name_line)[0] 去 '@'
+            let token = first_token(&name_line[1..]);
+            let acc = core_read_name(&String::from_utf8_lossy(token));
+            if index.contains(&acc) {
+                let mut bytes = Vec::with_capacity(record.iter().map(|l| l.len()).sum());
+                for l in record {
+                    bytes.extend_from_slice(l);
+                }
+                Ok(Some((acc, bytes)))
+            } else {
+                Ok(None)
+            }
+        })
+        .collect();
+    for (acc, bytes) in hits?.into_iter().flatten() {
+        out.extend_from_slice(&bytes);
+        found.insert(acc);
     }
     Ok(())
 }
@@ -908,7 +953,7 @@ mod tests {
 
     #[test]
     fn stats_lines_match_write_stats_tsv_and_sort_by_acc_bytes() {
-        use crate::coverage_stats::CoverageStatsRow;
+        use crate::coverage_stats::{write_stats_tsv, CoverageStatsRow};
         let rows = vec![
             CoverageStatsRow {
                 acc: "z/1".into(),
@@ -928,6 +973,11 @@ mod tests {
             lines,
             vec!["z/1\t2\t2\t0\tthread:0", "a/1\t1\t1.4\t0.8\tthread:0"]
         );
+        // oracle: 并行渲染与 write_stats_tsv 的数据行逐字节一致（M7-norm 格式串锁定）
+        let mut buf = Vec::new();
+        write_stats_tsv(&mut buf, &rows).unwrap();
+        let text = String::from_utf8(buf).unwrap();
+        assert_eq!(lines, text.lines().skip(1).collect::<Vec<_>>());
         let mut sorted = lines;
         sorted.sort_by(|a, b| {
             acc_field(a)

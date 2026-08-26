@@ -1,7 +1,5 @@
 # P3 trinity-chrysalis — Trinity Rust 复刻实施计划
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
-
 > **状态（2026-08-17，P3 验证门通过）**: **8/8 任务全部完成**（Task 0–8，分支 p3-chrysalis）。
 > 验证门：build ok、test 340/340、clippy -D warnings 通过、fmt 通过、xcheck-chrysalis 7/7、
 > xcheck-inchworm 回归 4/4、xcheck-kmer 回归 3/3。基准与对拍数字见 `docs/benchmarks.md`
