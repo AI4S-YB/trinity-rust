@@ -6,16 +6,18 @@
 //! 都是元数据往返，实测贡献了大量 sys time。
 //!
 //! 设计（从简）:
-//! - 每个 Cbin 两个逻辑包: `graphs`（QuantifyGraph 产物 graph.out+graph.reads）
-//!   与 `butterfly`（allProbPaths.fasta）; 各为 `<name>.pack`（记录顺序追加的
+//! - 每个 Cbin 三个逻辑包: `tmp`（partition 产物 graph.tmp/reads.tmp）、
+//!   `graphs`（QuantifyGraph 产物 graph.out+graph.reads）与 `butterfly`
+//!   （allProbPaths.fasta）; 各为 `<name>.pack`（记录顺序追加的
 //!   裸字节）+ `<name>.idx`（定长 32B 记录: id u64 / kind u64 / offset u64 /
 //!   len u64, 全小端）。
 //! - 索引读入为 `Vec<PackEntry>` 按 (id, kind) 排序后二分——u64 数组级别,
 //!   不建 HashMap<String, _>; 写侧全程追加（顺序写）。
 //! - 幂等: 各阶段（chrysalis-quantify / butterfly 池）都有整段 checkpoint,
 //!   阶段重跑 =  truncate 重建对应的包, 与原来"重写同名文件"语义一致。
-//! - partition 的 `.graph.tmp`/`.reads.tmp` 仍是逐组件文件（quantify 成功即删,
-//!   生命周期限于 chrysalis 阶段内; --scratch 下本就在本地盘）——有意不打包。
+//! - partition 的 `.graph.tmp`/`.reads.tmp` 也在包内（`tmp.pack`, kind
+//!   GRAPH_TMP/READS_TMP）: quantify 整阶段成功后整包删除, 回收空间——
+//!   原版逐组件删 .tmp 的等价（粗一档: 包内记录不可单删）。
 
 use std::io::{BufWriter, Write};
 use std::path::Path;
@@ -28,11 +30,18 @@ pub const KIND_GRAPH_OUT: u64 = 1;
 pub const KIND_GRAPH_READS: u64 = 2;
 /// allProbPaths.fasta 记录（Butterfly 产物）。
 pub const KIND_ALL_PROB_PATHS: u64 = 3;
+/// graph.tmp 记录（partition 的图输出, quantify 输入）。
+pub const KIND_GRAPH_TMP: u64 = 4;
+/// reads.tmp 记录（partition 的 reads 输出, quantify / 递归分区池输入）。
+pub const KIND_READS_TMP: u64 = 5;
 
 /// QuantifyGraph 产物包名（每个 Cbin 一个）。
 pub const GRAPHS_PACK: &str = "graphs";
 /// Butterfly 产物包名（每个 Cbin 一个）。
 pub const BUTTERFLY_PACK: &str = "butterfly";
+/// partition 产物包名（每个 Cbin 一个; quantify 全阶段成功后整包删除,
+/// 镜像原版逐组件删 .tmp 输入的空间回收语义）。
+pub const TMP_PACK: &str = "tmp";
 
 /// 索引记录字节数: id / kind / offset / len 各 u64 LE。
 const IDX_REC_LEN: usize = 32;
@@ -93,6 +102,9 @@ struct PackEntry {
 
 impl PackIndex {
     /// 读入 `<name>.idx` 全文并排序（32B/条; 2.8 万组件 × 3 条 ≈ 2.7MB）。
+    /// 同 (id, kind) 多条时**后者覆盖**（稳定排序保追加序后去重取末条）——
+    /// 镜像旧文件布局"同 comp 重开文件截断重写"的语义（未排序 reads 输入的
+    /// 怪癖路径, 见 partition 模块文档）。
     pub fn load(path: &Path) -> Result<Self, CommonError> {
         let raw = std::fs::read(path)?;
         if raw.len() % IDX_REC_LEN != 0 {
@@ -111,16 +123,32 @@ impl PackIndex {
                 len: u64::from_le_bytes(rec[24..32].try_into().unwrap()),
             });
         }
-        entries.sort_unstable_by_key(|e| (e.id, e.kind));
+        entries.sort_by_key(|e| (e.id, e.kind)); // 稳定排序: 同 key 保追加序
+                                                 // 同 (id, kind) 取末条（后者覆盖）
+        entries = entries
+            .into_iter()
+            .fold(Vec::new(), |mut acc: Vec<PackEntry>, e| {
+                match acc.last_mut() {
+                    Some(last) if (last.id, last.kind) == (e.id, e.kind) => *last = e,
+                    _ => acc.push(e),
+                }
+                acc
+            });
         Ok(PackIndex { entries })
     }
 
-    /// 查 (id, kind) → (offset, len); 同 id+kind 多条（不应出现）取首条。
+    /// 查 (id, kind) → (offset, len); key 唯一（load 已去重）。
     pub fn find(&self, id: u64, kind: u64) -> Option<(u64, u64)> {
         self.entries
             .binary_search_by_key(&(id, kind), |e| (e.id, e.kind))
             .ok()
             .map(|i| (self.entries[i].offset, self.entries[i].len))
+    }
+
+    /// 枚举全部条目 (id, kind, offset, len)（(id, kind) 升序）——
+    /// 测试/对拍工具展开包内容用。
+    pub fn entries(&self) -> impl Iterator<Item = (u64, u64, u64, u64)> + '_ {
+        self.entries.iter().map(|e| (e.id, e.kind, e.offset, e.len))
     }
 }
 

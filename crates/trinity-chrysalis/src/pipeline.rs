@@ -22,7 +22,10 @@ use crate::bubble_up::{bubble_up_clustering, BubbleParams};
 use crate::bundle::create_iworm_fasta_bundle;
 use crate::dna_vector::{read_fasta_bytes, stream_fasta_records};
 use crate::graph_from_fasta::{graph_from_fasta, sort_weld_graph, GffParams};
-use crate::pack::{PackWriter, GRAPHS_PACK, KIND_GRAPH_OUT, KIND_GRAPH_READS};
+use crate::pack::{
+    PackIndex, PackWriter, GRAPHS_PACK, KIND_GRAPH_OUT, KIND_GRAPH_READS, KIND_GRAPH_TMP,
+    KIND_READS_TMP, TMP_PACK,
+};
 use crate::partition::{partition, PartParams};
 use crate::quantify::{quantify_graph_mem, QgParams};
 use crate::reads_to_transcripts::{reads_to_transcripts, sort_reads_to_components, RttParams};
@@ -160,10 +163,11 @@ pub fn run_chrysalis_pipeline(
     })?;
 
     // 6. QuantifyGraph 逐组件（rayon 并行，组件独立）
-    //    skip_quantify: 递归模式分割点——止于分区, 保留 .tmp 供递归分区池消费。
-    //    产物写每 Cbin 一个 `graphs.pack`+`graphs.idx` 打包文件（IO 优化:
-    //    替代 per-component 的 cN.graph.out / cN.graph.reads 小文件）;
-    //    包在阶段开始 truncate 重建（= 阶段级 checkpoint 重跑的幂等语义）。
+    //    skip_quantify: 递归模式分割点——止于分区, 保留 tmp 包供递归分区池消费。
+    //    输入从每 Cbin 的 `tmp.pack` 按偏移读; 产物写每 Cbin 一个
+    //    `graphs.pack`+`graphs.idx`（包在阶段开始 truncate 重建 = 阶段级
+    //    checkpoint 重跑的幂等语义）。整阶段成功后删 tmp 包（镜像原版
+    //    逐组件删 .tmp 输入的空间回收语义, 粗一档: 整包删, 失败保留供排查）。
     if !p.skip_quantify {
         println!(
             "-running QuantifyGraph on {} components ({} threads)...",
@@ -176,12 +180,17 @@ pub fn run_chrysalis_pipeline(
             ..Default::default()
         };
         let mut writers: HashMap<PathBuf, Mutex<PackWriter>> = HashMap::new();
+        let mut tmp_indexes: HashMap<PathBuf, PackIndex> = HashMap::new();
         for (_, base) in &listing {
             let dir = base.parent().map(|d| d.to_path_buf()).unwrap_or_default();
             if !writers.contains_key(&dir) {
                 writers.insert(
                     dir.clone(),
                     Mutex::new(PackWriter::create(&dir, GRAPHS_PACK)?),
+                );
+                tmp_indexes.insert(
+                    dir.clone(),
+                    PackIndex::load(&dir.join(format!("{TMP_PACK}.idx")))?,
                 );
             }
         }
@@ -197,11 +206,10 @@ pub fn run_chrysalis_pipeline(
                     listing
                         .par_iter()
                         .filter_map(|(id, base)| {
-                            let g = base.with_extension("graph.tmp");
-                            let r = base.with_extension("reads.tmp");
                             let dir = base.parent().map(|d| d.to_path_buf()).unwrap_or_default();
                             let w = writers.get(&dir).expect("writer per Cbin pre-created");
-                            match run_quantify_packed(*id, &g, &r, w, &qg) {
+                            let idx = tmp_indexes.get(&dir).expect("tmp index per Cbin loaded");
+                            match run_quantify_packed(*id, &dir, idx, w, &qg) {
                                 Ok(()) => None,
                                 Err(e) => Some(format!("{}: {e}", base.display())),
                             }
@@ -220,6 +228,11 @@ pub fn run_chrysalis_pipeline(
                 failures.join("; ")
             )));
         }
+        // 整阶段成功 → 删 tmp 包（重跑由 partition 重建）
+        for dir in tmp_indexes.keys() {
+            let _ = std::fs::remove_file(dir.join(format!("{TMP_PACK}.pack")));
+            let _ = std::fs::remove_file(dir.join(format!("{TMP_PACK}.idx")));
+        }
     }
     println!(
         "-chrysalis-all complete: {} components in {}",
@@ -229,17 +242,43 @@ pub fn run_chrysalis_pipeline(
     Ok(listing)
 }
 
-/// 逐组件 QuantifyGraph → 追加进 Cbin 的 graphs 包; 成功后删 .tmp 输入
-/// （原版 QuantifyGraph.cc:489-493 unlink 语义——.tmp 是独立文件, 照删）。
+// tmp.pack 的 per-thread 打开句柄缓存（同一线程连续命中同 Cbin 时省
+// open/close; NFS 上每次 open 都是一次元数据往返）。
+thread_local! {
+    static TMP_FILES: std::cell::RefCell<HashMap<PathBuf, std::fs::File>> =
+        std::cell::RefCell::new(HashMap::new());
+}
+
+fn read_tmp_record(dir: &Path, idx: &PackIndex, id: u64, kind: u64) -> Result<Vec<u8>, String> {
+    let (offset, len) = idx.find(id, kind).ok_or_else(|| {
+        format!(
+            "tmp pack {} has no record (id={id}, kind={kind})",
+            dir.display()
+        )
+    })?;
+    let path = dir.join(format!("{TMP_PACK}.pack"));
+    TMP_FILES.with(|m| {
+        let mut m = m.borrow_mut();
+        if !m.contains_key(&path) {
+            let f = std::fs::File::open(&path).map_err(|e| e.to_string())?;
+            m.insert(path.clone(), f);
+        }
+        crate::pack::read_at(&m[&path], offset, len).map_err(|e| e.to_string())
+    })
+}
+
+/// 逐组件 QuantifyGraph: 从 Cbin 的 tmp 包读 graph.tmp/reads.tmp 记录,
+/// 产物追加进 graphs 包。输入的删除由调用方在整阶段成功后整包完成。
 fn run_quantify_packed(
     id: u64,
-    g: &Path,
-    r: &Path,
+    dir: &Path,
+    tmp_idx: &PackIndex,
     writer: &Mutex<PackWriter>,
     p: &QgParams,
 ) -> Result<(), String> {
-    let graph = std::fs::read_to_string(g).map_err(|e| e.to_string())?;
-    let reads = std::fs::read(r).map_err(|e| e.to_string())?;
+    let graph = read_tmp_record(dir, tmp_idx, id, KIND_GRAPH_TMP)?;
+    let reads = read_tmp_record(dir, tmp_idx, id, KIND_READS_TMP)?;
+    let graph = String::from_utf8(graph).map_err(|e| e.to_string())?;
     let (gout, rout) = quantify_graph_mem(&graph, &reads, p).map_err(|e| e.to_string())?;
     {
         let mut w = writer.lock().unwrap();
@@ -248,8 +287,6 @@ fn run_quantify_packed(
         w.append(id, KIND_GRAPH_READS, rout.as_bytes())
             .map_err(|e| e.to_string())?;
     }
-    let _ = std::fs::remove_file(g);
-    let _ = std::fs::remove_file(r);
     Ok(())
 }
 
@@ -276,10 +313,31 @@ mod tests {
         )
         .unwrap();
         assert!(!listing.is_empty());
-        // .tmp 在（递归模式要读）; .out 不在（quantify 未跑）; .tmp 未被清理
+        // tmp 包在且含 c0 的 graph.tmp/reads.tmp 记录（递归模式要读）;
+        // graphs 包不在（quantify 未跑）; tmp 包未被清理
+        let cbin0 = dir.join("Component_bins/Cbin0");
+        let g = crate::pack::read_entry(
+            &cbin0,
+            crate::pack::TMP_PACK,
+            0,
+            crate::pack::KIND_GRAPH_TMP,
+        )
+        .expect("c0 graph.tmp 记录应在 tmp 包内");
+        assert!(!g.is_empty());
+        let r = crate::pack::read_entry(
+            &cbin0,
+            crate::pack::TMP_PACK,
+            0,
+            crate::pack::KIND_READS_TMP,
+        )
+        .expect("c0 reads.tmp 记录应在 tmp 包内");
+        assert!(!r.is_empty());
+        assert!(!cbin0
+            .join(format!("{}.pack", crate::pack::GRAPHS_PACK))
+            .exists());
+        // per-component 小文件不再产生
         let c0 = dir.join("Component_bins/Cbin0/c0");
-        assert!(c0.with_extension("graph.tmp").exists());
-        assert!(c0.with_extension("reads.tmp").exists());
+        assert!(!c0.with_extension("graph.tmp").exists());
         assert!(!c0.with_extension("graph.out").exists());
     }
 }

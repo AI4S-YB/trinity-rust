@@ -10,6 +10,7 @@
 
 use std::path::{Path, PathBuf};
 
+use trinity_chrysalis::pack;
 use trinity_chrysalis::partition::{partition, PartParams};
 use trinity_chrysalis::quantify::{quantify_graph, QgParams};
 use trinity_chrysalis::reads_to_transcripts::sort_reads_to_components;
@@ -42,16 +43,20 @@ fn quantify_and_partition_match_original() {
     assert_eq!(listing.len(), 55, "55 组件通过长度过滤（与 perl 脚本一致）");
 
     for comp in [0u64, 1, 2] {
-        let base = out_dir.join(format!("Cbin0/c{comp}"));
+        let cbin0 = out_dir.join("Cbin0");
         let want_dir = fixture(&format!("quantify/c{comp}"));
-        // 分区产物与黄金逐字节相等
+        // 分区产物（tmp 包内记录）与黄金逐字节相等
+        let graph_tmp = pack::read_entry(&cbin0, pack::TMP_PACK, comp, pack::KIND_GRAPH_TMP)
+            .expect("graph.tmp 记录");
+        let reads_tmp = pack::read_entry(&cbin0, pack::TMP_PACK, comp, pack::KIND_READS_TMP)
+            .expect("reads.tmp 记录");
         assert_eq!(
-            read(base.with_extension("graph.tmp")),
+            String::from_utf8(graph_tmp.clone()).unwrap(),
             read(want_dir.join("graph.tmp")),
             "c{comp} graph.tmp"
         );
         assert_eq!(
-            read(base.with_extension("reads.tmp")),
+            String::from_utf8(reads_tmp.clone()).unwrap(),
             read(want_dir.join("reads.tmp")),
             "c{comp} reads.tmp"
         );
@@ -65,8 +70,8 @@ fn quantify_and_partition_match_original() {
         std::fs::create_dir_all(&tmp).unwrap();
         let g = tmp.join(format!("c{comp}.graph.tmp"));
         let r = tmp.join(format!("c{comp}.reads.tmp"));
-        std::fs::copy(base.with_extension("graph.tmp"), &g).unwrap();
-        std::fs::copy(base.with_extension("reads.tmp"), &r).unwrap();
+        std::fs::write(&g, &graph_tmp).unwrap();
+        std::fs::write(&r, &reads_tmp).unwrap();
         let out = quantify_graph(
             g.to_str().unwrap(),
             r.to_str().unwrap(),
