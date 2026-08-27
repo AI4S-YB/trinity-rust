@@ -8,7 +8,7 @@
 //! fastaToKmerCoverageStats per-side L816-898 + `sort -k1,1`; PE merge L950-985
 //! （nbkc_merge_left_right_stats.pl --sorted）; nbkc_normalize.pl（srand(12345)）选名单;
 //! 抽取 L505-584（Fastq_reader/Fasta_reader.pm 逐记录，命中原样写出）;
-//! 输出命名 L398-410 + left/right/single.norm.{fq,fa} 便捷名 L442-453（原版为 symlink，此处双写）。
+//! 输出命名 L398-410 + left/right/single.norm.{fq,fa} 便捷名 L442-453（原版为 symlink，此处硬链接）。
 //!
 //! SS_lib_type 语义（读原版确认，与任务稿的假设不同处以源码为准）:
 //! - 空 = DS（jellyfish --canonical + stats --DS）;
@@ -127,7 +127,7 @@ fn side_base_name(paths: &[PathBuf]) -> String {
 }
 
 /// 输出文件（长名，镜像原版 L398-410 的 `{basename}.normalized_K.._maxC.._minC.._maxCV..` 命名）。
-/// 便捷名 `left.norm.*`/`right.norm.*`/`single.norm.*` 一并写出（内容双写，见 [`run`]）。
+/// 便捷名 `left.norm.*`/`right.norm.*`/`single.norm.*` 一并写出（硬链接同内容，见 [`run`]）。
 pub struct DigiNormOutputs {
     pub left: Option<PathBuf>,
     pub right: Option<PathBuf>,
@@ -760,7 +760,9 @@ fn normalized_out_path(
     ))
 }
 
-/// 便捷名双写（原版为 `ln -sf`，此处复制内容，便于下游按固定名取用）。
+/// 便捷名（原版为 `ln -sf`，此处硬链接，跨设备/目标已存在时回落复制）。
+/// 硬链同内容只占一份物理空间——长名与便捷名内容恒同，双写曾是 ~2.6GB
+/// 白写（10M PE 实测）。
 fn write_convenience(
     long: &Path,
     out_dir: &Path,
@@ -772,8 +774,16 @@ fn write_convenience(
         SeqFormat::Fa => "fa",
     };
     let dst = out_dir.join(format!("{side}.norm.{ext}"));
-    std::fs::copy(long, dst)?;
-    Ok(())
+    if dst.exists() {
+        std::fs::remove_file(&dst)?;
+    }
+    match std::fs::hard_link(long, &dst) {
+        Ok(()) => Ok(()),
+        Err(_) => {
+            std::fs::copy(long, &dst)?;
+            Ok(())
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1119,6 +1129,28 @@ mod tests {
     }
 
     // ---------------- 输出命名 ----------------
+
+    /// 便捷名与长名同一 inode（硬链接，IO 优化: 同内容不再双写物理页）。
+    #[test]
+    fn convenience_name_is_hard_link() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = std::env::temp_dir().join(format!("diginorm_hl_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let long = dir.join("x.normalized_K25_maxC200_minC1_maxCV10000.fq");
+        std::fs::write(&long, b"@r/1\nAC\n+\nII\n").unwrap();
+        write_convenience(&long, &dir, "left", SeqFormat::Fq).unwrap();
+        let dst = dir.join("left.norm.fq");
+        assert_eq!(std::fs::read(&dst).unwrap(), b"@r/1\nAC\n+\nII\n");
+        // 同文件系统上应为硬链接（同 inode）; 失败说明静默走了复制分支
+        assert_eq!(
+            std::fs::metadata(&long).unwrap().ino(),
+            std::fs::metadata(&dst).unwrap().ino()
+        );
+        // 目标已存在时（重跑）先删再链，不报错
+        write_convenience(&long, &dir, "left", SeqFormat::Fq).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn normalized_out_path_matches_original_pattern() {
