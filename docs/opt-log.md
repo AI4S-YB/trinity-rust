@@ -1036,4 +1036,35 @@ string graph 远比基因组复杂——bubble popping 因 bucket 过大一个�
 - Ra 思想的有效成分已被吸收或证伪: dedup=归一化的替代机制（classic 已有
   归一化）、前置纠错（1.57% 修正量, 可单测）、bubble popping（转录组
   bucket 爆炸不可用）。可行域回到 genome-guided / 长读长。
+
+## GTasm 式 Graph Transformer 解图 AUC 对打: 无架构增量, 收档（2026-08-27, gt_train 1-3）
+
+用户提供 GTasm（github.com/chu-xuezhe/GTasm, Graph Transformer + HiFi 基因组
+组装）。机制: overlap 图边二分类（GT 注意力 + 边特征参与打分 + ScorePredictor）,
+训练用真值坐标构造边标签, 推理用入/出度 PE, 打分引导 walk。
+
+### 移植与对打（dev1 transitions, comp 分组 70/30, 同 fold 严格公平）
+
+chrysalis 图（graph.out 顶点计数第 3 列）转 DGL; 标签 = e2_label oracle
+（与 GBM 同源同 split）; RTX 3090, dgl 2.4+cu121（venv, annevo torch 栈）。
+
+| 模型 | 边特征 | test AUC |
+|---|---|---|
+| GT v1（GTasm 原版 forward） | log 计数 | 0.5000（x=pe 丢弃内容特征 + BatchNorm 坍缩常数） |
+| GT v2（内联修正: x+pe 拼接, LayerNorm, batch 累积, 梯度裁剪） | +log 计数 | 0.9380 |
+| GT v3（特征拉平: +e2_cov） | +e2_cov | **0.9391** |
+| GBM（HistGB, 19 手工特征, 同 fold） | 全套 | **0.9439** |
+
+### 终审
+
+- **拓扑上下文无增量**: 特征拉平后 GT 仍差 GBM 0.5pp。e2_label 的判别信号
+  集中在局部特征（覆盖度/度数）, 24-mer 图的边分类不依赖多跳结构——与
+  GTasm 在 HiFi 长读 overlap 图上的成功场景（读长覆盖结构信息量大）本质
+  不同。叠加 M8 时代的标签噪声上限（63% "假"支路有保守性）, AUC 天花板
+  更可能在标签而非模型容量。
+- 至此"深度学习解图"三形态全测: M5 GBM 引导（当年砍, 复杂度）/ M9 rerank
+  （GBM 0.93 探针保留）/ GT 拓扑架构（无增量）。用户最初"DL 模型辅助
+  解图"的愿景有了完整量化答案: **转换级信号已被 GBM 吃尽, 架构升级无利**。
+- 脚本: bench/export/gt_train{,2,3}.py, gbm_baseline.py; 环境
+  /tmp/gtasm_venv（dgl cu121）。
 | 2026-08-27 | dev1 | R=14.0% P=81.4% **F1=23.9%** | N50=1836 n=7835 | --CPU 8 --max_memory 8G |
