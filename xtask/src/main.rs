@@ -1,4 +1,5 @@
 mod bench;
+mod export_candidates;
 mod export_edges;
 mod junction;
 
@@ -21,6 +22,7 @@ fn main() {
         Some("eval-trinity") => eval_trinity_cmd(&args[1..]),
         Some("bench") => std::process::exit(crate::bench::run(&args[1..])),
         Some("export-edges") => std::process::exit(crate::export_edges::run(&args[1..])),
+        Some("export-candidates") => std::process::exit(crate::export_candidates::run(&args[1..])),
         Some("xcheck-trinity") => xcheck_trinity(&args[1..]),
         Some(other) => {
             eprintln!(
