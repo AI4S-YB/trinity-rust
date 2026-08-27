@@ -33,9 +33,11 @@ Resume: each stage writes an `.ok` checkpoint file; rerunning with the same `--o
 
 **Default location of intermediates (this port's default, differs from upstream)**: without `--scratch`, all intermediates (normalization dir / both.fa / mer_counts / inchworm / chrysalis / butterfly) go to a local temp directory `${TMPDIR:-/tmp}/trinity-rust-<hash of the output path>/`, and the `--output` directory only holds the final products (`<output>.Trinity.fasta` + gene_trans_map are written next to it as usual). The path is derived deterministically from the output directory, so rerunning with the same `--output` hits the same scratch directory and resume semantics are unchanged. At startup a statvfs space check runs (rough estimate: 6× the total compressed input size, floor 4 GB); if TMPDIR is unwritable or too small, a warning is printed and the run falls back to the old behavior (intermediates inside `--output`). Scratch is treated as volatile: deleting it means recomputing everything; it is not auto-cleaned after a successful run and can be removed manually.
 
+A `--recursive` mode (partitioned re-assembly) is also available.
+
 ## Architecture
 
-Six crates plus an orchestrating CLI; the data flow mirrors the upstream pipeline top to bottom:
+Five crates plus an orchestrating CLI; the data flow mirrors the upstream pipeline top to bottom:
 
 ```
                  trinity-cli (orchestration: CLI surface / checkpoints /
@@ -82,14 +84,24 @@ Six crates plus an orchestrating CLI; the data flow mirrors the upstream pipelin
 
 ## Performance summary
 
-See `docs/benchmarks.md` for details. Representative numbers (sample_data PE 100k reads, 4 threads):
+See `docs/benchmarks.md` (per-stage cross-checks) and `docs/opt-log.md` (end-to-end optimization log) for details.
 
-- k-mer count+dump: ~3.2× faster than jellyfish count+dump at ~1/7 peak memory, with byte-equivalent output multisets.
+**Compared to upstream Trinity v2.15.2 (C++/Perl/Java toolchain):**
+
+- k-mer count+dump: ~3.2× faster than jellyfish count+dump at ~1/7 peak memory, with byte-equivalent output multisets (sample_data PE 100k reads, 4 threads).
+- inchworm: ~2× faster, ~14% lower peak RSS (single-threaded).
+- chrysalis full chain: ~1/3.2 peak RSS (147 MB vs 466 MB).
+- butterfly: nearly an order of magnitude faster on small components with ~27× lower peak RSS (no JVM startup/baseline overhead).
 - End-to-end full sample_data run (30575 PE reads, 8 threads): this port ~9 s vs upstream (incl. Perl/JVM) ~26 s.
+
+**Compared to this project's v0.0.1 straight port (end-to-end speed work in the current version):**
+
+- Arabidopsis real data (PE, `--CPU 8`) end-to-end wall time **54 min → 17 min (-69%)**, with assembly metrics identical to baseline.
+- Four optimizations: k-mer dump elimination (direct binary bridge, saves ~8 min), ReadsToTranscripts query structure 16.3×, normalization 3.6×, component partition writing 5.5× — all verified oracle/byte-level equivalent.
 
 ## Validation
 
-- `cargo test --workspace`: 509 unit tests / component cross-checks, all green.
+- `cargo test --workspace`: 553 unit tests / component cross-checks, all green.
 - Three-layer cross-validation (`cargo xtask`):
   - `xcheck-kmer / xcheck-inchworm / xcheck-chrysalis / xcheck-butterfly` — layers 1 and 2 (unit/pipeline level, checked against upstream binaries or goldens);
   - `xcheck-trinity [--full]` — layer 3 end-to-end: truncated (default 50000 PE reads) / full-scale full-pipeline cross-checks in both directions + eval statistics + both.fa cross-feed spot checks + SS(RF) synthetic small set; decision thresholds and calibration rationale in `docs/xcheck-trinity-report.md`;
@@ -103,4 +115,4 @@ Upstream toolchain environment (for cross-checking): `TRINITY_SRC` (upstream sou
 - `docs/benchmarks.md` — benchmark records
 - `docs/backlog.md` — backlog and decision log
 - `docs/setup.md` — environment and upstream toolchain preparation
-- Stage specs / plans (P1–P5 working sets) are not kept in the repo; they are archived with the sessions, and their conclusions have all landed in the documents above.
+- `docs/superpowers/plans/` / `docs/superpowers/specs/` — stage implementation plans and design documents (P0–P5 porting, M0/M1 benchmarking & recursive partitioning, M7 speed optimization)
