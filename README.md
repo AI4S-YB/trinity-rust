@@ -91,7 +91,7 @@ target/release/trinity-cli \
 
 **相较本项目的 v0.0.1 移植版（当前版本的端到端速度优化）：**
 
-- 拟南芥真实数据（PE，`--CPU 8`）端到端 wall time **54 min → 17 min（-69%）**，组装指标与基线一致。
+- 拟南芥真实数据（PE，`--CPU 8`）端到端 wall time **54 min → 11.3 min（-79%）**，组装指标与基线一致。
 - 四项优化：k-mer dump 落盘消除（二进制直桥，省 ~8 min）、ReadsToTranscripts 查询结构 16.3×、归一化 3.6×、组件分区写出 5.5×；全部带 oracle/字节级等价验证。
 
 ## 验证

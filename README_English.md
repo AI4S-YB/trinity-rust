@@ -96,7 +96,7 @@ See `docs/benchmarks.md` (per-stage cross-checks) and `docs/opt-log.md` (end-to-
 
 **Compared to this project's v0.0.1 straight port (end-to-end speed work in the current version):**
 
-- Arabidopsis real data (PE, `--CPU 8`) end-to-end wall time **54 min → 17 min (-69%)**, with assembly metrics identical to baseline.
+- Arabidopsis real data (PE, `--CPU 8`) end-to-end wall time **54 min → 11.3 min (-79%)**, with assembly metrics identical to baseline.
 - Four optimizations: k-mer dump elimination (direct binary bridge, saves ~8 min), ReadsToTranscripts query structure 16.3×, normalization 3.6×, component partition writing 5.5× — all verified oracle/byte-level equivalent.
 
 ## Validation

@@ -337,7 +337,7 @@ dependencies = [
 
 [[package]]
 name = "trinity-butterfly"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "mimalloc",
  "rustc-hash",
@@ -347,7 +347,7 @@ dependencies = [
 
 [[package]]
 name = "trinity-chrysalis"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "mimalloc",
  "rayon",
@@ -358,7 +358,7 @@ dependencies = [
 
 [[package]]
 name = "trinity-cli"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "flate2",
  "libc",
@@ -373,7 +373,7 @@ dependencies = [
 
 [[package]]
 name = "trinity-common"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "flate2",
  "thiserror",
@@ -381,7 +381,7 @@ dependencies = [
 
 [[package]]
 name = "trinity-inchworm"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "dashmap",
  "mimalloc",
@@ -393,7 +393,7 @@ dependencies = [
 
 [[package]]
 name = "trinity-kmer"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "mimalloc",
  "rayon",
@@ -427,7 +427,7 @@ checksum = "f0805222e57f7521d6a62e36fa9163bc891acd422f971defe97d64e70d0a4fe5"
 
 [[package]]
 name = "xtask"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "flate2",
  "rayon",
