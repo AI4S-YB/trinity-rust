@@ -16,6 +16,10 @@ use trinity_common::cli::{Cli, CliError};
 use trinity_common::io_util::open_maybe_gz;
 use trinity_kmer::diginorm::{run, DigiNormParams, ReadsInput};
 
+// 全局 mimalloc（与 trinity-cli 一致; 实测大幅降低 minor page fault 与 sys time）。
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let cmd = args.first().cloned().unwrap_or_default();

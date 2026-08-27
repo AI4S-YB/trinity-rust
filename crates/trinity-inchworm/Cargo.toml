@@ -9,3 +9,4 @@ trinity-kmer = { path = "../trinity-kmer" }
 rustc-hash = { workspace = true }
 dashmap = { workspace = true }
 rayon = { workspace = true }
+mimalloc = { workspace = true }

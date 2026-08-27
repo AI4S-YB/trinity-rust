@@ -44,6 +44,10 @@ const USAGE: &str = "用法: trinity-chrysalis <子命令> [参数]
   chrysalis-all       -i <iworm.fa> -r <reads.fa> -o <outdir> [--SS] [-L 200] [-p 50]
                       [-N 1000] [--max_reads 200000] [-t N]";
 
+// 全局 mimalloc（与 trinity-cli 一致; 实测大幅降低 minor page fault 与 sys time）。
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     std::process::exit(run(&args));

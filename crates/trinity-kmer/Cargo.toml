@@ -7,3 +7,4 @@ edition.workspace = true
 trinity-common = { path = "../trinity-common" }
 rayon = { workspace = true }
 rustc-hash = { workspace = true }
+mimalloc = { workspace = true }
