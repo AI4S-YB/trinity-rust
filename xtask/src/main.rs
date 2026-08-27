@@ -1375,6 +1375,13 @@ fn xc_quantify_reads(ours: &Path, orig: &Path, graph_tmp: &Path) -> Result<Strin
     Ok(format!("reads 过滤刀口提及 {skipped}/{} 行", g.len()))
 }
 
+/// 从打包布局读一条 per-component 记录（pack 布局, 替代旧的 cN.* 小文件）。
+/// `base` = listing 的 `.../Cbin<N>/c<id>` 逻辑前缀（记录在其父目录的包里）。
+fn pack_rec(base: &Path, pack_name: &str, id: u64, kind: u64) -> Result<Vec<u8>, String> {
+    let dir = base.parent().map(|d| d.to_path_buf()).unwrap_or_default();
+    trinity_chrysalis::pack::read_entry(&dir, pack_name, id, kind).map_err(|e| e.to_string())
+}
+
 fn xcheck_chrysalis(args: &[String]) {
     let root = workspace_root();
     let mut iworm = root.join("fixtures/p3/gff.iworm.fa");
@@ -1770,13 +1777,19 @@ fn xcheck_chrysalis(args: &[String]) {
         }
         let bins_prefix = ours.join("bins");
         for line in listing.lines() {
-            let (_id, base) = line.split_once('\t').unwrap();
+            let (id_s, base) = line.split_once('\t').unwrap();
+            let id: u64 = id_s.parse().unwrap();
             let base_p = PathBuf::from(base);
             let rel = base_p.strip_prefix(&bins_prefix).unwrap().to_path_buf();
-            for ext in ["graph.tmp", "reads.tmp"] {
-                let ours_f = base_p.with_extension(ext);
+            // 我们侧为打包布局（tmp.pack）: 按 (id, kind) 从包读记录;
+            // 原版侧仍是 per-component 文件。
+            for (ext, kind) in [
+                ("graph.tmp", trinity_chrysalis::pack::KIND_GRAPH_TMP),
+                ("reads.tmp", trinity_chrysalis::pack::KIND_READS_TMP),
+            ] {
+                let ours_b = pack_rec(&base_p, trinity_chrysalis::pack::TMP_PACK, id, kind)?;
                 let orig_f = orig.join("Component_bins").join(&rel).with_extension(ext);
-                if read_s(&ours_f) != read_s(&orig_f) {
+                if ours_b != read_s(&orig_f).into_bytes() {
                     return Err(format!(
                         "{} 非逐字节相等",
                         rel.with_extension(ext).display()
@@ -1808,11 +1821,13 @@ fn xcheck_chrysalis(args: &[String]) {
         let mut warns = Vec::new();
         let mut checked = 0usize;
         for line in listing.lines() {
-            let (_id, base) = line.split_once('\t').unwrap();
+            let (id_s, base) = line.split_once('\t').unwrap();
+            let id: u64 = id_s.parse().unwrap();
             let base = PathBuf::from(base);
             let _rel = base.strip_prefix(&bins_prefix).unwrap().to_path_buf();
             let tag = base.file_name().unwrap().to_str().unwrap().to_string();
-            // 原版默认删输入——双侧复制副本再跑（-no_cleanup 双保险）
+            // 双侧 quantify 子命令仍是文件接口: 从 tmp 包解出记录落临时文件
+            // （原版默认删输入——双侧各写副本再跑, -no_cleanup 双保险）
             let (og, or_) = (
                 odir.join(format!("{tag}.graph.tmp")),
                 odir.join(format!("{tag}.reads.tmp")),
@@ -1821,10 +1836,24 @@ fn xcheck_chrysalis(args: &[String]) {
                 ydir.join(format!("{tag}.graph.tmp")),
                 ydir.join(format!("{tag}.reads.tmp")),
             );
-            std::fs::copy(base.with_extension("graph.tmp"), &og).unwrap();
-            std::fs::copy(base.with_extension("reads.tmp"), &or_).unwrap();
-            std::fs::copy(base.with_extension("graph.tmp"), &yg).unwrap();
-            std::fs::copy(base.with_extension("reads.tmp"), &yr).unwrap();
+            let g_b = pack_rec(
+                &base,
+                trinity_chrysalis::pack::TMP_PACK,
+                id,
+                trinity_chrysalis::pack::KIND_GRAPH_TMP,
+            )?;
+            let r_b = pack_rec(
+                &base,
+                trinity_chrysalis::pack::TMP_PACK,
+                id,
+                trinity_chrysalis::pack::KIND_READS_TMP,
+            )?;
+            for p in [&og, &yg] {
+                std::fs::write(p, &g_b).unwrap();
+            }
+            for p in [&or_, &yr] {
+                std::fs::write(p, &r_b).unwrap();
+            }
             run_redirect(
                 Command::new(&rs).args([
                     "quantify-graph",
@@ -1930,24 +1959,45 @@ fn xcheck_chrysalis(args: &[String]) {
             }
             return Err("listing 路径/序差异（组件集相同）".to_string());
         }
-        // 自一致性：首组件 graph.out 逐字节
+        // 自一致性：首组件 graph.out 逐字节（chrysalis-all 侧在 graphs 包内,
+        // 逻辑前缀 = listing 的 Cbin 路径; 包读接口见 pack_rec）
         let first = listing_chain.lines().next().unwrap();
+        let id0: u64 = first.split('\t').next().unwrap().parse().unwrap();
         let base0 = PathBuf::from(first.split('\t').nth(1).unwrap());
         let tag0 = base0.file_name().unwrap().to_str().unwrap().to_string();
         let ours_qg = ours.join("qg").join(format!("{tag0}.graph.out"));
-        let all_g = all
+        let all_base0 = all
             .join("Component_bins")
-            .join(base0.strip_prefix(ours.join("bins")).unwrap())
-            .with_extension("graph.out");
-        if read_s(&ours_qg) != read_s(&all_g) {
+            .join(base0.strip_prefix(ours.join("bins")).unwrap());
+        let all_g = pack_rec(
+            &all_base0,
+            trinity_chrysalis::pack::GRAPHS_PACK,
+            id0,
+            trinity_chrysalis::pack::KIND_GRAPH_OUT,
+        )?;
+        if read_s(&ours_qg).into_bytes() != all_g {
             return Err(format!(
                 "chrysalis-all {} 与逐命令产物非逐字节相等",
-                all_g.display()
+                all_base0.display()
             ));
         }
 
-        // Butterfly 冒烟：首组件（.graph.out + .graph.reads 已就绪）
-        let all_base0 = all_g.parent().unwrap().join(base0.file_name().unwrap());
+        // Butterfly 冒烟：首组件 graph.out/graph.reads 从 graphs 包解出为临时
+        // 文件（Butterfly.jar 是文件接口），跑原版 java 验证可被消化。
+        let smoke = work.join("bfly_smoke");
+        std::fs::create_dir_all(&smoke).unwrap();
+        std::fs::write(smoke.join(format!("{tag0}.graph.out")), &all_g).unwrap();
+        std::fs::write(
+            smoke.join(format!("{tag0}.graph.reads")),
+            pack_rec(
+                &all_base0,
+                trinity_chrysalis::pack::GRAPHS_PACK,
+                id0,
+                trinity_chrysalis::pack::KIND_GRAPH_READS,
+            )?,
+        )
+        .unwrap();
+        let smoke_base = smoke.join(&tag0);
         let st = Command::new(&java)
             .args([
                 "-Xmx2g",
@@ -1960,17 +2010,17 @@ fn xcheck_chrysalis(args: &[String]) {
                 "-F",
                 "300",
                 "-C",
-                all_base0.with_extension("graph").to_str().unwrap(),
+                smoke_base.with_extension("graph").to_str().unwrap(),
                 "--NO_EM_REDUCE",
                 "--stderr",
             ])
-            .current_dir(all_g.parent().unwrap())
+            .current_dir(&smoke)
             .status()
             .map_err(|e| format!("无法启动 java: {e}"))?;
         if !st.success() {
             return Err(format!("Butterfly 退出码 {st}"));
         }
-        let prob = all_base0.with_extension("graph.allProbPaths.fasta");
+        let prob = smoke_base.with_extension("graph.allProbPaths.fasta");
         let text = read_s(&prob);
         let n = text.lines().filter(|l| l.starts_with('>')).count();
         if text.trim().is_empty() || n == 0 {

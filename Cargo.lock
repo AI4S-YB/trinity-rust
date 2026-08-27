@@ -432,6 +432,7 @@ dependencies = [
  "rayon",
  "sha2",
  "trinity-butterfly",
+ "trinity-chrysalis",
  "trinity-common",
  "trinity-kmer",
 ]

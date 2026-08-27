@@ -11,6 +11,8 @@ path = "../crates/trinity-butterfly"
 path = "../crates/trinity-common"
 [dependencies.trinity-kmer]
 path = "../crates/trinity-kmer"
+[dependencies.trinity-chrysalis]
+path = "../crates/trinity-chrysalis"
 [dependencies.flate2]
 workspace = true
 [dependencies.rayon]
