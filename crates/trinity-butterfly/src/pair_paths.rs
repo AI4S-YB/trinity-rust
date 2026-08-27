@@ -448,34 +448,6 @@ impl SuffStats {
     }
 }
 
-/// 统计所有 PairPath 的路径中，每对相邻节点 (u,v) 被多少 read 覆盖（M3）。
-pub fn edge_read_coverage(s: &SuffStats) -> FxHashMap<(i32, i32), i64> {
-    let mut cov: FxHashMap<(i32, i32), i64> = FxHashMap::default();
-    for inner in s.combined_read_hash.values() {
-        for (pp, &count) in inner {
-            for path in [&pp.path1, &pp.path2] {
-                for w in path.windows(2) {
-                    *cov.entry((w[0], w[1])).or_insert(0) += count;
-                }
-            }
-        }
-    }
-    cov
-}
-
-/// 统计一条产出路径被多少 PairPath 兼容包含（M3 路径 read 支持数）。
-pub fn path_read_support(s: &SuffStats, path: &[i32]) -> i64 {
-    let mut total = 0i64;
-    for inner in s.combined_read_hash.values() {
-        for (pp, &count) in inner {
-            if pp.is_compatible_and_contained_by_single_path(path) {
-                total += count;
-            }
-        }
-    }
-    total
-}
-
 /// Java `getSuffStats_wPairs`（L9294）：按 read 名分组（同 T5 的 occurrence 序），
 /// 名下 1 条 → 单端 PairPath(path1)；≥2 条 → 取**前两条**（Java curList.get(0/1)，
 /// 更多 occurrence 忽略）。计数按 (firstV, PairPath) 累积。
@@ -875,67 +847,6 @@ mod tests {
         // HashMap 键语义：同 path1/path2 的 PairPath 相等
         assert_eq!(pp(&[1, 2], &[7, 8]), pp(&[1, 2], &[7, 8]));
         assert_ne!(pp(&[1, 2], &[7, 8]), pp(&[7, 8], &[1, 2]));
-    }
-
-    // ---------------- M3 read 支持 ----------------
-
-    #[test]
-    fn edge_coverage_counts() {
-        // PairPath path1=[1,2,3] → 边覆盖: (1,2)+5, (2,3)+5
-        let mut s = SuffStats::default();
-        let pp = PairPath::new(vec![1, 2, 3]);
-        s.combined_read_hash
-            .entry(1)
-            .or_default()
-            .insert(pp.clone(), 5);
-        let cov = edge_read_coverage(&s);
-        assert_eq!(cov.get(&(1, 2)), Some(&5));
-        assert_eq!(cov.get(&(2, 3)), Some(&5));
-        assert!(!cov.contains_key(&(1, 3))); // 不相邻的边不计数
-    }
-
-    #[test]
-    fn edge_coverage_includes_path2_and_accumulates() {
-        let mut s = SuffStats::default();
-        s.combined_read_hash
-            .entry(1)
-            .or_default()
-            .insert(PairPath::with_pair(vec![1, 2], vec![8, 9]), 3);
-        s.combined_read_hash
-            .entry(1)
-            .or_default()
-            .insert(PairPath::new(vec![1, 2]), 2);
-        let cov = edge_read_coverage(&s);
-        assert_eq!(cov.get(&(1, 2)), Some(&5)); // 3 + 2 累积
-        assert_eq!(cov.get(&(8, 9)), Some(&3)); // path2 也计数
-    }
-
-    #[test]
-    fn path_read_support_counts_compatible() {
-        // 路径 [1,2,3,4] 包含 PairPath path1=[1,2,3] → support=5
-        let mut s = SuffStats::default();
-        s.combined_read_hash
-            .entry(1)
-            .or_default()
-            .insert(PairPath::new(vec![1, 2, 3]), 5);
-        s.combined_read_hash
-            .entry(9)
-            .or_default()
-            .insert(PairPath::new(vec![9, 10]), 3);
-        let support = path_read_support(&s, &[1, 2, 3, 4]);
-        assert_eq!(support, 5); // 只有 [1,2,3] 被包含
-    }
-
-    #[test]
-    fn path_read_support_no_match_is_zero() {
-        let mut s = SuffStats::default();
-        s.combined_read_hash
-            .entry(9)
-            .or_default()
-            .insert(PairPath::new(vec![9, 10]), 3);
-        assert_eq!(path_read_support(&s, &[1, 2, 3]), 0);
-        // 单节点路径不兼容任何双节点 read
-        assert_eq!(path_read_support(&s, &[9]), 0);
     }
 
     // ---------------- getSuffStats_wPairs ----------------

@@ -302,8 +302,6 @@ dependencies = [
  "rustc-hash",
  "thiserror",
  "trinity-common",
- "trinity-flow",
- "trinity-kmer",
 ]
 
 [[package]]
@@ -325,7 +323,6 @@ dependencies = [
  "trinity-butterfly",
  "trinity-chrysalis",
  "trinity-common",
- "trinity-flow",
  "trinity-inchworm",
  "trinity-kmer",
 ]
@@ -336,13 +333,6 @@ version = "0.3.0"
 dependencies = [
  "flate2",
  "thiserror",
-]
-
-[[package]]
-name = "trinity-flow"
-version = "0.3.0"
-dependencies = [
- "trinity-common",
 ]
 
 [[package]]

@@ -14,11 +14,10 @@ pub mod pair_paths;
 pub mod paths;
 pub mod pog;
 pub mod postprocess;
-pub mod protein_extend;
 pub mod prune;
 pub mod threading;
 
-pub use component::{run_component, ComponentParams, ComponentResult, PathEngine};
+pub use component::{run_component, ComponentParams, ComponentResult};
 pub use context::BflyContext;
 pub use dfs::{get_topological_order, run_dfs2};
 pub use graph::{DiGraph, SeqVertex, SimpleEdge, T_VERTEX_ID, VERTEX_ROOT_ID};
@@ -27,8 +26,7 @@ pub use graph_io::{
     write_dot_string, BuildResult, RawRead, ReadParseError,
 };
 pub use pair_paths::{
-    edge_read_coverage, get_suff_stats_w_pairs, individual_paths_are_compatible, path_read_support,
-    trim_sink_nodes, PairPath, SuffStats,
+    get_suff_stats_w_pairs, individual_paths_are_compatible, trim_sink_nodes, PairPath, SuffStats,
 };
 pub use paths::{
     add_s_and_t, divide_into_components, extract_complex_path_prefixes_from_reads,

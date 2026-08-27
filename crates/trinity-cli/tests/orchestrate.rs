@@ -183,13 +183,6 @@ fn butterfly_pool_isolates_failures() {
             min_contig_length: 100,
             group_pairs_distance: 500,
             stack_size_mb: 16,
-            path_engine: trinity_cli::args::PathEngine::Classic,
-            kmer_size: 25,
-            flow_cov_fusion: false,
-            flow_cov_cap: 10,
-            counts_bin: dir.join("mer_counts.25.asm.rs.bin"),
-            count_source_fa: dir.join("both.fa"),
-            counts_ds: true,
         },
     )
     .unwrap_err();

@@ -599,7 +599,8 @@ fn extract_fq_records(
         pos = p;
     }
     // pass 2: 并行逐记录（逻辑与串行版逐行同构）
-    let hits: Result<Vec<Option<(String, Vec<u8>)>>, CommonError> = starts
+    type MaybeHit = Option<(String, Vec<u8>)>;
+    let hits: Result<Vec<MaybeHit>, CommonError> = starts
         .par_iter()
         .map(|&pos| {
             let mut lines: [Option<&[u8]>; 4] = [None; 4];
@@ -647,11 +648,9 @@ fn extract_fq_records(
             }
         })
         .collect();
-    for hit in hits? {
-        if let Some((acc, bytes)) = hit {
-            out.extend_from_slice(&bytes);
-            found.insert(acc);
-        }
+    for (acc, bytes) in hits?.into_iter().flatten() {
+        out.extend_from_slice(&bytes);
+        found.insert(acc);
     }
     Ok(())
 }

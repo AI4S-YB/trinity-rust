@@ -13,41 +13,6 @@ pub enum SeqType {
     Fa,
 }
 
-/// `--path-engine classic|flow|pogflow`（M2 Rust 版扩展）: butterfly 输出层引擎选择。
-/// classic = 原 Butterfly 移植; flow = 量化图最重路径剥离流分解;
-/// pogflow = POG 图（SeqVertex DAG）+ 流分解（M2.1）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum PathEngine {
-    #[default]
-    Classic,
-    Flow,
-    PogFlow,
-}
-
-impl std::fmt::Display for PathEngine {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            PathEngine::Classic => "classic",
-            PathEngine::Flow => "flow",
-            PathEngine::PogFlow => "pogflow",
-        })
-    }
-}
-
-impl std::str::FromStr for PathEngine {
-    type Err = CliError;
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "classic" => Ok(PathEngine::Classic),
-            "flow" => Ok(PathEngine::Flow),
-            "pogflow" => Ok(PathEngine::PogFlow),
-            other => Err(CliError::usage(format!(
-                "Error, unrecognized path-engine value of {other}. Should be: classic, flow or pogflow"
-            ))),
-        }
-    }
-}
-
 /// 主线参数集（原版 17 个同名 flag + Rust 版扩展 `--bfly_stack_mb`）。
 ///
 /// 继续性: workdir 既有 outdir 恢复（`.ok` 断点）天然支持，无 `--resume`
@@ -85,32 +50,10 @@ pub struct TrinityArgs {
     pub max_reads_per_graph: u64,
     /// 收尾不删中间文件。
     pub no_cleanup: bool,
-    /// `--path-engine`（M2）: butterfly 输出层引擎（默认 classic）。
-    pub path_engine: PathEngine,
     /// `--recursive`（M1）: 递归分区模式——phase-1 chrysalis 止于分区
     /// （skip_quantify）, 逐分区进程内迷你 Trinity, 产物落
     /// `read_partitions/c<id>.mini.fa`（存在即跳过 = 断点）。
     pub recursive: bool,
-    /// `--super_reads`（M4）: K19 预组装超级 read 递进——归一化后以 K=19
-    /// 预组装（inchworm, ≥200bp 过滤）产出 `super_reads.fa`，作为超级
-    /// read 追加进 K25 Chrysalis reads 池（参与 RTT 投票 + QuantifyGraph
-    /// 边权）。默认 false。
-    pub super_reads: bool,
-    /// `--model-guided`（M5）: reads 招募到模型转录本的基因分组 →
-    /// 每组定向重组装 → 合并。模型来自 `--model <fa>` 或自引导
-    /// （first_pass/ 全流程产物）。
-    pub model_guided: bool,
-    /// `--model <fa>`: 模型转录本 fasta（--model-guided 的外部模型）。
-    pub model: Option<PathBuf>,
-    /// `--protein-guided`（M6a）: DIAMOND 蛋白模板引导延长。
-    pub protein_guided: bool,
-    /// `--protein-db <fa>`: 蛋白库（--protein-guided 必需）。
-    pub protein_db: Option<PathBuf>,
-    /// `--flow-cov-fusion`（M8）: PogFlow 流分解的无 read 证据边以
-    /// junction k-mer 覆盖度（封顶）兜底权重。仅 PogFlow 引擎消费。默认 false。
-    pub flow_cov_fusion: bool,
-    /// `--flow-cov-cap <N>`: 覆盖度兜底权重上限（默认 10）。
-    pub flow_cov_cap: u64,
 }
 
 /// `--max_memory 10G` → 字节。镜像原版 L1156 `^(\d+)G`（大小写不敏感）;
@@ -191,19 +134,6 @@ pub fn parse_args(argv: &[String]) -> Result<TrinityArgs, CliError> {
     let max_reads_per_graph: u64 = cli.uint_flag("--max_reads_per_graph", 200000)?;
     let no_cleanup = cli.bool_flag("--no_cleanup");
     let recursive = cli.bool_flag("--recursive");
-    let super_reads = cli.bool_flag("--super_reads");
-    let model_guided = cli.bool_flag("--model-guided");
-    let model = cli.value_flag("--model")?.map(PathBuf::from);
-    let protein_guided = cli.bool_flag("--protein-guided");
-    let protein_db = cli.value_flag("--protein-db")?.map(PathBuf::from);
-    let flow_cov_fusion = cli.bool_flag("--flow-cov-fusion");
-    let flow_cov_cap: u64 = cli.uint_flag("--flow-cov-cap", 10)?;
-    let path_engine: PathEngine = match cli.value_flag("--path-engine")? {
-        None => PathEngine::Classic,
-        Some(v) => v
-            .parse()
-            .map_err(|_| CliError::usage(format!("invalid --path-engine value: {v}")))?,
-    };
 
     cli.finish()?;
 
@@ -253,47 +183,6 @@ pub fn parse_args(argv: &[String]) -> Result<TrinityArgs, CliError> {
     }
     // 原版: inchworm_cpu 默认 6，但 CPU 更小时收敛到 CPU（L1233 语义）。
     let inchworm_cpu = inchworm_cpu_in.unwrap_or(6).min(cpu.max(1));
-    if let Some(m) = &model {
-        if !m.exists() {
-            return Err(CliError::usage(format!(
-                "Error, --model file not found: {}",
-                m.display()
-            )));
-        }
-    }
-    if protein_guided {
-        let Some(db) = &protein_db else {
-            return Err(CliError::usage(
-                "Error, --protein-guided requires --protein-db <fa>",
-            ));
-        };
-        if !db.exists() {
-            return Err(CliError::usage(format!(
-                "Error, --protein-db file not found: {}",
-                db.display()
-            )));
-        }
-    }
-    if let Some(m) = &model {
-        if !model_guided {
-            eprintln!(
-                "WARNING: --model is only used with --model-guided; ignoring --model {}",
-                m.display()
-            );
-        }
-    }
-    if flow_cov_fusion {
-        if flow_cov_cap == 0 {
-            return Err(CliError::usage(
-                "Error, --flow-cov-cap must be >= 1 with --flow-cov-fusion",
-            ));
-        }
-        if path_engine != PathEngine::PogFlow {
-            eprintln!(
-                "WARNING: --flow-cov-fusion is only used with --path-engine pogflow; ignoring"
-            );
-        }
-    }
 
     Ok(TrinityArgs {
         seq_type,
@@ -315,13 +204,5 @@ pub fn parse_args(argv: &[String]) -> Result<TrinityArgs, CliError> {
         max_reads_per_graph,
         no_cleanup,
         recursive,
-        super_reads,
-        path_engine,
-        model_guided,
-        model,
-        protein_guided,
-        protein_db,
-        flow_cov_fusion,
-        flow_cov_cap,
     })
 }

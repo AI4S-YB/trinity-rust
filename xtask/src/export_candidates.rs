@@ -2,8 +2,9 @@
 //!
 //! 输入: bench 缓存（cache 根 / out 目录, 内含 chrysalis/Component_bins 的
 //! c*.graph.out + c*.graph.reads）与参照转录本 FASTA。对每个组件以**库方式**
-//! 离线重跑 trinity-butterfly 的 PogFlow 引擎（read 支持过滤放宽到
+//! 离线重跑 trinity-butterfly 的 classic 引擎（read 支持过滤放宽到
 //! min_read_support=1, 管线零改动、不重跑组装）, 收集候选转录本,
+//! （特性面精简后 PogFlow 已移除; classic 头无 support 字段 → 该列填 -1）,
 //! 提取全长级特征（序列浅特征 + 最长 ORF + 25-mer 覆盖度形状 + read 支持）,
 //! 再用 minimap2 锚定参照打 oracle 标签, 每候选一行写 TSV。
 //!
@@ -20,19 +21,263 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use rayon::prelude::*;
-use trinity_butterfly::protein_extend::translate_codon;
-use trinity_butterfly::{run_component, ComponentParams, PathEngine};
+use trinity_butterfly::{run_component, ComponentParams};
 use trinity_common::kmer::{get_ds_kmer_val, kmer_to_intval};
 use trinity_kmer::counter::CountMap;
-
-use crate::export_edges::{
-    counts_for_out_dir, entropy, gc_frac, locate_asm_out, locate_component_bins, max_homopolymer,
-    read_fasta,
-};
 
 const KMER: usize = 25; // 计数表键长（graph KMER_SIZE; graph.out 顶点名长 24）
 
 pub const TSV_HEADER: &str = "comp\tcand\tlen\tsupport\tgc\tent\thom\torf_aa\torf_frac\torf_m\tcov_mean\tcov_median\tcov_min\tcov_ge2_frac\tcov_cv\tref_cov\tref_ident\tqcov\tlabel";
+
+// ---------------------------------------------------------------------------
+// 密码子翻译与数据工具（特性面精简后自 protein_extend/export_edges 收编内联）
+// ---------------------------------------------------------------------------
+
+pub fn translate_codon(codon: &[u8]) -> u8 {
+    let n = |b: u8| match b {
+        b'T' => 0,
+        b'C' => 1,
+        b'A' => 2,
+        b'G' => 3,
+        _ => 4,
+    };
+    match codon.len() {
+        3 => match (n(codon[0]), n(codon[1]), n(codon[2])) {
+            (0, 0, 0) => b'F',
+            (0, 0, 1) => b'F',
+            (0, 0, 2) => b'L',
+            (0, 0, 3) => b'L',
+            (0, 1, 0) => b'S',
+            (0, 1, 1) => b'S',
+            (0, 1, 2) => b'S',
+            (0, 1, 3) => b'S',
+            (0, 2, 0) => b'Y',
+            (0, 2, 1) => b'Y',
+            (0, 2, 2) => b'*',
+            (0, 2, 3) => b'*',
+            (0, 3, 0) => b'C',
+            (0, 3, 1) => b'C',
+            (0, 3, 2) => b'*',
+            (0, 3, 3) => b'W',
+            (1, 0, 0) => b'L',
+            (1, 0, 1) => b'L',
+            (1, 0, 2) => b'L',
+            (1, 0, 3) => b'L',
+            (1, 1, 0) => b'P',
+            (1, 1, 1) => b'P',
+            (1, 1, 2) => b'P',
+            (1, 1, 3) => b'P',
+            (1, 2, 0) => b'H',
+            (1, 2, 1) => b'H',
+            (1, 2, 2) => b'Q',
+            (1, 2, 3) => b'Q',
+            (1, 3, 0) => b'R',
+            (1, 3, 1) => b'R',
+            (1, 3, 2) => b'R',
+            (1, 3, 3) => b'R',
+            (2, 0, 0) => b'I',
+            (2, 0, 1) => b'I',
+            (2, 0, 2) => b'I',
+            (2, 0, 3) => b'M',
+            (2, 1, 0) => b'T',
+            (2, 1, 1) => b'T',
+            (2, 1, 2) => b'T',
+            (2, 1, 3) => b'T',
+            (2, 2, 0) => b'N',
+            (2, 2, 1) => b'N',
+            (2, 2, 2) => b'K',
+            (2, 2, 3) => b'K',
+            (2, 3, 0) => b'S',
+            (2, 3, 1) => b'S',
+            (2, 3, 2) => b'R',
+            (2, 3, 3) => b'R',
+            (3, 0, 0) => b'V',
+            (3, 0, 1) => b'V',
+            (3, 0, 2) => b'V',
+            (3, 0, 3) => b'V',
+            (3, 1, 0) => b'A',
+            (3, 1, 1) => b'A',
+            (3, 1, 2) => b'A',
+            (3, 1, 3) => b'A',
+            (3, 2, 0) => b'D',
+            (3, 2, 1) => b'D',
+            (3, 2, 2) => b'E',
+            (3, 2, 3) => b'E',
+            (3, 3, 0) => b'G',
+            (3, 3, 1) => b'G',
+            (3, 3, 2) => b'G',
+            (3, 3, 3) => b'G',
+            _ => b'X',
+        },
+        _ => b'X',
+    }
+}
+
+pub fn gc_frac(s: &str) -> f64 {
+    let mut gc = 0usize;
+    let mut n = 0usize;
+    for b in s.bytes() {
+        match b {
+            b'G' | b'C' => {
+                gc += 1;
+                n += 1;
+            }
+            b'A' | b'T' => n += 1,
+            _ => {}
+        }
+    }
+    if n == 0 {
+        0.0
+    } else {
+        gc as f64 / n as f64
+    }
+}
+
+pub fn entropy(s: &str) -> f64 {
+    let mut cnt = [0usize; 4];
+    let mut n = 0usize;
+    for b in s.bytes() {
+        let i = match b {
+            b'A' => 0,
+            b'C' => 1,
+            b'G' => 2,
+            b'T' => 3,
+            _ => continue,
+        };
+        cnt[i] += 1;
+        n += 1;
+    }
+    if n == 0 {
+        return 0.0;
+    }
+    let mut h = 0.0f64;
+    for c in cnt {
+        if c > 0 {
+            let p = c as f64 / n as f64;
+            h -= p * p.log2();
+        }
+    }
+    h
+}
+
+pub fn max_homopolymer(s: &str) -> usize {
+    let mut best = 0;
+    let mut run = 0;
+    let mut prev = 0u8;
+    for b in s.bytes() {
+        if b == prev && matches!(b, b'A' | b'C' | b'G' | b'T') {
+            run += 1;
+        } else {
+            run = if matches!(b, b'A' | b'C' | b'G' | b'T') {
+                1
+            } else {
+                0
+            };
+        }
+        best = best.max(run);
+        prev = b;
+    }
+    best
+}
+
+/// 定位管线 asm out 目录（含 chrysalis/ 的那层）: 接受 cache 根或 out 本身。
+pub fn locate_asm_out(p: &Path) -> Option<PathBuf> {
+    [p.to_path_buf(), p.join("out")]
+        .into_iter()
+        .find(|cand| cand.join("chrysalis").is_dir())
+}
+
+/// 取 25-mer DS 计数表: override 路径 > mer_counts bin > norm.fq 重数。
+/// 返回 (表, 来源说明)。v1 只支持 K=25 DS（dev/real 全部数据集的形态）。
+pub fn counts_for_out_dir(asm_out: &Path, override_path: &str) -> (CountMap, String) {
+    let bin = if !override_path.is_empty() {
+        PathBuf::from(override_path)
+    } else {
+        asm_out.join("mer_counts.25.asm.rs.bin")
+    };
+    if bin.is_file() {
+        let m = trinity_kmer::counter::load_counts_bin(&bin, KMER, true)
+            .unwrap_or_else(|e| panic!("load {}: {e}", bin.display()));
+        return (m, format!("bin {}", bin.display()));
+    }
+    let norm = asm_out.join("insilico_read_normalization");
+    let mut merged = CountMap::default();
+    let mut n_files = 0;
+    for name in ["left.norm.fq", "right.norm.fq"] {
+        let p = norm.join(name);
+        if !p.is_file() {
+            continue;
+        }
+        let data = std::fs::read(&p).unwrap_or_else(|e| panic!("read {}: {e}", p.display()));
+        // fq → fa（4 行记录取序列行; both.fa 经 seqtk -A 转换, 序列多重集相同）
+        let mut fa = Vec::with_capacity(data.len() / 2 + 64);
+        for (i, line) in data.split(|&b| b == b'\n').enumerate() {
+            if i % 4 == 1 && !line.is_empty() {
+                fa.extend_from_slice(b">r\n");
+                fa.extend_from_slice(line);
+                fa.push(b'\n');
+            }
+        }
+        let m = trinity_kmer::counter::KmerCountTable::count_fasta_data_with_capacity(
+            &fa,
+            KMER,
+            true,
+            1 << 20,
+        );
+        for (k, v) in m {
+            *merged.entry(k).or_insert(0) += v;
+        }
+        n_files += 1;
+    }
+    assert!(
+        n_files > 0,
+        "{} 下既无 mer_counts.25.asm.rs.bin 也无 left/right.norm.fq",
+        asm_out.display()
+    );
+    (merged, format!("norm.fq 重数 ×{n_files}"))
+}
+
+/// 接受 cache 根（内含 out/）、out 目录、或 chrysalis 目录, 返回 Component_bins。
+pub fn locate_component_bins(p: &Path) -> Option<PathBuf> {
+    [
+        p.join("chrysalis/Component_bins"),
+        p.join("out/chrysalis/Component_bins"),
+        p.join("Component_bins"),
+    ]
+    .into_iter()
+    .find(|cand| cand.is_dir())
+}
+
+pub fn read_fasta(path: &Path) -> Vec<(String, String)> {
+    let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    let text: String = if bytes.starts_with(&[0x1f, 0x8b]) {
+        let mut s = String::new();
+        use std::io::Read;
+        flate2::read::GzDecoder::new(&bytes[..])
+            .read_to_string(&mut s)
+            .unwrap_or_else(|e| panic!("gunzip {}: {e}", path.display()));
+        s
+    } else {
+        String::from_utf8(bytes).unwrap_or_else(|e| panic!("utf8 {}: {e}", path.display()))
+    };
+    let mut out = Vec::new();
+    let mut name = String::new();
+    let mut seq = String::new();
+    for line in text.lines() {
+        if let Some(h) = line.strip_prefix('>') {
+            if !name.is_empty() {
+                out.push((std::mem::take(&mut name), std::mem::take(&mut seq)));
+            }
+            name = h.split_whitespace().next().unwrap_or("").to_string();
+        } else {
+            seq.push_str(line.trim());
+        }
+    }
+    if !name.is_empty() {
+        out.push((name, seq));
+    }
+    out
+}
 
 // ---------------------------------------------------------------------------
 // 候选 FASTA 解析
@@ -47,14 +292,15 @@ pub struct Candidate {
     pub seq: String,
 }
 
-/// 解析 run_component 的 allProbPaths FASTA（trinity_flow::paths::to_fasta 产物:
-/// header `>c6341_g1_i2 len=1730 support=5 path=[...]`, 序列 60 列折行）。
+/// 解析 run_component 的 allProbPaths FASTA（classic print_final_paths 产物:
+/// header `>c6341_g1_i2 len=1730 path=[...] {...}`, 序列 60 列折行;
+/// classic 无 support= 字段 → support 记 -1（未知, 与 0 区分））。
 /// header 缺 len= 时回退用拼接后的序列长。
 pub fn parse_candidates(comp: i32, fasta: &str) -> Vec<Candidate> {
     let mut out: Vec<Candidate> = Vec::new();
     let mut name = String::new();
     let mut len: Option<usize> = None;
-    let mut support = 0i64;
+    let mut support = -1i64;
     let mut seq = String::new();
     for line in fasta.lines() {
         if let Some(h) = line.strip_prefix('>') {
@@ -70,12 +316,12 @@ pub fn parse_candidates(comp: i32, fasta: &str) -> Vec<Candidate> {
             let mut toks = h.split_whitespace();
             name = toks.next().unwrap_or("").to_string();
             len = None;
-            support = 0;
+            support = -1;
             for t in toks {
                 if let Some(v) = t.strip_prefix("len=") {
                     len = v.parse().ok();
                 } else if let Some(v) = t.strip_prefix("support=") {
-                    support = v.parse().unwrap_or(0);
+                    support = v.parse().unwrap_or(-1);
                 }
             }
         } else {
@@ -398,7 +644,6 @@ pub fn run(argv: &[String]) -> i32 {
                     min_read_support: min_support,
                     path_reinforcement_distance: Some(25),
                     name: format!("c{id}"),
-                    path_engine: PathEngine::PogFlow,
                     ..Default::default()
                 };
                 let cands = match run_component(&graph_out, &graph_reads, &params) {

@@ -244,10 +244,7 @@ fn split_fasta_line_records(
         let seq_start = next;
         let mut seq_end = next;
         let mut p = next;
-        loop {
-            let Some((ls, ce, np)) = next_line(data, p) else {
-                break;
-            };
+        while let Some((ls, ce, np)) = next_line(data, p) {
             if data[ls] == b'>' {
                 break;
             }

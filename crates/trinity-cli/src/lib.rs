@@ -9,10 +9,8 @@ pub mod args;
 pub mod butterfly_pool;
 pub mod checkpoint;
 pub mod harvest;
-pub mod model_guided;
 pub mod orchestrate;
 pub mod prep;
-pub mod protein_guided;
 pub mod recursive;
 
 pub use args::{parse_args, SeqType, TrinityArgs};

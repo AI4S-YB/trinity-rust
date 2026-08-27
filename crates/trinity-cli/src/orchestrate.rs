@@ -17,13 +17,11 @@ use std::path::{Path, PathBuf};
 use trinity_chrysalis::pipeline::{run_chrysalis_pipeline, ChrysalisParams};
 use trinity_common::error::CommonError;
 use trinity_inchworm::irke::{
-    compute_sequence_assemblies, compute_sequence_assemblies_parallel, populate_from_kmers,
-    populate_from_table, prune_some_kmers, write_kmer_count_report, AssemblyParams, IrkeParams,
-    Monitor,
+    compute_sequence_assemblies_parallel, populate_from_table, prune_some_kmers,
+    write_kmer_count_report, AssemblyParams, IrkeParams, Monitor,
 };
 use trinity_kmer::counter::{estimate_hash_size, KmerCountTable};
 use trinity_kmer::diginorm::{self, DigiNormParams, ReadsInput};
-use trinity_kmer::dump::write_dump;
 
 use crate::args::{SeqType, TrinityArgs};
 use crate::butterfly_pool::{run_butterfly_pool, ButterflyPoolParams};
@@ -138,7 +136,7 @@ fn diginorm_params(args: &TrinityArgs, paired: bool) -> DigiNormParams {
 }
 
 /// mer_counts 二进制存取已收编至 `trinity_kmer::counter::{save_counts_bin,
-/// load_counts_bin}`（xtask export-edges 共用）; 保留本地薄封装以稳调用点。
+/// load_counts_bin}`; 保留本地薄封装以稳调用点。
 fn save_counts(
     path: &Path,
     counts: &trinity_kmer::counter::CountMap,
@@ -244,72 +242,6 @@ pub fn run_trinity(args: &TrinityArgs) -> Result<PathBuf, CommonError> {
         fs::write(&read_count_file, format!("{read_count}\n"))?;
     }
     let _ = read_count;
-
-    // ---- 2.6 模型引导组装分支（M5, --model-guided）----
-    // 归一化 + prep 已就绪（both.fa/single.fa 字节在 target_fa）→
-    // 招募到模型基因分组 → 每组定向重组装 → 合并。
-    if args.model_guided {
-        return crate::model_guided::run_model_guided(args, &outdir, &target_fa);
-    }
-
-    // ---- 2.5 K19 预组装（M4 超级 read 递进, --super_reads）----
-    // 归一化 + prep 之后的 both.fa/single.fa 字节 → K=19 计数 → inchworm
-    // （排序种子单线程, 预组装无需并行）→ ≥200bp 过滤 → header 改写
-    // `>aN;cov` → `>sr_N` → 落盘 super_reads.fa。断点: `.k19_preasm.ok`
-    // 存在即跳过（super_reads.fa 保留, 从盘上读回）。
-    let mut super_reads_data: Vec<u8> = Vec::new();
-    if args.super_reads {
-        let sr_ok = outdir.join(".k19_preasm.ok");
-        let sr_fa = outdir.join("super_reads.fa");
-        let sr_fa_ref = &sr_fa;
-        let sr_data_ref = &mut super_reads_data;
-        run_with_checkpoint(&sr_ok, "K19 pre-assembly (super reads)", || {
-            if checkpoint_exists(sr_fa_ref) {
-                *sr_data_ref = fs::read(sr_fa_ref)?;
-                return Ok(());
-            }
-            let reads_bytes = fs::read(&target_fa)?;
-            let k19 = 19usize;
-            // K=19 k-mer 计数（与 K25 主线同一 ds 语义）。
-            let counts19 = KmerCountTable::count_fasta_data(&reads_bytes, k19, ds);
-            // dump 到内存（min_cov = 1; 剪枝在 populate 后做）。
-            let mut dump: Vec<u8> = Vec::new();
-            write_dump(&mut dump, &counts19, k19, 1, ds)?;
-            let (mut counter19, _parsed) = populate_from_kmers(&dump, k19, ds)?;
-            prune_some_kmers(
-                &mut counter19,
-                args.min_kmer_count.max(1),
-                1.0,
-                false,
-                0.005,
-            );
-            let mut buf = Vec::new();
-            compute_sequence_assemblies(
-                &mut counter19,
-                &IrkeParams::default(),
-                &AssemblyParams {
-                    min_assembly_length: k19,
-                    ..Default::default()
-                },
-                &Monitor::new(0),
-                true,
-                &mut buf,
-            )?;
-            // ≥200bp 纯长度过滤（spec: super read 定义）。注意不能用
-            // filter_iworm_min_len_or_cov(200, 0)——那是 len OR cov 判定,
-            // cov>=0 恒真会放行全部 contig。
-            let filtered = filter_min_len(&buf, 200)?;
-            // header 改写: >aN;cov → >sr_N（无 PE 后缀, 防 Butterfly 配对干扰）。
-            let sr = rewrite_super_read_headers(&filtered)?;
-            fs::write(sr_fa_ref, &sr)?;
-            *sr_data_ref = sr;
-            Ok(())
-        })?;
-        // resume: checkpoint 命中被跳过 → 从盘上读回。
-        if super_reads_data.is_empty() && checkpoint_exists(&sr_fa) {
-            super_reads_data = fs::read(&sr_fa)?;
-        }
-    }
 
     // ---- 3. jellyfish 计数 + dump（L2584-2632）----
     let count_ok = outdir.join(format!(
@@ -451,24 +383,10 @@ pub fn run_trinity(args: &TrinityArgs) -> Result<PathBuf, CommonError> {
     let iworm_data = fs::read(&iworm_min100)?;
     let reads_data = fs::read(&target_fa)?;
 
-    // ---- M4: 超级 read 追加进 Chrysalis reads 池（RTT 投票 + 边权）----
-    let mut chrysalis_reads = reads_data.clone();
-    if args.super_reads && !super_reads_data.is_empty() {
-        chrysalis_reads.extend_from_slice(b"\n");
-        chrysalis_reads.extend_from_slice(&super_reads_data);
-    }
-
     // ---- 5/6/7. 递归模式（--recursive, M1）: phase-1 止于分区 → 迷你分区池
     // ---- → 汇总（与 classic 的 chrysalis+butterfly+harvest 段并列）。 ----
     if args.recursive {
-        return run_recursive(
-            a,
-            args,
-            &outdir,
-            &chrysalis_dir,
-            &iworm_data,
-            &chrysalis_reads,
-        );
+        return run_recursive(a, args, &outdir, &chrysalis_dir, &iworm_data, &reads_data);
     }
 
     let mut listing_opt: Option<Vec<(u64, PathBuf)>> = None;
@@ -480,7 +398,7 @@ pub fn run_trinity(args: &TrinityArgs) -> Result<PathBuf, CommonError> {
             || {
                 let listing = run_chrysalis_pipeline(
                     &iworm_data,
-                    &chrysalis_reads,
+                    &reads_data,
                     &chrysalis_dir,
                     &ChrysalisParams {
                         strand: ss.is_some(),
@@ -524,25 +442,11 @@ pub fn run_trinity(args: &TrinityArgs) -> Result<PathBuf, CommonError> {
                         min_contig_length: args.min_contig_length,
                         group_pairs_distance: args.group_pairs_distance,
                         stack_size_mb: args.bfly_stack_mb,
-                        path_engine: args.path_engine,
-                        kmer_size: args.kmer_size,
-                        flow_cov_fusion: args.flow_cov_fusion,
-                        flow_cov_cap: args.flow_cov_cap,
-                        counts_bin: counts_bin.clone(),
-                        count_source_fa: target_fa.clone(),
-                        counts_ds: ds,
                     },
                 )
             },
         )
     })?;
-
-    // ---- 6b. 蛋白引导延长（M6a; checkpoint .protein_guided.ok）----
-    if args.protein_guided {
-        trinity_common::timer::timed(&outdir, "protein_guided", || {
-            crate::protein_guided::run_protein_guided(&listing, args, &outdir, &target_fa)
-        })?;
-    }
 
     // ---- 7. 汇总（无 checkpoint; 每次重写 Trinity.tmp.fasta, L1916/L1943）----
     let trinity_tmp = outdir.join("Trinity.tmp.fasta");
@@ -858,71 +762,6 @@ pub fn filter_iworm_min_len_or_cov(
     Ok(out)
 }
 
-/// 纯长度过滤: 保留序列长度 >= min_len 的 FASTA 记录（M4 超级 read 定义
-/// ≥200bp, 无 cov 逃生门——`filter_iworm_min_len_or_cov` 是 len OR cov 判定,
-/// min_cov=0 时恒真, 不适用于此处）。
-pub fn filter_min_len(data: &[u8], min_len: usize) -> Result<Vec<u8>, CommonError> {
-    let mut out = Vec::with_capacity(data.len());
-    let mut i = 0usize;
-    while i < data.len() {
-        let hdr_end = data[i..]
-            .iter()
-            .position(|&b| b == b'\n')
-            .map(|p| i + p)
-            .unwrap_or(data.len());
-        let header = &data[i..hdr_end];
-        let mut j = hdr_end + 1;
-        let body_end = loop {
-            if j >= data.len() {
-                break data.len();
-            }
-            if data[j] == b'>' {
-                break j;
-            }
-            let nl = data[j..]
-                .iter()
-                .position(|&b| b == b'\n')
-                .map(|p| j + p + 1)
-                .unwrap_or(data.len());
-            j = nl;
-        };
-        let body = &data[hdr_end + 1..body_end];
-        let seq_len = body.iter().filter(|&&b| b != b'\n' && b != b'\r').count();
-        if seq_len >= min_len {
-            out.extend_from_slice(header);
-            out.push(b'\n');
-            out.extend_from_slice(body);
-        }
-        i = body_end;
-    }
-    Ok(out)
-}
-
-/// aN;cov total_counts:... 变为 sr_N（M4: 超级 read 无 PE 后缀, 防 Butterfly
-/// 配对 /1 与 /2 解析干扰; 序列行照抄）。
-pub fn rewrite_super_read_headers(data: &[u8]) -> Result<Vec<u8>, CommonError> {
-    let text = std::str::from_utf8(data)
-        .map_err(|e| CommonError::Parse(format!("super reads UTF-8: {e}")))?;
-    let mut out = Vec::with_capacity(data.len());
-    for line in text.lines() {
-        if line.starts_with('>') {
-            // >a123;45 → >sr_123
-            let acc = line
-                .strip_prefix('>')
-                .unwrap_or(line)
-                .split(';')
-                .next()
-                .unwrap_or("");
-            let num = acc.strip_prefix('a').unwrap_or(acc);
-            out.extend_from_slice(format!(">sr_{num}\n").as_bytes());
-        } else {
-            out.extend_from_slice(line.as_bytes());
-            out.push(b'\n');
-        }
-    }
-    Ok(out)
-}
-
 #[cfg(test)]
 mod min100_tests {
     use super::filter_iworm_min_len_or_cov;
@@ -948,39 +787,5 @@ mod min100_tests {
         let out = filter_iworm_min_len_or_cov(fa.as_bytes(), 100, 10).unwrap();
         let s = String::from_utf8(out).unwrap();
         assert!(s.contains(">x;") && s.contains(">y;"));
-    }
-}
-
-#[cfg(test)]
-mod super_read_tests {
-    use super::{filter_min_len, rewrite_super_read_headers};
-
-    #[test]
-    fn filter_min_len_strict() {
-        // 纯长度判定: 短序列即使 cov 很高也剔除（区别于 min100 的 OR 语义）。
-        let seq250 = "ACGT".repeat(63); // 252
-        let fa = format!(">a1;99 length: 250\n{seq250}\n>a2;999 length: 50\nACGT\n");
-        let out = filter_min_len(fa.as_bytes(), 200).unwrap();
-        let s = String::from_utf8(out).unwrap();
-        assert!(s.contains(">a1;"));
-        assert!(!s.contains(">a2;"));
-    }
-
-    #[test]
-    fn rewrites_header_strips_cov_keeps_seq() {
-        let fa = b">a123;45 total_counts: 99 K: 19 length: 250\nACGT\n>a7;1 x\nTTTT\n";
-        let out = rewrite_super_read_headers(fa).unwrap();
-        let s = String::from_utf8(out).unwrap();
-        assert!(s.contains(">sr_123\n"));
-        assert!(s.contains(">sr_7\n"));
-        assert!(!s.contains("total_counts"));
-        assert!(s.contains("ACGT") && s.contains("TTTT"));
-    }
-
-    #[test]
-    fn no_prefix_acc_kept() {
-        // 无 'a' 前缀时 accession 原样保留数字部分。
-        let out = rewrite_super_read_headers(b">b5;2 c\nAA\n").unwrap();
-        assert!(String::from_utf8(out).unwrap().contains(">sr_b5\n"));
     }
 }

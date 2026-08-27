@@ -9,7 +9,6 @@ trinity-kmer = { path = "../trinity-kmer" }
 trinity-inchworm = { path = "../trinity-inchworm" }
 trinity-chrysalis = { path = "../trinity-chrysalis" }
 trinity-butterfly = { path = "../trinity-butterfly" }
-trinity-flow = { path = "../trinity-flow" }
 rayon = { workspace = true }
 
 [dev-dependencies]

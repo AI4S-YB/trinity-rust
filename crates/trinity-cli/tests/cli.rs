@@ -461,23 +461,3 @@ fn prep_both_fa_size_mismatch_rebuilds() {
     let r = read(&out.join("right.fa"));
     assert_eq!(read(&target), format!("{l}{r}"));
 }
-
-// ------------------------------------------------------------ protein-guided (M6a)
-
-#[test]
-fn protein_guided_requires_protein_db() {
-    let mut v = base_args();
-    v.push("--protein-guided".into());
-    let err = parse_args(&v).unwrap_err();
-    assert!(err.msg.contains("--protein-guided requires --protein-db"));
-}
-
-#[test]
-fn protein_guided_db_must_exist() {
-    let mut v = base_args();
-    v.push("--protein-guided".into());
-    v.push("--protein-db".into());
-    v.push("/nonexistent/P.fa".into());
-    let err = parse_args(&v).unwrap_err();
-    assert!(err.msg.contains("not found"));
-}
