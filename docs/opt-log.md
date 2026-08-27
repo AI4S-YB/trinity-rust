@@ -691,3 +691,18 @@ minimap2 -x asm10 分别比对 alyr_cdna 与 dev1 参照。
   但适合作为 M8 融合权重的第二路先验（覆盖度兜底 + alyr 命中加成）。
   预期收益小（≤199 个决策点 × 此前 ~62% 错误率 ≈ 75 个分叉修正上限）。
   下一步: M10 集成实验（--flow-alyr-fusion, 边权 += 命中加成）, dev1 Gate 裁决。
+
+## 特性面精简与 release 优化吸收（2026-08-27）
+
+- **砍**（用户裁定, 特性面收敛到生产形态）: M2 flow / M2.1-M3 PogFlow /
+  M4 super_reads / M5 model-guided / M6 protein-guided / M8 flow-cov-fusion,
+  连带 trinity-flow crate 与全部相关 e2e; xtask export-edges 同步移除。
+  判定依据见各里程碑段（M5 为真实数据唯一正收益但复杂度不合 release 定位;
+  M8 real 中性; M4/M6 负/中性）。被砍特性在 git 历史与本文档完整保留。
+- **留**: classic 引擎 + --recursive（M1）+ M7 提速 + evalv2 junction 评估 +
+  M9 候选探针（export-candidates 改接 classic 引擎, 候选头无 support → -1）。
+- **吸收**（cherry-pick 自 trinity-rust-release, 零冲突）: 硬链接便捷名
+  （省 ~2.6GB 双写）/ --scratch 中间产物外置 / Component_bins 打包
+  （消灭 per-component 小文件）/ fq 归一化直出 fa / mimalloc 全局分配器
+  （小集 sys -85%, wall -25%）。并收入其基线的 clippy 修复（workspace 现已零警告）。
+- 终验: 构建 + 38 测试套件全绿, clippy/fmt 干净。
