@@ -696,7 +696,7 @@ pub fn run(argv: &[String]) -> i32 {
         }
         std::fs::write(&tmp_fa, &fa).unwrap_or_else(|e| panic!("write {tmp_fa}: {e}"));
         let out = std::process::Command::new(crate::bench::MINIMAP2)
-            .args(["-x", "asm5", "-t", &threads.to_string(), "--secondary=no"])
+            .args(["-x", "asm5", "-t", &threads.to_string()])
             .arg(&reff)
             .arg(&tmp_fa)
             .output()

@@ -797,3 +797,38 @@ absent 桶内部（关键反转——**k-mer 材料全在产出池, 缺的是组
 4. comp 黑洞可忽略（27 条）。扩池的本质是**补组合+补端部**, 不是救 comp。
 - 瑕疵注记同上节（cache 混用）; probe_stuck 首版的 containment 统计曾用错
   f[6]（参照长）当产出长, 已在 probe_stuck3 修正重算。
+
+## 死因分解重大修正: absent 桶是评估 artifact（2026-08-27, probe_rewire 1-2）
+
+`minimap2 <ref> <final> --secondary=no` 参数序下 query=产出: 一条产出近似匹配
+多条参照（多 isoform 基因必然发生）时, 非最佳参照的 hit 全被 secondary 屏蔽
+掐掉 → R_full 系统性低估。
+
+### 证据链（probe_rewire.py / probe_rewire2.py, 顶点级 k-mer 映射回图）
+
+- 产出 k-mer 映射回图: 主 comp 映射率中位 1.00（产出 fasta path 头的 vid 是
+  引擎私有编号, 与 graph.out 不同空间, 不可直接用; k-mer 映射是正确通道）。
+- absent 1,009 条: top1 产出顶点命中率中位 **1.00**, LIS 共线中位 **1.00**
+  （双向取大; 1008/1009 保序）, 顶点数比中位 1.08——图顶点层面存在一条产出
+  几乎逐顶点保序走过参照路径, 长度相当。无乱序嵌合。
+- 去掉 `--secondary=no` 重测: absent 桶 **439 条直接达 R_full 口径**;
+  全量 dev1: R_full 718 (8.2%) → **1,220 (14.0%)**, 低估 502 条 (5.8pp, 相对 +70%)。
+- 顶点级真分散（owner top1<0.7）仅 13 条（probe_stuck5 的 472 条"分散"被
+  "(k-mer,产出) 命对"重复计数稀释 top1 的判据高估——跨 comp 同源命中污染）。
+
+### 修复
+
+- `xtask/src/bench.rs` 与 `export_candidates.rs` 的 asm5 比对去掉
+  `--secondary=no`（compute_metrics 本就 per-target 取 best, 无需改聚合）。
+  splice junction 评估的 `--secondary=no` 语义不同（防基因组乱命中）, 不动。
+- 历史影响: M0-M7 所有 bench 绝对值偏低; A/B 相对比较同向偏差, 结论方向
+  不受影响, 但幅度需按新口径复核。dev1 新成绩（xtask bench 复跑确认）:
+  R_full 14.0% / R70 53.4% / P 81.4% / F1 23.9%（此前口径 R=8.2%）。
+
+### 对 M9 的重新定位
+
+- 可走未产出池从 1,443 缩至 ~941; absent 桶 43% 是假缺口（评估漏计）,
+  真缺口死因以端部完整性（near_miss+partial 434）与同基因兄弟竞争为主。
+- 组合枚举不足市场从 472 缩至 ~13——**重组器路线基本出局**;
+  M9 主攻端部延伸 + asm10 敏感性列。
+| 2026-08-27 | dev1 | R=14.0% P=81.4% **F1=23.9%** | N50=1836 n=7835 | --CPU 8 --max_memory 8G |

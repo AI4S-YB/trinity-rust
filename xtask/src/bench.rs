@@ -272,9 +272,10 @@ pub fn run(argv: &[String]) -> i32 {
     } else {
         println!("[bench] 组装缓存命中: {}", dir.display());
     }
-    // minimap2
+    // minimap2（不加 --secondary=no: target=参照/query=产出时, 一条产出近似多条参照
+    // 的 secondary hit 会被抑制, 多 isoform 基因的 R_full 系统性低估——dev1 实测 -5.8pp）
     let paf = std::process::Command::new(MINIMAP2)
-        .args(["-x", "asm5", "-t", "8", "--secondary=no"])
+        .args(["-x", "asm5", "-t", "8"])
         .arg(&reff)
         .arg(&final_fa)
         .output()
