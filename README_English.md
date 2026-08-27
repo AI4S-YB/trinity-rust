@@ -124,6 +124,19 @@ Scaling saturates beyond 32 threads (32→64 yields only 1.05×); peak RSS grows
 - v0.3.0 (algorithmic): k-mer dump elimination (direct binary bridge, saves ~8 min), ReadsToTranscripts packed hash index + sliding-window entropy (16.3×), parallel coverage statistics + rolling revcomp normalization (3.6×), batched component partition writes (5.5× — the original issued ~45M raw per-line syscalls).
 - v0.4.0 (IO/system overhead): normalization double-write elimination via hard links (-2.6 GB written), intermediates on a local scratch dir by default (`--scratch` is now the default; output dir stays clean), full component-data packing (~140k per-component files eliminated, butterfly stage 136 s → 31 s), direct fa emission from normalization, mimalloc as the global allocator (sys time -85%, page faults -96%).
 
+**IO overhead work (v0.4.0, before/after on real data at 64 threads):**
+
+| Metric | v0.3.0 | v0.4.0 | Change |
+|---|---|---|---|
+| Intermediate write volume | ~13.4 GB | ~9.6 GB | -29% |
+| Per-component small files | ~140k files | 4-6 pack files per Cbin | ≈ eliminated |
+| sys time share | 2056 s (31%) | 561 s (13%) | -73% |
+| Minor page faults | 197M | 35.4M | -82% |
+| butterfly stage wall | 136 s | 31 s | -77% |
+| wall (scratch is default) | 12:29 | 7:23 | -41% |
+
+Background: assembly output directories often live on network storage (NFS), where the upstream-style "one set of small files per component + full-dataset file handoff between stages" turns every create/write/close into a network metadata round-trip. v0.4.0 attacks this three ways: moving all intermediates off the network disk (`--scratch` by default, see "Default location of intermediates" above), packing small files into sequentially-written pack files with fixed-size offset indexes, and hard-linking duplicate content. Peak RSS is unaffected (flat before/after mimalloc).
+
 All optimizations carry oracle/byte-level equivalence verification; assembly metrics are identical to the porting baseline (see the tie-break divergence band above).
 
 ## Validation
