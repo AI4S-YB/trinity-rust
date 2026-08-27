@@ -65,6 +65,10 @@ Common options
   --PARALLEL_IWORM  (parallel contig building via rayon chunked seeds)
   --SINGLE_PHASE    (with --PARALLEL_IWORM: skip the two-phase seed re-selection)";
 
+// 全局 mimalloc（与 trinity-cli 一致; 实测大幅降低 minor page fault 与 sys time）。
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     std::process::exit(run(&args));

@@ -40,6 +40,10 @@ const USAGE: &str = "用法: butterfly -N <int> -L <int> -F <int> -C <prefix> [�
   --stderr            输出改打 stderr
   --log_stderr        写 <prefix>.err（占位）";
 
+// 全局 mimalloc（与 trinity-cli 一致; 实测大幅降低 minor page fault 与 sys time）。
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     std::process::exit(run(&args));
