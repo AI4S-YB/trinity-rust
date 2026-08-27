@@ -177,7 +177,19 @@ pub fn read_component_base_listing(p: &Path) -> Result<Vec<(u64, PathBuf)>, Comm
 /// Trinity 主线全流程。返回最终 fasta 路径（`<outdir>.Trinity.fasta`）。
 pub fn run_trinity(args: &TrinityArgs) -> Result<PathBuf, CommonError> {
     let outdir = absolutize(&args.output);
-    let chrysalis_dir = outdir.join("chrysalis");
+    // --scratch: 中间产物（归一化目录/both.fa/mer_counts/inchworm/chrysalis/
+    // butterfly）与 checkpoint（.ok）全部落 `<scratch>/<output 目录名>/`,
+    // 最终 `<output>.Trinity.fasta` 与 gene_trans_map 拷回 --output 旁。
+    // checkpoint 随产物走: scratch 易失, 换 scratch 目录 = 全部重算。
+    // 默认（无 --scratch）workdir == outdir, 行为不变。
+    let workdir = match &args.scratch {
+        Some(s) => absolutize(s).join(outdir.file_name().unwrap_or_default()),
+        None => outdir.clone(),
+    };
+    // scratch 模式下也建 outdir: 保证最终产物（outdir 的同级文件）父链存在,
+    // 与默认模式"outdir 必被创建"的行为对齐。
+    fs::create_dir_all(&outdir)?;
+    let chrysalis_dir = workdir.join("chrysalis");
     fs::create_dir_all(&chrysalis_dir)?;
 
     let paired = !args.left.is_empty();
@@ -196,7 +208,7 @@ pub fn run_trinity(args: &TrinityArgs) -> Result<PathBuf, CommonError> {
     // ---- 1. 归一化（L1441-1453; checkpoint insilico_read_normalization/normalization.ok）----
     if !args.no_normalize_reads {
         let norm: Result<(), CommonError> =
-            trinity_common::timer::timed(&outdir, "normalize", || {
+            trinity_common::timer::timed(&workdir, "normalize", || {
                 // 硬护栏: 归一化需把两侧读入整读进内存。
                 if let Some(msg) = memory_guard_error(
                     args.max_memory,
@@ -205,7 +217,7 @@ pub fn run_trinity(args: &TrinityArgs) -> Result<PathBuf, CommonError> {
                 ) {
                     return Err(CommonError::Parse(msg));
                 }
-                let norm_dir = outdir.join("insilico_read_normalization");
+                let norm_dir = workdir.join("insilico_read_normalization");
                 let norm_ok = norm_dir.join("normalization.ok");
                 if !run_with_checkpoint(&norm_ok, "In silico Read Normalization", || {
                     let params = diginorm_params(args, paired);
@@ -233,8 +245,8 @@ pub fn run_trinity(args: &TrinityArgs) -> Result<PathBuf, CommonError> {
 
     // ---- 2. prep → both.fa/single.fa + .read_count（L1604-1705）----
     let (target_fa, read_count) =
-        trinity_common::timer::timed(&outdir, "prep", || prep_reads(&a, &outdir))?;
-    let read_count_file = outdir.join(format!(
+        trinity_common::timer::timed(&workdir, "prep", || prep_reads(&a, &workdir))?;
+    let read_count_file = workdir.join(format!(
         "{}.read_count",
         target_fa.file_name().unwrap_or_default().to_string_lossy()
     ));
@@ -244,12 +256,12 @@ pub fn run_trinity(args: &TrinityArgs) -> Result<PathBuf, CommonError> {
     let _ = read_count;
 
     // ---- 3. jellyfish 计数 + dump（L2584-2632）----
-    let count_ok = outdir.join(format!(
+    let count_ok = workdir.join(format!(
         ".jellyfish_count.{k}.mincov{}.{SR_FLAG}.ok",
         args.min_kmer_count
     ));
-    let counts_bin = outdir.join(format!("mer_counts.{k}.{SR_FLAG}.rs.bin"));
-    trinity_common::timer::timed(&outdir, "kmer_count", || -> Result<(), CommonError> {
+    let counts_bin = workdir.join(format!("mer_counts.{k}.{SR_FLAG}.rs.bin"));
+    trinity_common::timer::timed(&workdir, "kmer_count", || -> Result<(), CommonError> {
         if !checkpoint_exists(&count_ok) {
             eprintln!("-- Trinity (rust) | Jellyfish count (K={k})");
             // 硬护栏: target_fa 整读进内存 + 计数哈希。
@@ -278,16 +290,16 @@ pub fn run_trinity(args: &TrinityArgs) -> Result<PathBuf, CommonError> {
     } else {
         "inchworm.DS.fa"
     };
-    let iworm_fa = outdir.join(iworm_name);
-    let iworm_tmp = outdir.join(format!("{iworm_name}.tmp"));
-    let iworm_ok = outdir.join(format!(".iworm.{k}.{SR_FLAG}.ok"));
-    trinity_common::timer::timed(&outdir, "inchworm", || {
+    let iworm_fa = workdir.join(iworm_name);
+    let iworm_tmp = workdir.join(format!("{iworm_name}.tmp"));
+    let iworm_ok = workdir.join(format!(".iworm.{k}.{SR_FLAG}.ok"));
+    trinity_common::timer::timed(&workdir, "inchworm", || {
         run_with_checkpoint(&iworm_ok, "Inchworm (linear contig construction)", || {
             // M7 直桥: 计数表（checkpoint 二进制或重算）直接构建 counter,
             // 跳过 jellyfish dump 文本往返; 原 dump 的 -L min_cov 过滤由
             // 下方 prune_some_kmers 等价承担。
             let (mut counter, _parsed) = trinity_common::timer::timed(
-                &outdir,
+                &workdir,
                 "kmer_load",
                 || -> Result<(trinity_inchworm::kmer_counter::KmerCounter, usize), CommonError> {
                     let counts = if checkpoint_exists(&counts_bin) {
@@ -302,7 +314,7 @@ pub fn run_trinity(args: &TrinityArgs) -> Result<PathBuf, CommonError> {
                     populate_from_table(&counts, k, ds)
                 },
             )?;
-            write_kmer_count_report(&outdir.join("inchworm.kmer_count"), counter.size())?;
+            write_kmer_count_report(&workdir.join("inchworm.kmer_count"), counter.size())?;
             // 主线实参: --min_any_entropy 1.0 --no_prune_error_kmers（L1050/L2707）
             // + dump -L 已按 min_kmer_cov 过滤（minKmerCount 此处为等价二次过滤）。
             eprintln!(
@@ -331,7 +343,7 @@ pub fn run_trinity(args: &TrinityArgs) -> Result<PathBuf, CommonError> {
             Ok(())
         })
     })?;
-    let iworm_renamed_ok = outdir.join(format!("iworm_renamed.{k}.{SR_FLAG}.ok"));
+    let iworm_renamed_ok = workdir.join(format!("iworm_renamed.{k}.{SR_FLAG}.ok"));
     run_with_checkpoint(&iworm_renamed_ok, "mv inchworm.fa.tmp", || {
         if checkpoint_exists(&iworm_tmp) {
             fs::rename(&iworm_tmp, &iworm_fa)?;
@@ -345,7 +357,7 @@ pub fn run_trinity(args: &TrinityArgs) -> Result<PathBuf, CommonError> {
     })?;
     let _ = iworm_fa;
     // L1835-1837: touch <inchworm>.finished
-    let iworm_finished = outdir.join(format!("{iworm_name}.finished"));
+    let iworm_finished = workdir.join(format!("{iworm_name}.finished"));
     if !checkpoint_exists(&iworm_finished) {
         fs::write(&iworm_finished, b"")?;
     }
@@ -386,12 +398,20 @@ pub fn run_trinity(args: &TrinityArgs) -> Result<PathBuf, CommonError> {
     // ---- 5/6/7. 递归模式（--recursive, M1）: phase-1 止于分区 → 迷你分区池
     // ---- → 汇总（与 classic 的 chrysalis+butterfly+harvest 段并列）。 ----
     if args.recursive {
-        return run_recursive(a, args, &outdir, &chrysalis_dir, &iworm_data, &reads_data);
+        return run_recursive(
+            a,
+            args,
+            &outdir,
+            &workdir,
+            &chrysalis_dir,
+            &iworm_data,
+            &reads_data,
+        );
     }
 
     let mut listing_opt: Option<Vec<(u64, PathBuf)>> = None;
-    let quantify_ok = outdir.join(".quantify_graph.ok");
-    trinity_common::timer::timed(&outdir, "chrysalis_total", || {
+    let quantify_ok = workdir.join(".quantify_graph.ok");
+    trinity_common::timer::timed(&workdir, "chrysalis_total", || {
         run_with_checkpoint(
             &quantify_ok,
             "Chrysalis (clustering & de Bruijn graph)",
@@ -429,14 +449,14 @@ pub fn run_trinity(args: &TrinityArgs) -> Result<PathBuf, CommonError> {
 
     // ---- 6. butterfly 组件池（checkpoint .butterfly.ok; L1934-1936）----
     warn_memory(args.max_memory, file_len(&iworm_fa), "Butterfly");
-    trinity_common::timer::timed(&outdir, "butterfly", || {
+    trinity_common::timer::timed(&workdir, "butterfly", || {
         run_with_checkpoint(
-            &outdir.join(".butterfly.ok"),
+            &workdir.join(".butterfly.ok"),
             "Butterfly (component pool)",
             || {
                 run_butterfly_pool(
                     &listing,
-                    &outdir,
+                    &workdir,
                     &ButterflyPoolParams {
                         cpu: args.cpu.max(1),
                         min_contig_length: args.min_contig_length,
@@ -449,8 +469,8 @@ pub fn run_trinity(args: &TrinityArgs) -> Result<PathBuf, CommonError> {
     })?;
 
     // ---- 7. 汇总（无 checkpoint; 每次重写 Trinity.tmp.fasta, L1916/L1943）----
-    let trinity_tmp = outdir.join("Trinity.tmp.fasta");
-    let n_transcripts = trinity_common::timer::timed(&outdir, "harvest", || {
+    let trinity_tmp = workdir.join("Trinity.tmp.fasta");
+    let n_transcripts = trinity_common::timer::timed(&workdir, "harvest", || {
         harvest(&listing, args.min_contig_length, &trinity_tmp)
     })?;
     if n_transcripts == 0 {
@@ -460,8 +480,9 @@ pub fn run_trinity(args: &TrinityArgs) -> Result<PathBuf, CommonError> {
     }
 
     // 最终命名: `<outdir 绝对路径>.Trinity.fasta`（L1512）+ gene_trans_map。
+    // scratch 模式下 tmp 在 workdir（可能跨设备）→ rename 失败回落 copy+remove。
     let final_fa = PathBuf::from(format!("{}.Trinity.fasta", outdir.display()));
-    fs::rename(&trinity_tmp, &final_fa)?;
+    move_file(&trinity_tmp, &final_fa)?;
     write_gene_trans_map(
         &final_fa,
         &final_fa.with_file_name(format!(
@@ -478,13 +499,25 @@ pub fn run_trinity(args: &TrinityArgs) -> Result<PathBuf, CommonError> {
         for p in [
             &target_fa,
             &counts_bin,
-            &outdir.join("left.fa"),
-            &outdir.join("right.fa"),
+            &workdir.join("left.fa"),
+            &workdir.join("right.fa"),
         ] {
             let _ = fs::remove_file(p);
         }
     }
     Ok(final_fa)
+}
+
+/// 跨设备安全移动（--scratch 与 --output 常在不同文件系统, rename 直接失败）。
+pub(crate) fn move_file(src: &Path, dst: &Path) -> Result<(), CommonError> {
+    match fs::rename(src, dst) {
+        Ok(()) => Ok(()),
+        Err(_) => {
+            fs::copy(src, dst)?;
+            fs::remove_file(src)?;
+            Ok(())
+        }
+    }
 }
 
 /// 递归模式主线（`--recursive`, M1）: 取代 classic 的 chrysalis-quantify +
@@ -500,6 +533,7 @@ fn run_recursive(
     a: TrinityArgs,
     args: &TrinityArgs,
     outdir: &Path,
+    workdir: &Path,
     chrysalis_dir: &Path,
     iworm_data: &[u8],
     reads_data: &[u8],
@@ -512,7 +546,7 @@ fn run_recursive(
     );
     // ---- phase-1: chrysalis 止于分区（.tmp 保留, 供分区池消费）----
     let mut listing_opt: Option<Vec<(u64, PathBuf)>> = None;
-    let quantify_ok = outdir.join(".recursive_phase1.ok");
+    let quantify_ok = workdir.join(".recursive_phase1.ok");
     run_with_checkpoint(
         &quantify_ok,
         "Chrysalis (recursive phase-1: clustering & partitioning)",
@@ -555,9 +589,9 @@ fn run_recursive(
         reads_data.len() as u64,
         "Recursive mini pool",
     );
-    let mini_dir = outdir.join("read_partitions");
+    let mini_dir = workdir.join("read_partitions");
     run_with_checkpoint(
-        &outdir.join(".recursive.ok"),
+        &workdir.join(".recursive.ok"),
         "Recursive mini partition pool",
         || run_partition_pool(&listing, chrysalis_dir, args, &mini_dir).map(|_| ()),
     )?;
@@ -567,7 +601,7 @@ fn run_recursive(
         .collect();
 
     // ---- 汇总: min_len 过滤 + 全局去重（print_butterfly_assemblies 语义）----
-    let trinity_tmp = outdir.join("Trinity.tmp.fasta");
+    let trinity_tmp = workdir.join("Trinity.tmp.fasta");
     let n_transcripts = harvest_mini(&mini_files, args.min_contig_length, &trinity_tmp)?;
     if n_transcripts == 0 {
         return Err(CommonError::Parse(
@@ -575,9 +609,9 @@ fn run_recursive(
         ));
     }
 
-    // 最终命名与 gene_trans_map: 与 classic 尾段一致。
+    // 最终命名与 gene_trans_map: 与 classic 尾段一致（scratch 跨设备走 move_file）。
     let final_fa = PathBuf::from(format!("{}.Trinity.fasta", outdir.display()));
-    fs::rename(&trinity_tmp, &final_fa)?;
+    move_file(&trinity_tmp, &final_fa)?;
     write_gene_trans_map(
         &final_fa,
         &final_fa.with_file_name(format!(
@@ -588,13 +622,13 @@ fn run_recursive(
 
     // 收尾清理与 classic 相同集合（mini.fa 与 chrysalis 产物保留——断点依赖）。
     if !args.no_cleanup {
-        let target_fa = outdir.join("both.fa");
+        let target_fa = workdir.join("both.fa");
         for p in [
             &target_fa,
-            &outdir.join(format!("mer_counts.{}.{}.rs.bin", args.kmer_size, SR_FLAG)),
-            &outdir.join(format!("jellyfish.kmers.{}.{}.fa", args.kmer_size, SR_FLAG)),
-            &outdir.join("left.fa"),
-            &outdir.join("right.fa"),
+            &workdir.join(format!("mer_counts.{}.{}.rs.bin", args.kmer_size, SR_FLAG)),
+            &workdir.join(format!("jellyfish.kmers.{}.{}.fa", args.kmer_size, SR_FLAG)),
+            &workdir.join("left.fa"),
+            &workdir.join("right.fa"),
         ] {
             let _ = fs::remove_file(p);
         }

@@ -27,8 +27,9 @@ target/release/trinity-cli \
 | `--normalize_max_read_cov` / `--no_normalize_reads` | 归一化上限 / 跳过归一化 |
 | `--bfly_stack_mb` | Butterfly 线程栈（本实现扩展，默认对齐原版 JVM 栈行为） |
 | `--no_cleanup` | 保留中间产物（both.fa / left.fa / right.fa 等） |
+| `--scratch <dir>` | 中间产物（归一化目录 / both.fa / mer_counts / inchworm / chrysalis / butterfly）写到 `<scratch>/<output 目录名>/`；最终 `<output>.Trinity.fasta` 与 gene_trans_map 仍落在 `--output` 旁 |
 
-断点续跑：各阶段 `.ok` checkpoint 文件，重跑同 `--output` 自动跳过已完成阶段。
+断点续跑：各阶段 `.ok` checkpoint 文件，重跑同 `--output` 自动跳过已完成阶段。**注意**：`--scratch` 下 checkpoint 随产物放在 scratch 目录内（scratch 视为易失存储）——换 scratch 目录等于全部重算；续跑必须用同一 `--scratch`。
 
 ## 路径引擎（v0.2.0 新增）
 
