@@ -106,6 +106,11 @@ pub struct TrinityArgs {
     pub protein_guided: bool,
     /// `--protein-db <fa>`: 蛋白库（--protein-guided 必需）。
     pub protein_db: Option<PathBuf>,
+    /// `--flow-cov-fusion`（M8）: PogFlow 流分解的无 read 证据边以
+    /// junction k-mer 覆盖度（封顶）兜底权重。仅 PogFlow 引擎消费。默认 false。
+    pub flow_cov_fusion: bool,
+    /// `--flow-cov-cap <N>`: 覆盖度兜底权重上限（默认 10）。
+    pub flow_cov_cap: u64,
 }
 
 /// `--max_memory 10G` → 字节。镜像原版 L1156 `^(\d+)G`（大小写不敏感）;
@@ -191,6 +196,8 @@ pub fn parse_args(argv: &[String]) -> Result<TrinityArgs, CliError> {
     let model = cli.value_flag("--model")?.map(PathBuf::from);
     let protein_guided = cli.bool_flag("--protein-guided");
     let protein_db = cli.value_flag("--protein-db")?.map(PathBuf::from);
+    let flow_cov_fusion = cli.bool_flag("--flow-cov-fusion");
+    let flow_cov_cap: u64 = cli.uint_flag("--flow-cov-cap", 10)?;
     let path_engine: PathEngine = match cli.value_flag("--path-engine")? {
         None => PathEngine::Classic,
         Some(v) => v
@@ -275,6 +282,18 @@ pub fn parse_args(argv: &[String]) -> Result<TrinityArgs, CliError> {
             );
         }
     }
+    if flow_cov_fusion {
+        if flow_cov_cap == 0 {
+            return Err(CliError::usage(
+                "Error, --flow-cov-cap must be >= 1 with --flow-cov-fusion",
+            ));
+        }
+        if path_engine != PathEngine::PogFlow {
+            eprintln!(
+                "WARNING: --flow-cov-fusion is only used with --path-engine pogflow; ignoring"
+            );
+        }
+    }
 
     Ok(TrinityArgs {
         seq_type,
@@ -302,5 +321,7 @@ pub fn parse_args(argv: &[String]) -> Result<TrinityArgs, CliError> {
         model,
         protein_guided,
         protein_db,
+        flow_cov_fusion,
+        flow_cov_cap,
     })
 }

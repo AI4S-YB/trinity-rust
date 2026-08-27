@@ -145,11 +145,17 @@ fn resume_skips_completed_stage() {
     // 删中间产物（保留 .ok）→ 重跑: 计数阶段被跳过（mer_counts 不重建）,
     // inchworm 之后各阶段亦全部跳过, 最终仍成功产出。
     // （M7 后无 dump 文本阶段, 计数表经 kmer_load 直桥进 inchworm。）
+    let counts_bin = outdir.join("mer_counts.25.asm.rs.bin");
     let iworm_fa = outdir.join("inchworm.DS.fa");
+    fs::remove_file(&counts_bin).unwrap();
     let iworm_mtime = fs::metadata(&iworm_fa).unwrap().modified().unwrap();
 
     let final_fa = run_trinity(&synth_args_opt(&fa, &outdir, true)).unwrap();
     assert!(final_fa.exists());
+    assert!(
+        !counts_bin.exists(),
+        "count stage should be skipped on resume"
+    );
     assert_eq!(
         fs::metadata(&iworm_fa).unwrap().modified().unwrap(),
         iworm_mtime,
@@ -179,6 +185,11 @@ fn butterfly_pool_isolates_failures() {
             stack_size_mb: 16,
             path_engine: trinity_cli::args::PathEngine::Classic,
             kmer_size: 25,
+            flow_cov_fusion: false,
+            flow_cov_cap: 10,
+            counts_bin: dir.join("mer_counts.25.asm.rs.bin"),
+            count_source_fa: dir.join("both.fa"),
+            counts_ds: true,
         },
     )
     .unwrap_err();

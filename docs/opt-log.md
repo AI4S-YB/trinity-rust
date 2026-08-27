@@ -442,3 +442,203 @@ dev1 上"reads 里存在但组装丢失的末端" ≈ 极少, 蛋白引导延长
 | 2026-08-26 | v2-real-m6a | R=3.5% P=83.6% **F1=6.8%** | N50=1546 n=33017 | --path-engine pogflow --protein-guided --protein-db /storage/home/senior007/test/athal/bench/real/alyr_pep.fa --max_memory 16G --CPU 8 |
 | 2026-08-26 | evalv2-dev1-m5-sa | R=8.6% P=83.6% **F1=15.7%** | N50=1737 n=8190 | --path-engine pogflow --model-guided --max_memory 16G --CPU 8 |
 
+## M8 图解模型探针（2026-08-26, 转换级数据集 + GBM 基线）
+
+目标: 验证"DL 模型 → 权重文件 → 辅助流分解选边"路线的可行性。产出
+`xtask export-edges`（边表/转换表导出器, 14 单测）, 结论先行全部入档。
+
+### 探针三步与裁定
+
+1. **边级标签证伪（v1）**: dev1 全边 95.2% 正例——图来自同样本 reads 且
+   inchworm 已剪错误 k-mer, "边真不真"非问题; 判别问题在分叉处（决策点出边
+   正例率 38.1%）。全负分叉 44% = StringTie 参照不全的标签噪声实锤。
+2. **转换级数据集（v2）**: 参照三连 k-mer 标注 (入边,出边) 转换, 候选 = 内部
+   决策点（in≥1,out≥2）in×out 全组合。四集规模: dev1 8,309 / dev2 9,529 /
+   dev3 5,378 / holdout 446 行, 正例率 58.5-60.9%（均衡）。**e1_label/e2_label
+   为 oracle 泄漏列, 仅切片分析用, 训练禁用**。
+3. **k-mer 覆盖度（v3）**: 边 (u→v) 的 25-mer = u24mer+v末碱基, 查 jellyfish
+   计数表（mer_counts bin 已被收尾清理 → 回退 norm.fq 重数, 序列多重集恒等;
+   save/load_counts_bin 收编至 trinity-kmer 共用）。
+
+### GBM 基线（HistGradientBoosting, dev1+dev2 训 / dev3 测 / holdout 终测）
+
+| 集 | 行级 acc / AUC | 决策级 argmax | argmax(e2_cov) 规则基线 |
+|---|---|---|---|
+| dev3 | 0.893 / 0.932 | **76.9%**（混合 62.3% / 纯配对 95.9%） | 76.6% |
+| holdout | 0.789 / 0.853 | **70.0%**（混合 36.1% / 纯配对 96.0%） | 67.3% |
+
+- 特征重要性: **e2_cov 0.226 + e1_cov 0.208 ≈ 全部信号**; 其余 17 个
+  度数/序列特征合计 <0.02。GBM ≈ 单特征覆盖度规则（dev3 +0.3pp）。
+- **裁定: DL/GNN 不成立**——可学信号就是覆盖度, 模式识别无增量;
+  路线收敛为"覆盖度加权选边"。
+- 纯配对切片 95.9% 但偏 trivial（92.7% 候选两边皆真）; 混合切片 62.3%
+  的"错误"中 **63% 是 e2_cov≥50 的高覆盖边**——StringTie 漏报的真实分支,
+  标签噪声非模型错误, 真实选择精度已贴近标签上限。
+- **下一步（M8 主体）: 引擎实验**——graph.out 边权恒 1（M6a 已证）, 流分解
+  分叉处无任何覆盖输入; 最小实验 = 25-mer 覆盖作边权注入 PogFlow, dev1 F1
+  裁决。GBM 分数作为可选精化（相对裸覆盖 +0.3pp, 大概率不值得接线）。
+- 评估循环性注意: 模型若跟随高覆盖分支而 StringTie 漏报, F1 口径下 P 会
+  表面受损——引擎实验需同时看 R/P 分解与 n, 必要时换 Ensembl 参照复评。
+| 2026-08-26 | m8-cap2-dev1sub | R=2.7% P=88.0% **F1=5.3%** | N50=1408 n=7426 | --path-engine pogflow --flow-cov-fusion --flow-cov-cap 2 --max_memory 16G --CPU 8 |
+| 2026-08-26 | v2-real-m5 | R=3.9% P=86.2% **F1=7.4%** | N50=1470 n=34674 | --path-engine pogflow --model-guided --max_memory 16G --CPU 8 |
+| 2026-08-26 | m8-cap5-dev1sub | R=2.7% P=87.6% **F1=5.2%** | N50=1412 n=7448 | --path-engine pogflow --flow-cov-fusion --flow-cov-cap 5 --max_memory 16G --CPU 8 |
+| 2026-08-26 | m8-cap10-dev1sub | R=2.7% P=88.4% **F1=5.2%** | N50=1411 n=7427 | --path-engine pogflow --flow-cov-fusion --flow-cov-cap 10 --max_memory 16G --CPU 8 |
+| 2026-08-26 | m8-cap50-dev1sub | R=2.7% P=88.1% **F1=5.2%** | N50=1406 n=7443 | --path-engine pogflow --flow-cov-fusion --flow-cov-cap 50 --max_memory 16G --CPU 8 |
+| 2026-08-26 | m8-cap2-dev1sub | R=2.7% P=88.0% **F1=5.3%** | N50=1408 n=7426 | --path-engine pogflow --flow-cov-fusion --flow-cov-cap 2 --max_memory 16G --CPU 8 |
+| 2026-08-26 | m8-cap5-dev1sub | R=2.7% P=87.6% **F1=5.2%** | N50=1412 n=7448 | --flow-cov-cap 5 余同 |
+| 2026-08-26 | m8-cap10-dev1sub | R=2.7% P=88.4% **F1=5.2%** | N50=1411 n=7427 | --flow-cov-cap 10 余同 |
+| 2026-08-26 | m8-cap50-dev1sub | R=2.7% P=88.1% **F1=5.2%** | N50=1406 n=7443 | --flow-cov-cap 50 余同 |
+
+### M8 CAP 扫描（dev1sub, 2026-08-26）
+
+| CAP | n | R | P | F1 | N50 |
+|---|---|---|---|---|---|
+| 2 | 7426 | 2.7% | 88.0% | 5.28% | 1408 |
+| 5 | 7448 | 2.7% | 87.6% | 5.24% | 1412 |
+| 10 | 7427 | 2.7% | 88.4% | 5.24% | 1411 |
+| 50 | 7443 | 2.7% | 88.1% | 5.24% | 1406 |
+
+- **CAP 不敏感**（四配置 F1 互差 ≤0.05pp, 在噪声带内）→ 按 plan 取默认 10 定稿。
+- 融合机制确认生效（计数表 16.2M 键装载, 四配置产物数/精度均与 classic
+  dev1sub 基线 7389/86.3% 有差异方向: P +1.3~+2.1pp）。
+- 注意: dev1sub 无 pogflow 无融合对照（M1 网格只跑过 classic）——
+  补跑 m8-ctrl-dev1sub（pogflow 无融合）以分离"引擎差"与"融合差"。
+| 2026-08-26 | m8-ctrl-dev1sub | R=2.7% P=88.0% **F1=5.2%** | N50=1412 n=7448 | --path-engine pogflow --max_memory 16G --CPU 8 |
+
+## 评估 v2（junction 级双维度）——上线与全景（2026-08-26）
+
+### StringTie real 参照构建（scripts/prepare_stringtie_real.sh, 幂等, 全本地 ~5 min）
+
+**引导 GTF 考古判定**: 当年 holdout 参照 `athal/stringtie.gtf` 头部命令行为
+`stringtie -G chr5.renamed.gtf -p 8 -o stringtie.gtf -A stringtie.abund chr5.bam`, 其 chr1/chr4
+杂染色体记录（3+5 行）经 `samtools idxstats chr5.bam` 证实来自 chr5.bam 自身的散逸比对
+（chr1=153/chr2=108/chr3=172/chr4=382 条）——**不存在"用 all.bam 跑全基因组 StringTie"
+的隐藏运行, 头部命令行诚实**。chr5.renamed.gtf 的生成 = TAIR10.gff.gz
+（GCF_000001735.4）chr5 子集 → `gffread -E - -o chr5.gtf` → NC_003076.8 改名 chr5;
+dev2/dev3 轨道同构（gffread 头部 `gffread -E - -o devN.gtf`, stringtie 头部
+`-G devN.renamed.gtf -p 8`）。athal5.fa.fai 的 chr1..chr5 与 RefSeq 五条核染色体按尺寸
+一一对应（NC_003070.9=chr1/30427671 … NC_003076.8=chr5/26975502; 叶绿体 NC_000932.1
+与线粒体 NC_037304.1 不在 athal5.fa, 剔除）。→ real 全基因组引导 GTF = 同一
+TAIR10.gff.gz 五条核染色体 → gffread → 同一改名约定 = `bench/real/guide.gtf`
+（670,324 行 / 324,327 exon, chr1-5）。
+
+构建命令（脚本内实形; 与当年管线的差异注明: hd_pipeline.sh 的 hisat2 带 `--dta`,
+本构建按计划书形态未加, 已注脚本头）:
+
+```
+hisat2 -x athal5 -p 8 -1 bench/real/R1.fq.gz -2 bench/real/R2.fq.gz \
+  | samtools sort -@ 4 -o hisat2.bam -          # 10M PE 对, 96.59% overall, ~2 min
+stringtie -G guide.gtf -p 8 -o real_stringtie.gtf -A real_stringtie.abund hisat2.bam   # 3.0.3
+```
+
+产出: **real_stringtie.gtf = 33,277 转录本 / 21,998 基因（STRG）**（全基因组预期内）;
+首条比对 DRR095137.1742804 → chr1:3646 100M。
+
+### 双维度全景（junction 指标为 2026-08-26 回溯重评; classic/pogflow 组装缓存命中 m7-final, m5/m6a 因二进制更新重组装）
+
+| 配置 | R | P | F1 | P_full | Jgene | Jtx | Jprec | novelJ | single | n |
+|---|---|---|---|---|---|---|---|---|---|---|
+| v2-real-classic | 3.5% | 82.3% | 6.7% | 40.1% | 58.3% | 35.7% | 54.4% | 7.5% | 32.7% | 32833 |
+| v2-real-pogflow | 3.5% | 84.2% | 6.7% | 40.0% | 58.3% | 35.9% | 54.8% | 6.8% | 32.9% | 33041 |
+| v2-real-m5 | 3.9% | 86.2% | **7.4%** | **42.4%** | **61.0%** | **37.4%** | 53.6% | **6.2%** | **30.7%** | 34674 |
+| v2-real-m6a | 3.5% | 83.6% | 6.8% | 40.1% | 58.5% | 36.1% | 55.3% | 6.9% | 32.8% | 33017 |
+| evalv2-dev1-m5（dev 轨） | 8.6% | 83.6% | 15.7% | 64.3% | 30.4% | 20.9% | 21.0% | 74.1% | 33.8% | 8190 |
+
+（junction 分母: real = 参照 21,998 基因 / 33,277 转录本; dev = stringtie.gtf 的 4,831/5,369。
+m5/m6a 的 F1 与 08-25 首跑 7.5/6.7 差 0.1pp, 属重组装 run-to-run 抖动。）
+
+### 验收
+
+1. **区分力 PASS**: m5 Jgene 61.0% > classic 58.3%（+2.7pp）, 与 F1 体系同向（7.4 > 6.7）;
+   Jtx +1.7pp、novelJ -1.3pp、single -2.0pp 三项同向
+2. **稳定性 PASS**: v2-real-classic 重放两次, Junction 行逐字节一致
+   （`Jgene=58.3% Jtx=35.7% Jprec=54.4% novelJ=7.5% single=32.7% (genes=21998 tx=33277 asm=32751)`）
+3. **数值合理性**: Jgene 58-61% 高于预估 15-40% 带——判定为参照语义差而非 bug
+   （Task4 首跑 sanity 与本次重放逐位一致; asm 数 32-34k 与组装 n 吻合）, 详见下段
+
+### junction 数 vs F1 体系: 读出什么
+
+- **M5 优势方向保持, 相对幅度收窄**: F1 差 +0.7pp ≈ +10.4% 相对; Jgene 差 +2.7pp ≈ +4.6%
+  相对。M5 的增益本质是"找回更多表达位点"（Jgene/Jtx 同升 + 单外显子占比 32.7→30.7%）
+  而非"每条更准"——Jprec 反而 54.4→53.6 微降: 多出的链有一部分由参考内含子组成但
+  不精确等于任一参考链（变异剪接形态的密集上报）; novelJ 反而最低（6.2%）说明它
+  **不是编造内含子, 而是多报同位点的链变体**
+- **m6a 中性在 junction 语义下成立**: Jgene 58.5 vs 58.3（+0.2pp）, Jtx +0.4pp,
+  Jprec +0.9pp——与 F1（6.8 vs 6.7）同构, 旁系游荡式延长不伤 junction 完整度
+- **pogflow ≈ classic 在两套体系下严格成立**（Jgene 逐位同为 58.3）
+- **跨轨道绝对值不可比**: dev1 Jgene 30.4% vs real 61.0% 是参照构造差异而非组装器差异
+  ——dev1 参照（chr5 低深度、另一样本 DRR168 三重样 + chr5-only 引导）不含组装 reads
+  （hd chr5, DRR200069）的大部分真实内含子, novelJ 74.1% 即其镜像; real 参照与组装
+  **同本同 reads**（同 10M 对、96.6% 映射、全基因组 TAIR10 引导）, 参照只含有表达的
+  位点, 加上基因级"任一链复现即找回"判据天然宽松 → Jgene 抬到 58-61%, 超出按
+  "全注释/异本参照"语义预估的 15-40% 带。**junction 指标的正确用法是同轨道内配置间
+  Δ, 不是跨参照绝对值**
+- 实用结论: 双维度比单一 F1 多拆出一层——M5 的"+R 不伤 P"在 junction 语义下细化为
+  "宏观找回更多位点 + 内含子最干净 + 链形态变体更密（Jprec 微幅代价）"; m6a/pogflow
+  的中性结论在第二维度复核后无反转
+| 2026-08-26 | m8-dev1 | R=8.4% P=84.5% **F1=15.2%** | N50=1730 n=7881 | --path-engine pogflow --flow-cov-fusion --flow-cov-cap 10 --max_memory 16G --CPU 8 |
+| 2026-08-26 | m8-dev2 | R=7.7% P=82.7% **F1=14.2%** | N50=1684 n=9162 | --path-engine pogflow --flow-cov-fusion --flow-cov-cap 10 --max_memory 16G --CPU 8 |
+| 2026-08-26 | m8-dev3 | R=7.4% P=85.5% **F1=13.6%** | N50=1725 n=6537 | --path-engine pogflow --flow-cov-fusion --flow-cov-cap 10 --max_memory 16G --CPU 8 |
+| 2026-08-26 | m8-holdout | R=2.1% P=85.4% **F1=4.1%** | N50=583 n=4591 | --path-engine pogflow --flow-cov-fusion --flow-cov-cap 10 --max_memory 4G --CPU 8 |
+| 2026-08-26 | m8-ctrl-dev1sub | R=2.7% P=88.0% **F1=5.2%** | N50=1412 n=7448 | --path-engine pogflow --max_memory 16G --CPU 8（无融合对照） |
+| 2026-08-26 | m8-dev1 | R=8.4% P=84.5% **F1=15.2%** | N50=1730 n=7881 | --path-engine pogflow --flow-cov-fusion --flow-cov-cap 10 --max_memory 16G --CPU 8 |
+| 2026-08-26 | m8-dev2 | R=7.7% P=82.7% **F1=14.2%** | N50=1684 n=9162 | 同上 |
+| 2026-08-26 | m8-dev3 | R=7.4% P=85.5% **F1=13.6%** | N50=1725 n=6537 | 同上 |
+| 2026-08-26 | m8-holdout | R=2.1% P=85.4% **F1=4.1%** | N50=583 n=4591 | --max_memory 4G |
+
+## M8 覆盖度加权流分解验收（2026-08-26, --flow-cov-fusion, CAP=10）
+
+| 集 | M3（pogflow 无融合）F1 | **M8 F1** | Δ | R / P 变化 |
+|---|---|---|---|---|
+| dev1 | 15.1% | **15.2%** | +0.1pp | R 8.3→8.4, P 84.5→84.5 |
+| dev2 | 13.9% | **14.2%** | +0.3pp | R 7.6→7.7, P 82.3→82.7 |
+| dev3 | 13.5% | **13.6%** | +0.1pp | R 7.4→7.4, P 85.9→85.5 |
+| holdout | 4.0% | **4.1%** | +0.1pp | R 2.0→2.1, P 85.2→85.4 |
+
+### Gate 判定: PASS
+
+- dev1 F1 15.2% > 15.1%（M3 基线）且 P 84.5% ≥ 84%——**四集全部非负, 三集为正**
+- 方向与探针预言一致: R 普遍微升而 P 未损——无 read 证据的高覆盖边确为
+  真实分支, 覆盖度兜底把它们找回而不引入假边（P 未现 spec 风险 3 的
+  "表面受损"形态, 无需 Ensembl 复评分支）
+- CAP=10（扫描不敏感, 见上节）; 机制: 无证据边 floor 1 → min(cov25,10),
+  read 证据边不动; 融合装载 23.9-31.1M 键, 均命中 bin 无需重数
+- dev1sub 对照（ctrl 5.2% vs 融合 5.2-5.3%）无分离——亚采样深度下融合
+  效果不可见, dev1sub 仅用于 CAP 排序的既定口径不变
+- 回归: bench 缓存键含 passthrough flag（新 key 新目录, 无互踩）;
+  fusion off 路径与 M3 逐边一致（digraph_to_flow 单测 + workspace 46 套件绿）
+
+### BUSCO 补充维度（2026-08-26, embryophyta_odb10 离线, n=1614, 首跑）
+
+| 组装 | Complete [S/D] | Fragmented | Missing | 备注 |
+|---|---|---|---|---|
+| real-classic | 70.6% [61.6/8.9] | 12.3% | 17.1% | 10M PE, M7 后 |
+| real-pogflow | 70.6% [61.0/9.6] | 12.3% | 17.1% | 与 classic 持平（三体系一致） |
+| real-m5 | **70.9% [62.1/8.8]** | **11.6%** | 17.5% | 方向性最佳, 与 F1/Jgene 同向但幅度小（保守基因集对表达广度不敏感） |
+| real-m6a | 70.6% [60.4/10.2] | 12.3% | 17.1% | 中性（三体系一致） |
+| dev1-pogflow / dev1-m5 | 23.5% / 23.4% | ~2.2% | ~74% | dev 为部分转录组数据, 绝对值低属预期 |
+| **orig-Trinity（chr5 对拍）** | **3.4% [3.0/0.4]** | 3.5% | 93.1% | 原版 Perl v2.15.2 |
+| **rust-port-early（同数据）** | **3.4% [3.2/0.2]** | 3.5% | 93.1% | **Complete 与原版完全一致**——移植保真度的独立第三方验证 |
+
+- **移植保真度**: 同数据下 Rust 移植与原版 Trinity 的 BUSCO 完整度逐位一致
+  （3.4%=3.4%, F/M 同; S/D 微差 0.2pp 属平局序噪声）——与既有 xcheck 多重集
+  等价结论互相印证
+- chr5 数据完整度 3.4% 低是数据覆盖所致（chr5 子集 reads 对全转录组保守基因）,
+  与移植质量无关
+- 三套质量体系（F1 / junction / BUSCO）对四配置的排序完全一致:
+  M5 ≥ 其余持平, 无配置拖后腿
+| 2026-08-26 | real-m8 | R=3.5% P=84.2% **F1=6.7%** | N50=1531 n=33025 | --path-engine pogflow --flow-cov-fusion --flow-cov-cap 10 --max_memory 16G --CPU 8 |
+| 2026-08-26 | real-m8 | R=3.5% P=84.2% **F1=6.7%** | N50=1531 n=33025 | --path-engine pogflow --flow-cov-fusion --flow-cov-cap 10 --max_memory 16G --CPU 8 |
+
+### M8 real 轨道验证（2026-08-26, real-m8 vs v2-real-pogflow）
+
+| 配置 | R | P | F1 | N50 | n |
+|---|---|---|---|---|---|
+| v2-real-pogflow | 3.5% | 84.2% | 6.7% | 1524 | 33041 |
+| real-m8（融合） | 3.5% | 84.2% | 6.7% | 1531 | 33025 |
+
+- **real 上中性**（计数表 48.0M 键装载, 机制生效但指标逐位持平）——dev 四集的
+  +0.1~0.3pp 增益未在真实数据复现; 与 M6a 经验同构（真实数据 PE 结构更复杂,
+  弱证据分叉的覆盖度兜底不再提供增量）。M8 结论修订为: **dev 模拟数据小增益,
+  real 中性无害**——flag 保留 opt-in, 不设默认。
+

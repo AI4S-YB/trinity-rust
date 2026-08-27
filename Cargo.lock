@@ -352,6 +352,7 @@ dependencies = [
  "rayon",
  "rustc-hash",
  "trinity-common",
+ "trinity-kmer",
 ]
 
 [[package]]

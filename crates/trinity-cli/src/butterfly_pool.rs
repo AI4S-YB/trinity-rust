@@ -39,12 +39,72 @@ pub struct ButterflyPoolParams {
     pub path_engine: PathEngine,
     /// kmer 长（flow 引擎 path_to_seq 用; classic 不消费）。
     pub kmer_size: usize,
+    /// `--flow-cov-fusion`（M8）: 无 read 证据边以 junction k-mer 覆盖度兜底。
+    pub flow_cov_fusion: bool,
+    /// `--flow-cov-cap`（默认 10）。
+    pub flow_cov_cap: u64,
+    /// 计数表路径（mer_counts.<k>.<SR>.rs.bin, 收尾清理会删——
+    /// 缺失时回退 count_source_fa 重数）。
+    pub counts_bin: PathBuf,
+    /// 计数源 FASTA（both.fa / single.fa, 重数回退用）。
+    pub count_source_fa: PathBuf,
+    /// 计数表 DS 模式（load_counts_bin 校验用）。
+    pub counts_ds: bool,
+}
+
+/// M8 覆盖度表装载: bin → 源 FASTA 重数 → 双缺失优雅降级（None = 现状行为）。
+/// 一次性装载, `Arc` 跨组件线程只读共享。
+fn load_flow_cov(
+    params: &ButterflyPoolParams,
+) -> Option<(std::sync::Arc<trinity_kmer::counter::CountMap>, u64)> {
+    use trinity_kmer::counter::{CountMap, KmerCountTable};
+    let cap = params.flow_cov_cap;
+    if params.counts_bin.is_file() {
+        match trinity_kmer::counter::load_counts_bin(
+            &params.counts_bin,
+            params.kmer_size,
+            params.counts_ds,
+        ) {
+            Ok(m) => {
+                eprintln!(
+                    "[flow-cov] 装载计数表 {} 键（{}）",
+                    m.len(),
+                    params.counts_bin.display()
+                );
+                return Some((std::sync::Arc::new(m), cap));
+            }
+            Err(e) => eprintln!("[flow-cov] 计数表装载失败（{e}）, 尝试源 FASTA 重数"),
+        }
+    }
+    if params.count_source_fa.is_file() {
+        let t0 = std::time::Instant::now();
+        let data = fs::read(&params.count_source_fa)
+            .unwrap_or_else(|e| panic!("read {}: {e}", params.count_source_fa.display()));
+        let m: CountMap = KmerCountTable::count_fasta_data_with_capacity(
+            &data,
+            params.kmer_size,
+            params.counts_ds,
+            1 << 20,
+        );
+        eprintln!(
+            "[flow-cov] 源 FASTA 重数 {} 键（{:.1?}）",
+            m.len(),
+            t0.elapsed()
+        );
+        return Some((std::sync::Arc::new(m), cap));
+    }
+    eprintln!("[flow-cov] 计数表与计数源均缺失, 融合禁用（行为同 floor 1）");
+    None
 }
 
 /// 原版 butterfly 命令实参（L2363-2388）:
 /// `-N 100000 -L <min_contig_length> -F <group_pairs_distance> -C <base>.graph
 /// --path_reinforcement_distance=25 --NO_EM_REDUCE`。
-fn component_params(base: &Path, p: &ButterflyPoolParams) -> ComponentParams {
+fn component_params(
+    base: &Path,
+    p: &ButterflyPoolParams,
+    flow_cov: &Option<(std::sync::Arc<trinity_kmer::counter::CountMap>, u64)>,
+) -> ComponentParams {
     ComponentParams {
         n: 100_000,
         min_len: p.min_contig_length,
@@ -58,6 +118,7 @@ fn component_params(base: &Path, p: &ButterflyPoolParams) -> ComponentParams {
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| "component".to_string()),
         stack_size: p.stack_size_mb.saturating_mul(1024 * 1024),
+        flow_cov: flow_cov.clone(),
         ..Default::default()
     }
 }
@@ -70,6 +131,12 @@ pub fn run_butterfly_pool(
     params: &ButterflyPoolParams,
 ) -> Result<(), CommonError> {
     let failed: Mutex<Vec<(u64, String)>> = Mutex::new(Vec::new());
+    // M8: fusion 开启才装载（关闭零成本零行为差）
+    let flow_cov = if params.flow_cov_fusion {
+        load_flow_cov(params)
+    } else {
+        None
+    };
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(params.cpu.max(1))
         .build()
@@ -77,7 +144,7 @@ pub fn run_butterfly_pool(
 
     pool.install(|| {
         listing.par_iter().for_each(|(id, base)| {
-            if let Err(e) = run_one(base, params) {
+            if let Err(e) = run_one(base, params, &flow_cov) {
                 eprintln!("-butterfly component {id} failed: {e}");
                 failed
                     .lock()
@@ -103,7 +170,11 @@ pub fn run_butterfly_pool(
     )))
 }
 
-fn run_one(base: &Path, params: &ButterflyPoolParams) -> Result<(), CommonError> {
+fn run_one(
+    base: &Path,
+    params: &ButterflyPoolParams,
+    flow_cov: &Option<(std::sync::Arc<trinity_kmer::counter::CountMap>, u64)>,
+) -> Result<(), CommonError> {
     let graph_out = PathBuf::from(format!("{}.graph.out", base.display()));
     let graph_reads = PathBuf::from(format!("{}.graph.reads", base.display()));
     let out = PathBuf::from(format!("{}.graph.allProbPaths.fasta", base.display()));
@@ -113,14 +184,14 @@ fn run_one(base: &Path, params: &ButterflyPoolParams) -> Result<(), CommonError>
         .map_err(|e| CommonError::Parse(format!("cannot read {}: {e}", graph_reads.display())))?;
     match params.path_engine {
         PathEngine::Classic => {
-            let result = run_component(&g, &r, &component_params(base, params))?;
+            let result = run_component(&g, &r, &component_params(base, params, flow_cov))?;
             fs::write(&out, &result.all_prob_paths_fasta)
                 .map_err(|e| CommonError::Parse(format!("cannot write {}: {e}", out.display())))?;
         }
         PathEngine::PogFlow => {
             // M2.1: 走 run_component（POG 递归需要 butterfly 的大栈线程），
             // 引擎参数切 PogFlow——create_dag_from_overlap_layout 后流分解。
-            let mut cp = component_params(base, params);
+            let mut cp = component_params(base, params, flow_cov);
             cp.path_engine = trinity_butterfly::PathEngine::PogFlow;
             let result = run_component(&g, &r, &cp)?;
             fs::write(&out, &result.all_prob_paths_fasta)
@@ -144,4 +215,69 @@ fn run_one(base: &Path, params: &ButterflyPoolParams) -> Result<(), CommonError>
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tmpdir(tag: &str) -> PathBuf {
+        let d =
+            std::env::temp_dir().join(format!("trinity-rust-flowcov-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn params(dir: &Path, fusion: bool) -> ButterflyPoolParams {
+        ButterflyPoolParams {
+            cpu: 1,
+            min_contig_length: 100,
+            group_pairs_distance: 500,
+            stack_size_mb: 16,
+            path_engine: PathEngine::PogFlow,
+            kmer_size: 25,
+            flow_cov_fusion: fusion,
+            flow_cov_cap: 10,
+            counts_bin: dir.join("mer_counts.25.asm.rs.bin"),
+            count_source_fa: dir.join("both.fa"),
+            counts_ds: true,
+        }
+    }
+
+    #[test]
+    fn flow_cov_missing_everything_degrades_to_none() {
+        let dir = tmpdir("none");
+        assert!(load_flow_cov(&params(&dir, true)).is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn flow_cov_loads_bin_when_present() {
+        let dir = tmpdir("bin");
+        let mut m = trinity_kmer::counter::CountMap::default();
+        m.insert(42u64, 7u32);
+        trinity_kmer::counter::save_counts_bin(&dir.join("mer_counts.25.asm.rs.bin"), &m, 25, true)
+            .unwrap();
+        let (table, cap) = load_flow_cov(&params(&dir, true)).unwrap();
+        assert_eq!(cap, 10);
+        assert_eq!(table.get(&42), Some(&7));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn flow_cov_recounts_from_source_fa() {
+        let dir = tmpdir("fa");
+        // 无 bin, 只有源 FASTA: 26 个 A → 25-mer "A"*25 计数 2
+        fs::write(
+            dir.join("both.fa"),
+            ">r1\nAAAAAAAAAAAAAAAAAAAAAAAAAA\n>r2\nAAAAAAAAAAAAAAAAAAAAAAAAAA\n",
+        )
+        .unwrap();
+        let (table, _) = load_flow_cov(&params(&dir, true)).unwrap();
+        use trinity_common::kmer::{get_ds_kmer_val, kmer_to_intval};
+        let key = get_ds_kmer_val(kmer_to_intval(b"AAAAAAAAAAAAAAAAAAAAAAAAA").unwrap(), 25);
+        assert_eq!(table.get(&key), Some(&4)); // 每条 26nt 序列 2 窗 × 2 序列
+        let _ = fs::remove_dir_all(&dir);
+    }
 }

@@ -1,4 +1,5 @@
 mod bench;
+mod export_edges;
 mod junction;
 
 use std::env;
@@ -19,6 +20,7 @@ fn main() {
         Some("xcheck-butterfly") => xcheck_butterfly(&args[1..]),
         Some("eval-trinity") => eval_trinity_cmd(&args[1..]),
         Some("bench") => std::process::exit(crate::bench::run(&args[1..])),
+        Some("export-edges") => std::process::exit(crate::export_edges::run(&args[1..])),
         Some("xcheck-trinity") => xcheck_trinity(&args[1..]),
         Some(other) => {
             eprintln!(

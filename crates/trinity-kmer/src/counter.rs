@@ -150,6 +150,59 @@ fn merge_counts(mut a: CountMap, b: CountMap) -> CountMap {
 }
 
 /// mer_counts 二进制记录布局: `u64 key, u32 count`（小端）, 头部魔数
+/// `TRMC` + u32 k + u8 ds（读回时校验）。M7 消 dump 直桥的落盘格式,
+/// 管线（orchestrate）与离线工具（xtask export-edges）共用。
+pub fn save_counts_bin(
+    path: &std::path::Path,
+    counts: &CountMap,
+    k: usize,
+    ds: bool,
+) -> Result<(), trinity_common::error::CommonError> {
+    let mut buf: Vec<u8> = Vec::new();
+    buf.extend_from_slice(b"TRMC");
+    buf.extend_from_slice(&(k as u32).to_le_bytes());
+    buf.push(ds as u8);
+    for (&key, &c) in counts.iter() {
+        buf.extend_from_slice(&key.to_le_bytes());
+        buf.extend_from_slice(&c.to_le_bytes());
+    }
+    std::fs::write(path, buf)?;
+    Ok(())
+}
+
+/// save_counts_bin 的读回侧; k/ds 不匹配或头损坏报错。
+pub fn load_counts_bin(
+    path: &std::path::Path,
+    k: usize,
+    ds: bool,
+) -> Result<CountMap, trinity_common::error::CommonError> {
+    use trinity_common::error::CommonError;
+    let data = std::fs::read(path)?;
+    if data.len() < 9 || &data[..4] != b"TRMC" {
+        return Err(CommonError::Parse(format!(
+            "corrupt k-mer table {}: bad header",
+            path.display()
+        )));
+    }
+    let k_in = u32::from_le_bytes([data[4], data[5], data[6], data[7]]) as usize;
+    let ds_in = data[8] != 0;
+    if k_in != k || ds_in != ds {
+        return Err(CommonError::Parse(format!(
+            "k-mer table {} was built with different k/DS settings",
+            path.display()
+        )));
+    }
+    let mut counts = CountMap::default();
+    let mut i = 9;
+    while i + 12 <= data.len() {
+        let key = u64::from_le_bytes(data[i..i + 8].try_into().unwrap());
+        let c = u32::from_le_bytes(data[i + 8..i + 12].try_into().unwrap());
+        counts.insert(key, c);
+        i += 12;
+    }
+    Ok(counts)
+}
+
 /// Trinity:2598-2604 hash 大小护栏（信息性容量提示用，语义与原版一致）
 pub fn estimate_hash_size(max_memory: u64, read_file_size: u64) -> u64 {
     let mut h = if max_memory > read_file_size {

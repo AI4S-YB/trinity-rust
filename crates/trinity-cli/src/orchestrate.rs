@@ -137,24 +137,15 @@ fn diginorm_params(args: &TrinityArgs, paired: bool) -> DigiNormParams {
     }
 }
 
-/// mer_counts 二进制记录布局: `u64 key, u32 count`（小端）, 头部魔数
-/// `TRMC` + u32 k + u8 ds（读回时校验）。
+/// mer_counts 二进制存取已收编至 `trinity_kmer::counter::{save_counts_bin,
+/// load_counts_bin}`（xtask export-edges 共用）; 保留本地薄封装以稳调用点。
 fn save_counts(
     path: &Path,
     counts: &trinity_kmer::counter::CountMap,
     k: usize,
     ds: bool,
 ) -> Result<(), CommonError> {
-    let mut buf: Vec<u8> = Vec::new();
-    buf.extend_from_slice(b"TRMC");
-    buf.extend_from_slice(&(k as u32).to_le_bytes());
-    buf.push(ds as u8);
-    for (&key, &c) in counts.iter() {
-        buf.extend_from_slice(&key.to_le_bytes());
-        buf.extend_from_slice(&c.to_le_bytes());
-    }
-    fs::write(path, buf)?;
-    Ok(())
+    trinity_kmer::counter::save_counts_bin(path, counts, k, ds)
 }
 
 fn load_counts(
@@ -162,30 +153,7 @@ fn load_counts(
     k: usize,
     ds: bool,
 ) -> Result<trinity_kmer::counter::CountMap, CommonError> {
-    let data = fs::read(path)?;
-    if data.len() < 9 || &data[..4] != b"TRMC" {
-        return Err(CommonError::Parse(format!(
-            "corrupt k-mer table {}: bad header",
-            path.display()
-        )));
-    }
-    let k_in = u32::from_le_bytes([data[4], data[5], data[6], data[7]]) as usize;
-    let ds_in = data[8] != 0;
-    if k_in != k || ds_in != ds {
-        return Err(CommonError::Parse(format!(
-            "k-mer table {} was built with different k/DS settings",
-            path.display()
-        )));
-    }
-    let mut counts = trinity_kmer::counter::CountMap::default();
-    let mut i = 9;
-    while i + 12 <= data.len() {
-        let key = u64::from_le_bytes(data[i..i + 8].try_into().unwrap());
-        let c = u32::from_le_bytes(data[i + 8..i + 12].try_into().unwrap());
-        counts.insert(key, c);
-        i += 12;
-    }
-    Ok(counts)
+    trinity_kmer::counter::load_counts_bin(path, k, ds)
 }
 
 /// component_base_listing.txt（T1 partition 落盘）→ (comp id, base 前缀) 升序。
@@ -558,6 +526,11 @@ pub fn run_trinity(args: &TrinityArgs) -> Result<PathBuf, CommonError> {
                         stack_size_mb: args.bfly_stack_mb,
                         path_engine: args.path_engine,
                         kmer_size: args.kmer_size,
+                        flow_cov_fusion: args.flow_cov_fusion,
+                        flow_cov_cap: args.flow_cov_cap,
+                        counts_bin: counts_bin.clone(),
+                        count_source_fa: target_fa.clone(),
+                        counts_ds: ds,
                     },
                 )
             },

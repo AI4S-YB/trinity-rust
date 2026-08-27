@@ -7,6 +7,10 @@ edition.workspace = true
 
 [dependencies.trinity-butterfly]
 path = "../crates/trinity-butterfly"
+[dependencies.trinity-common]
+path = "../crates/trinity-common"
+[dependencies.trinity-kmer]
+path = "../crates/trinity-kmer"
 [dependencies.flate2]
 workspace = true
 [dependencies.sha2]
