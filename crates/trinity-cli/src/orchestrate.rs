@@ -131,6 +131,10 @@ fn diginorm_params(args: &TrinityArgs, paired: bool) -> DigiNormParams {
         ds: ss.is_none(),
         max_cov: args.normalize_max_read_cov as f64,
         min_cov: args.min_kmer_count as f64,
+        // IO 优化: fq 输入直出归一化 fa（跳过 norm.fq 物化）; --no_cleanup
+        // 时额外保留 norm.fq（原版把归一化 fq 留给用户——既定差异见 README）。
+        fa_direct: args.seq_type == SeqType::Fq,
+        keep_fq: args.no_cleanup,
         ..Default::default()
     }
 }
@@ -206,6 +210,9 @@ pub fn run_trinity(args: &TrinityArgs) -> Result<PathBuf, CommonError> {
         .build_global();
 
     // ---- 1. 归一化（L1441-1453; checkpoint insilico_read_normalization/normalization.ok）----
+    // fa_direct（fq 输入直出归一化 fa）时: 下游按 fa 消费, 且 SS revcomp 已在
+    // diginorm 内部 prep 完成 → prep 阶段不得再 revcomp（防双重反转）。
+    let norm_fa_direct = !args.no_normalize_reads && args.seq_type == SeqType::Fq;
     if !args.no_normalize_reads {
         let norm: Result<(), CommonError> =
             trinity_common::timer::timed(&workdir, "normalize", || {
@@ -231,12 +238,19 @@ pub fn run_trinity(args: &TrinityArgs) -> Result<PathBuf, CommonError> {
                 })? {
                     // skipped: 输出文件应已在（resume 语义）。
                 }
-                let ext = ext_of(args.seq_type);
+                let ext = if norm_fa_direct {
+                    "fa"
+                } else {
+                    ext_of(args.seq_type)
+                };
                 if paired {
                     a.left = vec![norm_dir.join(format!("left.norm.{ext}"))];
                     a.right = vec![norm_dir.join(format!("right.norm.{ext}"))];
                 } else {
                     a.single = vec![norm_dir.join(format!("single.norm.{ext}"))];
+                }
+                if norm_fa_direct {
+                    a.seq_type = SeqType::Fa;
                 }
                 Ok(())
             });
@@ -244,8 +258,9 @@ pub fn run_trinity(args: &TrinityArgs) -> Result<PathBuf, CommonError> {
     }
 
     // ---- 2. prep → both.fa/single.fa + .read_count（L1604-1705）----
-    let (target_fa, read_count) =
-        trinity_common::timer::timed(&workdir, "prep", || prep_reads(&a, &workdir))?;
+    let (target_fa, read_count) = trinity_common::timer::timed(&workdir, "prep", || {
+        prep_reads(&a, &workdir, norm_fa_direct)
+    })?;
     let read_count_file = workdir.join(format!(
         "{}.read_count",
         target_fa.file_name().unwrap_or_default().to_string_lossy()

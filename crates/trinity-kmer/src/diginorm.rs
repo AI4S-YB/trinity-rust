@@ -63,6 +63,14 @@ pub struct DigiNormParams {
     /// 非 SS 即 true。只影响**计数阶段**（jellyfish --canonical）; stats 阶段恒 DS
     /// （见模块文档），SS 时由 stats_query_table 补 canonical 合并。
     pub ds: bool,
+    /// fq 输入直接产出归一化 **fa**（从已 prep 的内存 fa 抽取选中记录,
+    /// 跳过 norm.fq 全量物化与下游 fq→fa 往返; trinity-cli 默认开）。
+    /// SS revcomp 已在 prep 内完成 → 下游 prep 不得再 revcomp（编排层负责）。
+    /// 库默认 false（保持原版行为: 原格式 fq 抽取写出）。
+    pub fa_direct: bool,
+    /// fa_direct 时**额外**保留 norm.fq（trinity-cli 的 --no_cleanup 语义;
+    /// 原版 Trinity 恒把归一化 fq 留给用户, 此处默认不留——既定差异, 见 README）。
+    pub keep_fq: bool,
 }
 
 impl Default for DigiNormParams {
@@ -76,6 +84,8 @@ impl Default for DigiNormParams {
             ss_revcomp_left: false,
             ss_revcomp_right: false,
             ds: true,
+            fa_direct: false,
+            keep_fq: false,
         }
     }
 }
@@ -128,10 +138,12 @@ fn side_base_name(paths: &[PathBuf]) -> String {
 
 /// 输出文件（长名，镜像原版 L398-410 的 `{basename}.normalized_K.._maxC.._minC.._maxCV..` 命名）。
 /// 便捷名 `left.norm.*`/`right.norm.*`/`single.norm.*` 一并写出（硬链接同内容，见 [`run`]）。
+/// `fmt` = 主产物实际格式（fa_direct 时 fq 输入的主产物是 fa）。
 pub struct DigiNormOutputs {
     pub left: Option<PathBuf>,
     pub right: Option<PathBuf>,
     pub single: Option<PathBuf>,
+    pub fmt: SeqFormat,
 }
 
 /// 输入序列格式。
@@ -173,16 +185,35 @@ pub fn run(
             let final_rows = merged_to_stats_rows(&merged);
             let selected = select_rows(&final_rows, params)?;
             let index = index_keys(&selected);
-            let out_left = normalized_out_path(out_dir, &side_base_name(left_paths), fmt, params);
-            let out_right = normalized_out_path(out_dir, &side_base_name(right_paths), fmt, params);
-            extract_to_file(&left_raw, fmt, &index, &out_left)?;
-            extract_to_file(&right_raw, fmt, &index, &out_right)?;
-            write_convenience(&out_left, out_dir, "left", fmt)?;
-            write_convenience(&out_right, out_dir, "right", fmt)?;
+            let (out_left, out_fmt) = emit_side(
+                &left_raw,
+                &left_fa,
+                fmt,
+                params,
+                &index,
+                SideOut {
+                    dir: out_dir,
+                    base: &side_base_name(left_paths),
+                    side: "left",
+                },
+            )?;
+            let (out_right, _) = emit_side(
+                &right_raw,
+                &right_fa,
+                fmt,
+                params,
+                &index,
+                SideOut {
+                    dir: out_dir,
+                    base: &side_base_name(right_paths),
+                    side: "right",
+                },
+            )?;
             Ok(DigiNormOutputs {
                 left: Some(out_left),
                 right: Some(out_right),
                 single: None,
+                fmt: out_fmt,
             })
         }
         ReadsInput::Single(paths) => {
@@ -192,16 +223,64 @@ pub fn run(
             let rows = sorted_stats_rows(&fa, &table, params)?;
             let selected = select_rows(&rows, params)?;
             let index = index_keys(&selected);
-            let out = normalized_out_path(out_dir, &side_base_name(paths), fmt, params);
-            extract_to_file(&raw, fmt, &index, &out)?;
-            write_convenience(&out, out_dir, "single", fmt)?;
+            let (out, out_fmt) = emit_side(
+                &raw,
+                &fa,
+                fmt,
+                params,
+                &index,
+                SideOut {
+                    dir: out_dir,
+                    base: &side_base_name(paths),
+                    side: "single",
+                },
+            )?;
             Ok(DigiNormOutputs {
                 left: None,
                 right: None,
                 single: Some(out),
+                fmt: out_fmt,
             })
         }
     }
+}
+
+/// 一侧输出（IO 优化）: `fa_direct` 且 fq 输入 → 从**内存中已 prep 的 fa**
+/// 抽取选中记录直出 `.fa`（跳过 norm.fq 全量物化与下游 fq→fa 转换——
+/// 名字规范/SS revcomp 在 prep 阶段已完成, 抽取产物与 fq→fa 往返逐字节一致）;
+/// `keep_fq` 时额外再写一份原格式 fq（trinity-cli --no_cleanup 语义）。
+/// 返回（主产物长名路径, 实际格式）。
+fn emit_side(
+    raw: &[u8],
+    fa: &[u8],
+    fmt: SeqFormat,
+    params: &DigiNormParams,
+    index: &HashSet<String>,
+    dst: SideOut<'_>,
+) -> Result<(PathBuf, SeqFormat), CommonError> {
+    if params.fa_direct && fmt == SeqFormat::Fq {
+        let out = normalized_out_path(dst.dir, dst.base, SeqFormat::Fa, params);
+        extract_to_file(fa, SeqFormat::Fa, index, &out)?;
+        write_convenience(&out, dst.dir, dst.side, SeqFormat::Fa)?;
+        if params.keep_fq {
+            let fq = normalized_out_path(dst.dir, dst.base, SeqFormat::Fq, params);
+            extract_to_file(raw, fmt, index, &fq)?;
+            write_convenience(&fq, dst.dir, dst.side, SeqFormat::Fq)?;
+        }
+        Ok((out, SeqFormat::Fa))
+    } else {
+        let out = normalized_out_path(dst.dir, dst.base, fmt, params);
+        extract_to_file(raw, fmt, index, &out)?;
+        write_convenience(&out, dst.dir, dst.side, fmt)?;
+        Ok((out, fmt))
+    }
+}
+
+/// emit_side 的输出位置三元组（out_dir / basename / 侧名）。
+struct SideOut<'a> {
+    dir: &'a Path,
+    base: &'a str,
+    side: &'a str,
 }
 
 // ---------------------------------------------------------------- 读入与格式
