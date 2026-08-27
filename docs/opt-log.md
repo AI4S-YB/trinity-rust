@@ -943,4 +943,41 @@ R_full 上界 = 125/33,277 ≈ +0.4pp**（此前 +3-4pp 的估计错在把
   butterfly）在 dev1/real 上已接近其架构可达上限; 剩余缺口 ~65% 数据
   上限封顶, 后处理与调参空间已探尽。下一步若要突破, 需换架构级机制
   （如 genome-guided 模式、长读长辅助）, 非本仓当前定位。
+
+## OLC 路线冒烟: 从零与合并层双双证伪（2026-08-27, probe_olc 1-2）
+
+用户提议 hifiasm 风格 OLC; 短读转录组 OLC 的两个形态都做了冒烟。
+
+### 从零 OLC（probe_olc1, reads 级）
+
+- 归一化 reads 中位 **83bp**——hifiasm 前提（15-25kb HiFi）不存在。
+- minimap2 敏感参数（-k10 -w2）self-map 仅 ~15K 对 overlap（每 read 0.13 个,
+  归一化压稀了 read 密度）; dovetail 几何（overlap>=40 + overhang<=35）
+  在 83bp 上与 containment 不可分——**合格边 0 条**。minibwa（lh3 的
+  bwa-mem 继任者, 短读敏感 seeding）同样救不动: self-map 只回 best hit。
+- 判定: 从零 OLC 在 83bp 归一化 reads 上几何不可行（Ra 等从头 OLC 转录组
+  组装器成熟度低的同一根因）。
+
+### 产出级 OLC 合并层（probe_olc2, CAP3/MIRA 收尾思路）
+
+classic 产出（32,748 条, 中位 717bp）self-overlap → dovetail 2,621 边 →
+1,071 个 cluster 贪心拼接（合并体中位 1,968bp, 吸收 2,366 条成员）:
+
+| | R_full | R70 | P | n |
+|---|---|---|---|---|
+| classic | 9.5% | 47.1% | 84.6% | 32,748 |
+| OLC 合并 | **9.1%** | **46.6%** | 85.0% | 31,453 |
+
+**净负 -0.4pp**: 共享末端外显子的 isoform 对被判 dovetail, 贪心链式拼接
+（cluster 最大 18 成员）制造嵌合, 吸收的成员原本各自 hit 不同参照。
+且根因与数据上限一致: classic 产出的截断末端在图死端（reads 没覆盖）,
+两条同死端截断体合并无米下锅——缺失段不在任何原料里。
+
+### 裁定
+
+- OLC 两形态证伪收档。多 K 合并（Euler-mix 变体）不另跑: 合并层本身
+  已净负, K!=25 产出更差（M1: K29 -4.8 vs 5.3）, 数据上限同样封顶;
+  Euler-mix 的 2,544→10,646 是检出数量非参照回收, 与本仓 R_full 目标不同轴。
+- 架构级突破的可行域确认只剩: genome-guided 模式 / 长读长辅助
+  （长读下 OLC/string graph 才是主场）——均超当前仓定位, 待用户裁定。
 | 2026-08-27 | dev1 | R=14.0% P=81.4% **F1=23.9%** | N50=1836 n=7835 | --CPU 8 --max_memory 8G |
