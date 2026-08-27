@@ -11,6 +11,7 @@ trinity-chrysalis = { path = "../trinity-chrysalis" }
 trinity-butterfly = { path = "../trinity-butterfly" }
 rayon = { workspace = true }
 mimalloc = { workspace = true }
+libc = "0.2"
 
 [dev-dependencies]
 flate2 = { workspace = true }

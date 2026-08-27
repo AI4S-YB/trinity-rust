@@ -107,6 +107,64 @@ fn absolutize(p: &Path) -> PathBuf {
     cwd.join(p)
 }
 
+/// outdir 绝对路径的 FNV-1a 64bit 哈希（默认 scratch 目录名用; 确定性,
+/// 同一 --output 重跑命中同一目录 → checkpoint 续跑语义不变）。
+fn fnv1a64(s: &str) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in s.as_bytes() {
+        h = (h ^ *b as u64).wrapping_mul(0x100000001b3);
+    }
+    h
+}
+
+/// 默认 scratch 目录: `${TMPDIR:-/tmp}/trinity-rust-<outdir 路径哈希>`。
+pub fn default_scratch_dir(outdir: &Path) -> PathBuf {
+    let tmp = std::env::var_os("TMPDIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/tmp"));
+    tmp.join(format!(
+        "trinity-rust-{:016x}",
+        fnv1a64(&outdir.to_string_lossy())
+    ))
+}
+
+/// statvfs 可用字节数（bavail × frsize）; 调用失败 → None。
+fn avail_bytes(dir: &Path) -> Option<u64> {
+    use std::os::unix::ffi::OsStrExt;
+    let c = std::ffi::CString::new(dir.as_os_str().as_bytes()).ok()?;
+    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+    // SAFETY: c 为合法 C 字符串, st 指向已分配的 statvfs 结构。
+    if unsafe { libc::statvfs(c.as_ptr(), &mut st) } == 0 {
+        Some(st.f_bavail as u64 * st.f_frsize.max(1) as u64)
+    } else {
+        None
+    }
+}
+
+/// 默认 scratch 的空间护栏: 需求 = 压缩输入总大小 × 6, 下限 4GB。
+/// TMPDIR 不可创建/不可写或空间不足 → Err（调用方打印警告并回落 outdir）。
+fn check_default_scratch(cand: &Path, need: u64) -> Result<(), String> {
+    if let Err(e) = fs::create_dir_all(cand) {
+        return Err(format!(
+            "默认 scratch 目录 {} 不可创建/不可写（{e}）",
+            cand.display()
+        ));
+    }
+    match avail_bytes(cand) {
+        None => Err(format!("无法 statvfs 默认 scratch {}", cand.display())),
+        Some(avail) if avail < need => {
+            let _ = fs::remove_dir(cand); // 刚建的空目录顺手清掉（非空则保留）
+            Err(format!(
+                "默认 scratch {} 可用空间 {:.1}GB < 需求 {:.1}GB",
+                cand.display(),
+                avail as f64 / (1 << 30) as f64,
+                need as f64 / (1 << 30) as f64
+            ))
+        }
+        Some(_) => Ok(()),
+    }
+}
+
 fn ext_of(t: SeqType) -> &'static str {
     match t {
         SeqType::Fq => "fq",
@@ -185,10 +243,25 @@ pub fn run_trinity(args: &TrinityArgs) -> Result<PathBuf, CommonError> {
     // butterfly）与 checkpoint（.ok）全部落 `<scratch>/<output 目录名>/`,
     // 最终 `<output>.Trinity.fasta` 与 gene_trans_map 拷回 --output 旁。
     // checkpoint 随产物走: scratch 易失, 换 scratch 目录 = 全部重算。
-    // 默认（无 --scratch）workdir == outdir, 行为不变。
+    // **默认化**: 不传 --scratch 时中间产物落 `${TMPDIR:-/tmp}/trinity-rust-
+    // <outdir 路径哈希>/`（哈希确定 → 同 --output 重跑续跑语义不变）;
+    // TMPDIR 不可写或空间不足（粗估: 压缩输入 ×6, 下限 4GB）时警告并回落
+    // 旧行为（中间产物直接放 --output）。显式 --scratch 不检查不回落。
     let workdir = match &args.scratch {
         Some(s) => absolutize(s).join(outdir.file_name().unwrap_or_default()),
-        None => outdir.clone(),
+        None => {
+            let cand = default_scratch_dir(&outdir);
+            let need = input_files_bytes(args).saturating_mul(6).max(4u64 << 30);
+            match check_default_scratch(&cand, need) {
+                Ok(()) => cand,
+                Err(msg) => {
+                    eprintln!(
+                        "WARNING: {msg}——中间产物回落到 --output 目录（可用 --scratch 显式指定跳过检查）"
+                    );
+                    outdir.clone()
+                }
+            }
+        }
     };
     // scratch 模式下也建 outdir: 保证最终产物（outdir 的同级文件）父链存在,
     // 与默认模式"outdir 必被创建"的行为对齐。
@@ -742,6 +815,35 @@ mod tests {
         // 软护栏无返回值; 极端入参不 panic 即可。
         warn_memory(1, u64::MAX / 2, "Chrysalis");
         warn_memory(u64::MAX, 0, "Butterfly");
+    }
+
+    #[test]
+    fn default_scratch_dir_deterministic_per_outdir() {
+        let a = default_scratch_dir(Path::new("/x/out"));
+        assert_eq!(a, default_scratch_dir(Path::new("/x/out")));
+        assert_ne!(a, default_scratch_dir(Path::new("/x/out2")));
+        assert!(a
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .starts_with("trinity-rust-"));
+    }
+
+    #[test]
+    fn default_scratch_check_falls_back_when_unwritable() {
+        // 不可创建/不可写 → Err（编排层回落 --output）
+        assert!(check_default_scratch(Path::new("/proc/nonexistent/tr-rs-x"), 1).is_err());
+        // 需求超过可用空间 → Err（刚建的空目录被清掉）
+        assert!(check_default_scratch(
+            &std::env::temp_dir().join(format!("tr_rs_huge_{}", std::process::id())),
+            u64::MAX / 2
+        )
+        .is_err());
+        // 可写且空间充足 → Ok
+        let d = std::env::temp_dir().join(format!("tr_rs_ok_{}", std::process::id()));
+        assert!(check_default_scratch(&d, 1).is_ok());
+        let _ = fs::remove_dir(&d);
     }
 }
 

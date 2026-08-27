@@ -706,3 +706,16 @@ minimap2 -x asm10 分别比对 alyr_cdna 与 dev1 参照。
   （消灭 per-component 小文件）/ fq 归一化直出 fa / mimalloc 全局分配器
   （小集 sys -85%, wall -25%）。并收入其基线的 clippy 修复（workspace 现已零警告）。
 - 终验: 构建 + 38 测试套件全绿, clippy/fmt 干净。
+
+### IO/系统开销优化（2026-08-27, 发布版真实数据驱动: sys 31% + 13GB 写放大）
+
+- 归一化便捷名硬链接（消 ~2.6GB 双写）; `--scratch <dir>` 中间产物整体出
+  NFS; Component_bins 全量打包（tmp/graphs/butterfly 三包, per-component
+  小文件 8.5 万 + 5.7 万 → 每 Cbin 4-6 个文件）; fq 归一化直出 fa（跳
+  norm.fq 物化, both.fa 逐字节对拍锁定）; mimalloc 全局分配器（sample_data
+  A/B: sys -85%, minor fault -96%, wall -25%）。
+- **--scratch 默认化**: 不传时中间产物落 `${TMPDIR:-/tmp}/trinity-rust-
+  <outdir 路径 FNV-1a 哈希>/`, 启动 statvfs 空间检查（需求 = 压缩输入 ×6,
+  下限 4GB）, 不足/不可写则警告并回落 --output 旧行为; checkpoint 随产物,
+  哈希确定 → 续跑语义不变。
+- xtask xcheck-chrysalis 已适配 pack 布局（原版工具链在位, 7/7 PASS）。
