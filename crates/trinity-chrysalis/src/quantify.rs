@@ -32,7 +32,7 @@ use std::collections::HashMap;
 
 use trinity_common::error::CommonError;
 
-use crate::dna_vector::{compute_entropy, read_fasta_short_names, revcomp, DnaSeq};
+use crate::dna_vector::{compute_entropy, read_fasta_bytes, revcomp, DnaSeq};
 
 /// QuantifyGraph.cc:28 `static float MIN_KMER_ENTROPY = 1.0;`（本地于本文件，
 /// 与 GraphFromFasta 的 1.3 不同）。
@@ -105,20 +105,40 @@ pub fn quantify_graph(
     reads_tmp: &str,
     p: &QgParams,
 ) -> Result<QuantifyOutput, CommonError> {
+    let graph = std::fs::read_to_string(graph_tmp)?;
+    let reads = std::fs::read(reads_tmp)?;
+    let (g, r) = quantify_graph_mem(&graph, &reads, p)?;
+    let graph_out = match graph_tmp.strip_suffix(".tmp") {
+        Some(stem) => format!("{stem}.graph.out"),
+        None => format!("{graph_tmp}.graph.out"),
+    };
+    let reads_out = reads_ext_filename(&graph_out);
+    std::fs::write(&graph_out, &g)?;
+    std::fs::write(&reads_out, &r)?;
+    Ok(QuantifyOutput {
+        graph_out,
+        reads_out,
+    })
+}
+
+/// 内存版 QuantifyGraph（IO 优化: 管线层直写打包文件, 跳过 .graph.out /
+/// .graph.reads 落盘）。输入输出与 [`quantify_graph`] 逐字节一致——
+/// `read_fasta_short_names(path)` ≡ `read_fasta_bytes(bytes, true)`。
+/// 返回 (graph_out 文本, reads 文本)。
+pub fn quantify_graph_mem(
+    graph_text: &str,
+    reads_data: &[u8],
+    p: &QgParams,
+) -> Result<(String, String), CommonError> {
     let kk = p.k + 1; // 内部 25
-    let mut seqs = read_fasta_short_names(reads_tmp)?;
+    let mut seqs = read_fasta_bytes(reads_data, true);
     if p.max_reads > 0 {
         seqs.truncate(p.max_reads as usize);
     }
 
     let kmers = add_kmers(&seqs, kk);
 
-    let graph = std::fs::read_to_string(graph_tmp)?;
-    let graph_out = match graph_tmp.strip_suffix(".tmp") {
-        Some(stem) => format!("{stem}.graph.out"),
-        None => format!("{graph_tmp}.graph.out"),
-    };
-    let reads_out = reads_ext_filename(&graph_out);
+    let graph = graph_text;
 
     let mut first: HashMap<i64, u8> = HashMap::new();
     for line in graph.lines() {
@@ -200,12 +220,7 @@ pub fn quantify_graph(
         sort_print(&mut r, &mut ids, &seqs);
     }
 
-    std::fs::write(&graph_out, &g)?;
-    std::fs::write(&reads_out, &r)?;
-    Ok(QuantifyOutput {
-        graph_out,
-        reads_out,
-    })
+    Ok((g, r))
 }
 
 /// `add_kmers`（:225-235）：全部 25-mer 入表后按 25 字节字典序排序。
