@@ -980,4 +980,23 @@ classic 产出（32,748 条, 中位 717bp）self-overlap → dovetail 2,621 边 
   Euler-mix 的 2,544→10,646 是检出数量非参照回收, 与本仓 R_full 目标不同轴。
 - 架构级突破的可行域确认只剩: genome-guided 模式 / 长读长辅助
   （长读下 OLC/string graph 才是主场）——均超当前仓定位, 待用户裁定。
+
+## Ra 思想混合层复测: bubble 语义仍净负, 混合 OLC 收口（2026-08-27, probe_olc3）
+
+用户指出 Ra（github.com/mariokostelac/ra, OLC 转录组组装器）的思想——
+全 overlap 布局 + trimming + bubble popping; 吸收其语义重做产出级混合层
+（修正 naive 版三宗罪: dovetail 误判 isoform / 贪心链式嵌合 / 合并吞 hit）:
+
+- string graph（全 overlap 建边 1,926, contained 561）→ bubble-aware
+  DFS 路径枚举（每 bubble ≤4 支路, 每 component ≤8 路径, isoform 支路
+  各成路径）→ contained 只在完全被路径覆盖时去冗余。
+- real: R_full 9.5%→**9.2%** (-0.3pp), R70 47.1%→46.7%, P 84.6%→84.2%,
+  n 32,748→31,951（去冗余 797 条, 但去掉的成员含可 hit 参照者,
+  路径序列未完全继承成员的 hit 能力）。
+
+**两次语义（naive -0.4pp / Ra bubble -0.3pp）稳定小负, 混合 OLC 层收口**。
+根因统一: classic 产出的信息已在转录本序列里, 重排不创造 reads 里没有的
+覆盖; R_full 瓶颈是数据上限, 不是序列组织方式。Ra 本身在文献中不及
+Trinity 系的表现与此一致。短读 de novo 场景的 OLC/混合探索彻底闭环
+（从零几何不可行 + 合并两连负）; 可行域仍是 genome-guided / 长读长。
 | 2026-08-27 | dev1 | R=14.0% P=81.4% **F1=23.9%** | N50=1836 n=7835 | --CPU 8 --max_memory 8G |
