@@ -93,7 +93,14 @@ fn side_revcomp(ss: &Option<String>, idx: usize) -> bool {
 
 /// 主入口。返回 `(trinity_target_fa 路径, read count)`。
 /// PE: both.fa（= left.fa ++ right.fa，先左后右）; SE: single.fa。
-pub fn prep_reads(args: &TrinityArgs, outdir: &Path) -> Result<(PathBuf, u64), CommonError> {
+///
+/// `pre_revcomped`: 输入已完成 SS revcomp（归一化 fa_direct 直通产物——
+/// diginorm 内部 prep 已按 SS 端 revcomp）→ 此处不再 revcomp, 防双重反转。
+pub fn prep_reads(
+    args: &TrinityArgs,
+    outdir: &Path,
+    pre_revcomped: bool,
+) -> Result<(PathBuf, u64), CommonError> {
     fs::create_dir_all(outdir)?;
 
     if !args.single.is_empty() {
@@ -102,7 +109,7 @@ pub fn prep_reads(args: &TrinityArgs, outdir: &Path) -> Result<(PathBuf, u64), C
             &args.single,
             args.seq_type,
             "single",
-            args.ss_lib_type.as_deref() == Some("R"),
+            args.ss_lib_type.as_deref() == Some("R") && !pre_revcomped,
             outdir,
         )?;
         let target = outdir.join("single.fa");
@@ -115,14 +122,14 @@ pub fn prep_reads(args: &TrinityArgs, outdir: &Path) -> Result<(PathBuf, u64), C
         &args.left,
         args.seq_type,
         "left",
-        side_revcomp(&args.ss_lib_type, 0),
+        side_revcomp(&args.ss_lib_type, 0) && !pre_revcomped,
         outdir,
     )?;
     prep_side_files(
         &args.right,
         args.seq_type,
         "right",
-        side_revcomp(&args.ss_lib_type, 1),
+        side_revcomp(&args.ss_lib_type, 1) && !pre_revcomped,
         outdir,
     )?;
 

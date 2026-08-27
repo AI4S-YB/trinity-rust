@@ -333,7 +333,7 @@ fn read(p: &Path) -> String {
 fn prep_fq_pe_no_ss() {
     let out = tmpdir("prep-pe");
     let args = pe_args(None);
-    let (target, n) = prep_reads(&args, &out).unwrap();
+    let (target, n) = prep_reads(&args, &out, false).unwrap();
     assert_eq!(target, out.join("both.fa"));
     let l = read(&out.join("left.fa"));
     let r = read(&out.join("right.fa"));
@@ -356,7 +356,7 @@ fn prep_fq_pe_no_ss() {
 fn prep_fq_pe_ss_rf_revcomp_left() {
     let out = tmpdir("prep-rf");
     let args = pe_args(Some("RF"));
-    let (_, _) = prep_reads(&args, &out).unwrap();
+    let (_, _) = prep_reads(&args, &out, false).unwrap();
     // RF → left 端 'R' → revcomp; right 端 'F' → 原样
     let l = read(&out.join("left.fa"));
     assert!(
@@ -375,7 +375,7 @@ fn prep_fq_pe_ss_rf_revcomp_left() {
 fn prep_fq_pe_ss_fr_no_revcomp() {
     let out = tmpdir("prep-fr");
     let args = pe_args(Some("FR"));
-    prep_reads(&args, &out).unwrap();
+    prep_reads(&args, &out, false).unwrap();
     let l = read(&out.join("left.fa"));
     assert!(l.contains("AATGATGAATACATCTAAGGGACGATTGTATTAATTTCAC"));
 }
@@ -396,7 +396,7 @@ fn prep_fq_multi_file_concat_order() {
         "out",
     ]);
     let args = parse_args(&v).unwrap();
-    let (target, n) = prep_reads(&args, &out).unwrap();
+    let (target, n) = prep_reads(&args, &out, false).unwrap();
     assert_eq!(target, out.join("single.fa"));
     let s = read(&target);
     assert!(s.starts_with(">pair1/1\n"));
@@ -423,7 +423,7 @@ fn prep_fa_se_ss_r_revcomp() {
         "out",
     ]);
     let args = parse_args(&v).unwrap();
-    let (target, n) = prep_reads(&args, &dir.join("out")).unwrap();
+    let (target, n) = prep_reads(&args, &dir.join("out"), false).unwrap();
     let s = read(&target);
     // revcomp_fasta.pl 镜像（tr 表）+ 60 列折行
     assert!(s.contains(">a\n"));
@@ -443,7 +443,7 @@ fn prep_checkpoint_skip() {
     fs::write(out.join("both.fa"), ">sentinel\nACGT\n>r\nTTTT\n").unwrap();
     fs::write(out.join("both.fa.ok"), b"").unwrap();
     let args = pe_args(None);
-    let (target, n) = prep_reads(&args, &out).unwrap();
+    let (target, n) = prep_reads(&args, &out, false).unwrap();
     assert_eq!(read(&target), ">sentinel\nACGT\n>r\nTTTT\n");
     assert_eq!(n, 2);
     // left fq 未被重新生成（哨兵保留）
@@ -456,7 +456,7 @@ fn prep_both_fa_size_mismatch_rebuilds() {
     // left/right 无 .ok → 重新生成; both.fa 预置为空且无 .ok → 重建为字节精确拼接
     fs::write(out.join("both.fa"), b"").unwrap();
     let args = pe_args(None);
-    let (target, _) = prep_reads(&args, &out).unwrap();
+    let (target, _) = prep_reads(&args, &out, false).unwrap();
     let l = read(&out.join("left.fa"));
     let r = read(&out.join("right.fa"));
     assert_eq!(read(&target), format!("{l}{r}"));

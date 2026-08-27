@@ -80,6 +80,8 @@ trinity-cli --seqType fq --left R1.fq.gz --right R2.fq.gz \
 
 **中间产物布局（性能优化，既定差异）**：`chrysalis/Component_bins/Cbin*/` 下不再逐组件写 `cN.graph.out` / `cN.graph.reads` / `cN.graph.allProbPaths.fasta` 小文件（2.8 万组件 ≈ 8.5 万个文件，NFS 上元数据往返极贵），改为每个 Cbin 两个打包文件 `graphs.pack`/`graphs.idx`（QuantifyGraph 产物）与 `butterfly.pack`/`butterfly.idx`（Butterfly 产物）；`.idx` 为定长 32B 记录（component id / kind / offset / len，小端）。归一化的 `left.norm.*` 便捷名是长名文件的硬链接（原版为符号链接），不再物理双写。
 
+**归一化产物格式（fq 输入时）**：fq 输入直接产出归一化 **fa**（`left.norm.fa` / `{名}.normalized_K…​.fa`），跳过 `norm.fq` 的全量物化与下游 fq→fa 往返——归一化内部本就要做 fq→fa，选中记录直接从内存 fa 抽取，与"写 fq 再转 fa"逐字节等价（有测试锁定）。原版会把归一化 fq 留给用户；本实现**默认不再保留 norm.fq**，需要时用 `--no_cleanup`（此时 fq 与 fa 都写）。
+
 **已知 tie-break 差异（既定差异带）**：
 
 - inchworm 并行种子平局序与原版 `--PARALLEL_IWORM` 一样非确定——同实现两次跑的转录本多重集也会漂移（实测覆盖率带 78~94%）；跨实现端到端双向覆盖率实测 57~71%（见 `docs/xcheck-trinity-report.md` 阈值校准说明）。差异主体是端部截断的同序列（100% 一致的包含关系），非移植错位。

@@ -135,6 +135,82 @@ fn paired_fq_end_to_end_hand_derived() {
     assert_eq!(conv_right, right_out);
 }
 
+/// fa_direct（IO 优化, trinity-cli 默认）: fq 输入直出归一化 fa, 不写 norm.fq;
+/// 产物 == 对默认路径 norm.fq 再做 fq_records_to_fa（下游 prep 的既有转换）——
+/// 即"直通"与"物化 fq 再转 fa"逐字节等价。keep_fq 时 fq 也保留。
+#[test]
+fn fa_direct_matches_materialize_then_convert() {
+    let dir_fq = tmpdir("pe_fq_ref");
+    let outs_fq = run(
+        &DigiNormParams::default(),
+        &ReadsInput::Paired(vec![fixture("pe.l.fq")], vec![fixture("pe.r.fq")]),
+        &dir_fq,
+    )
+    .unwrap();
+
+    let dir_fa = tmpdir("pe_fa_direct");
+    let outs_fa = run(
+        &DigiNormParams {
+            fa_direct: true,
+            ..Default::default()
+        },
+        &ReadsInput::Paired(vec![fixture("pe.l.fq")], vec![fixture("pe.r.fq")]),
+        &dir_fa,
+    )
+    .unwrap();
+
+    // 主产物是 fa; fq 不存在
+    assert_eq!(outs_fa.fmt, trinity_kmer::diginorm::SeqFormat::Fa);
+    let left_fa = std::fs::read(dir_fa.join("left.norm.fa")).unwrap();
+    let right_fa = std::fs::read(dir_fa.join("right.norm.fa")).unwrap();
+    assert!(!dir_fa.join("left.norm.fq").exists());
+    assert!(outs_fa
+        .left
+        .unwrap()
+        .file_name()
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .ends_with(".normalized_K25_maxC200_minC1_maxCV10000.fa"));
+
+    // 等价性: 直出 fa == prep_side(默认路径 norm.fq)
+    let ref_left = fq_records_to_fa(
+        &std::fs::read(outs_fq.left.unwrap()).unwrap(),
+        ReadType::R1,
+        false,
+    )
+    .unwrap();
+    let ref_right = fq_records_to_fa(
+        &std::fs::read(outs_fq.right.unwrap()).unwrap(),
+        ReadType::R2,
+        false,
+    )
+    .unwrap();
+    assert_eq!(left_fa, ref_left);
+    assert_eq!(right_fa, ref_right);
+
+    // keep_fq: fq 与 fa 都写, fq 与默认路径逐字节一致
+    let dir_keep = tmpdir("pe_fa_keep");
+    run(
+        &DigiNormParams {
+            fa_direct: true,
+            keep_fq: true,
+            ..Default::default()
+        },
+        &ReadsInput::Paired(vec![fixture("pe.l.fq")], vec![fixture("pe.r.fq")]),
+        &dir_keep,
+    )
+    .unwrap();
+    assert_eq!(
+        std::fs::read(dir_keep.join("left.norm.fq")).unwrap(),
+        std::fs::read(dir_fq.join("left.norm.fq")).unwrap()
+    );
+    assert_eq!(
+        std::fs::read(dir_keep.join("left.norm.fa")).unwrap(),
+        left_fa
+    );
+}
+
 #[test]
 fn single_fq_end_to_end() {
     let out_dir = tmpdir("se_fq");
