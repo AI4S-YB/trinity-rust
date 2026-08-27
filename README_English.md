@@ -26,10 +26,12 @@ Common options (same names as the upstream `Trinity` script):
 | `--min_kmer_cov` (alias `--min_kmer_count`) | k-mer count cutoff |
 | `--normalize_max_read_cov` / `--no_normalize_reads` | Normalization cap / skip normalization |
 | `--bfly_stack_mb` | Butterfly thread stack (extension of this port; defaults to match upstream JVM stack behavior) |
-| `--no_cleanup` | Keep intermediate files (both.fa / left.fa / right.fa etc.) |
-| `--scratch <dir>` | Write all intermediates (normalization dir / both.fa / mer_counts / inchworm / chrysalis / butterfly) to `<scratch>/<output dir name>/`; the final `<output>.Trinity.fasta` and gene_trans_map are still delivered next to `--output` |
+| `--no_cleanup` | Keep intermediate files (both.fa / left.fa / right.fa, normalized norm.fq, etc.; located in the scratch directory) |
+| `--scratch <dir>` | Write intermediates to `<scratch>/<output dir name>/` (no space check when given explicitly) |
 
-Resume: each stage writes an `.ok` checkpoint file; rerunning with the same `--output` skips completed stages automatically. **Note**: with `--scratch`, checkpoints live with the intermediates inside the scratch directory (scratch is treated as volatile storage) — changing the scratch directory means recomputing everything; always resume with the same `--scratch`.
+Resume: each stage writes an `.ok` checkpoint file; rerunning with the same `--output` skips completed stages automatically.
+
+**Default location of intermediates (this port's default, differs from upstream)**: without `--scratch`, all intermediates (normalization dir / both.fa / mer_counts / inchworm / chrysalis / butterfly) go to a local temp directory `${TMPDIR:-/tmp}/trinity-rust-<hash of the output path>/`, and the `--output` directory only holds the final products (`<output>.Trinity.fasta` + gene_trans_map are written next to it as usual). The path is derived deterministically from the output directory, so rerunning with the same `--output` hits the same scratch directory and resume semantics are unchanged. At startup a statvfs space check runs (rough estimate: 6× the total compressed input size, floor 4 GB); if TMPDIR is unwritable or too small, a warning is printed and the run falls back to the old behavior (intermediates inside `--output`). Scratch is treated as volatile: deleting it means recomputing everything; it is not auto-cleaned after a successful run and can be removed manually.
 
 A `--recursive` mode (partitioned re-assembly) is also available.
 

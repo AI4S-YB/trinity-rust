@@ -108,8 +108,10 @@ fn recursive_e2e_with_checkpoint_resume() {
     // 断言: Trinity.fasta 存在非空
     let text = fs::read_to_string(&final_fa).unwrap();
     assert!(!text.is_empty() && text.contains('>'), "Trinity.fasta 空");
+    // 默认 scratch: 中间产物与 checkpoint 在 default_scratch_dir 内
+    let work = trinity_cli::orchestrate::default_scratch_dir(&outdir);
     // 断言: 分区产物 ≥1
-    let minis: Vec<_> = fs::read_dir(outdir.join("read_partitions"))
+    let minis: Vec<_> = fs::read_dir(work.join("read_partitions"))
         .unwrap()
         .filter_map(|e| {
             let p = e.unwrap().path();
@@ -119,10 +121,11 @@ fn recursive_e2e_with_checkpoint_resume() {
         })
         .collect();
     assert!(!minis.is_empty(), "read_partitions/*.mini.fa 应 ≥1");
-    // 断言: 断点标记存在
-    assert!(outdir.join(".recursive.ok").exists(), ".recursive.ok 缺失");
-    // classic 的 butterfly 路径不应触发
-    assert!(!outdir.join(".butterfly.ok").exists());
+    // 断言: 断点标记存在（scratch 内）
+    assert!(work.join(".recursive.ok").exists(), ".recursive.ok 缺失");
+    // classic 的 butterfly 路径不应触发; output 目录无中间目录
+    assert!(!work.join(".butterfly.ok").exists());
+    assert!(!outdir.join("read_partitions").exists());
     // gene_trans_map 与 classic 路径一致
     let map = final_fa.with_file_name(format!(
         "{}.gene_trans_map",

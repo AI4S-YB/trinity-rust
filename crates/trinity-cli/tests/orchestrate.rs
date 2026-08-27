@@ -118,7 +118,9 @@ fn end_to_end_small() {
         assert!(trans.strip_prefix(gene).unwrap().starts_with("_i"));
     }
 
-    // .ok / finished 齐全（no_normalize → 无 normalization.ok）
+    // .ok / finished 齐全（no_normalize → 无 normalization.ok）——默认 scratch 下
+    // 中间产物与 checkpoint 都在 ${TMPDIR:-/tmp}/trinity-rust-<hash>/ 内
+    let work = trinity_cli::orchestrate::default_scratch_dir(&outdir);
     for ok in [
         ".jellyfish_count.25.mincov1.asm.ok",
         ".iworm.25.asm.ok",
@@ -128,18 +130,21 @@ fn end_to_end_small() {
         "inchworm.DS.fa.finished",
         "single.fa.ok",
     ] {
-        assert!(outdir.join(ok).exists(), "missing checkpoint: {ok}");
+        assert!(work.join(ok).exists(), "missing checkpoint: {ok}");
     }
-    assert!(!outdir.join("insilico_read_normalization").exists());
+    assert!(!work.join("insilico_read_normalization").exists());
     // 单端 → single.fa（非 both.fa）
-    assert!(outdir.join("single.fa").exists());
+    assert!(work.join("single.fa").exists());
     // 组件产物走打包布局: graphs/butterfly 包在, per-component 小文件不在
-    let cbin = outdir.join("chrysalis/Component_bins/Cbin0");
+    let cbin = work.join("chrysalis/Component_bins/Cbin0");
     assert!(cbin.join("graphs.pack").exists());
     assert!(cbin.join("graphs.idx").exists());
     assert!(cbin.join("butterfly.pack").exists());
     assert!(!cbin.join("c0.graph.out").exists());
     assert!(!cbin.join("c0.graph.allProbPaths.fasta").exists());
+    // 默认场景: output 目录不再有中间目录（全部在 scratch）
+    assert!(!outdir.join("chrysalis").exists());
+    assert!(!outdir.join("insilico_read_normalization").exists());
 }
 
 #[test]
@@ -152,8 +157,10 @@ fn resume_skips_completed_stage() {
     // 删中间产物（保留 .ok）→ 重跑: 计数阶段被跳过（mer_counts 不重建）,
     // inchworm 之后各阶段亦全部跳过, 最终仍成功产出。
     // （M7 后无 dump 文本阶段, 计数表经 kmer_load 直桥进 inchworm。）
-    let counts_bin = outdir.join("mer_counts.25.asm.rs.bin");
-    let iworm_fa = outdir.join("inchworm.DS.fa");
+    // 默认 scratch: 中间产物在 default_scratch_dir 内。
+    let work = trinity_cli::orchestrate::default_scratch_dir(&outdir);
+    let counts_bin = work.join("mer_counts.25.asm.rs.bin");
+    let iworm_fa = work.join("inchworm.DS.fa");
     fs::remove_file(&counts_bin).unwrap();
     let iworm_mtime = fs::metadata(&iworm_fa).unwrap().modified().unwrap();
 
@@ -251,6 +258,7 @@ fn args_aliases_kmer_size_and_min_kmer_cov() {
 }
 
 /// 默认收尾清理: single.fa / jellyfish 产物删除, .ok 断点与最终产物保留。
+/// （默认 scratch: 中间物在 scratch 目录, output 目录始终无中间物。）
 #[test]
 fn cleanup_removes_intermediates_by_default() {
     let dir = tmpdir("cleanup");
@@ -258,12 +266,15 @@ fn cleanup_removes_intermediates_by_default() {
     let outdir = dir.join("trinity_out");
     let final_fa = run_trinity(&synth_args(&fa, &outdir)).unwrap();
     assert!(final_fa.exists());
+    let work = trinity_cli::orchestrate::default_scratch_dir(&outdir);
     for gone in ["single.fa", "mer_counts.25.asm.rs.bin"] {
-        assert!(!outdir.join(gone).exists(), "{gone} should be cleaned up");
+        assert!(!work.join(gone).exists(), "{gone} should be cleaned up");
     }
     // .ok 断点保留 → resume 语义可用
-    assert!(outdir.join("single.fa.ok").exists());
-    assert!(outdir.join(".jellyfish_count.25.mincov1.asm.ok").exists());
+    assert!(work.join("single.fa.ok").exists());
+    assert!(work.join(".jellyfish_count.25.mincov1.asm.ok").exists());
+    // output 目录无中间物
+    assert!(!outdir.join("single.fa").exists());
 }
 
 /// resume 在清理后仍可用（产物缺失 + .ok 在 → prep 重建, 各阶段跳过）。
