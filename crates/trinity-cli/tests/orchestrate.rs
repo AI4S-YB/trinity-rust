@@ -121,7 +121,6 @@ fn end_to_end_small() {
     // .ok / finished 齐全（no_normalize → 无 normalization.ok）
     for ok in [
         ".jellyfish_count.25.mincov1.asm.ok",
-        ".jellyfish_dump.25.mincov1.asm.ok",
         ".iworm.25.asm.ok",
         "iworm_renamed.25.asm.ok",
         ".quantify_graph.ok",
@@ -143,16 +142,14 @@ fn resume_skips_completed_stage() {
     let outdir = dir.join("trinity_out");
     run_trinity(&synth_args_opt(&fa, &outdir, true)).unwrap();
 
-    // 删中间产物（保留 .ok）→ 重跑: dump 阶段被跳过（文件不重建）,
+    // 删中间产物（保留 .ok）→ 重跑: 计数阶段被跳过（mer_counts 不重建）,
     // inchworm 之后各阶段亦全部跳过, 最终仍成功产出。
-    let kmer_fa = outdir.join("jellyfish.kmers.25.asm.fa");
+    // （M7 后无 dump 文本阶段, 计数表经 kmer_load 直桥进 inchworm。）
     let iworm_fa = outdir.join("inchworm.DS.fa");
-    fs::remove_file(&kmer_fa).unwrap();
     let iworm_mtime = fs::metadata(&iworm_fa).unwrap().modified().unwrap();
 
     let final_fa = run_trinity(&synth_args_opt(&fa, &outdir, true)).unwrap();
     assert!(final_fa.exists());
-    assert!(!kmer_fa.exists(), "dump stage should be skipped on resume");
     assert_eq!(
         fs::metadata(&iworm_fa).unwrap().modified().unwrap(),
         iworm_mtime,
@@ -246,16 +243,12 @@ fn cleanup_removes_intermediates_by_default() {
     let outdir = dir.join("trinity_out");
     let final_fa = run_trinity(&synth_args(&fa, &outdir)).unwrap();
     assert!(final_fa.exists());
-    for gone in [
-        "single.fa",
-        "jellyfish.kmers.25.asm.fa",
-        "mer_counts.25.asm.rs.bin",
-    ] {
+    for gone in ["single.fa", "mer_counts.25.asm.rs.bin"] {
         assert!(!outdir.join(gone).exists(), "{gone} should be cleaned up");
     }
     // .ok 断点保留 → resume 语义可用
     assert!(outdir.join("single.fa.ok").exists());
-    assert!(outdir.join(".jellyfish_dump.25.mincov1.asm.ok").exists());
+    assert!(outdir.join(".jellyfish_count.25.mincov1.asm.ok").exists());
 }
 
 /// resume 在清理后仍可用（产物缺失 + .ok 在 → prep 重建, 各阶段跳过）。

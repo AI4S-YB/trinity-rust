@@ -360,6 +360,34 @@ pub fn run(argv: &[String]) -> i32 {
     use std::io::Write;
     f.write_all(row.as_bytes()).unwrap();
 
+    // M7 探针: top-5 耗时段（两份 .stage_timings 合并）
+    {
+        let mut stages: Vec<(String, f64)> = Vec::new();
+        for p in [
+            dir.join("out/.stage_timings"),
+            dir.join("out/chrysalis/.stage_timings"),
+        ] {
+            if let Ok(text) = std::fs::read_to_string(&p) {
+                for line in text.lines() {
+                    let f: Vec<&str> = line.split('\t').collect();
+                    if f.len() == 2 {
+                        if let Ok(s) = f[1].parse::<f64>() {
+                            stages.push((f[0].to_string(), s));
+                        }
+                    }
+                }
+            }
+        }
+        stages.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        if !stages.is_empty() {
+            let top: Vec<String> = stages
+                .iter()
+                .take(5)
+                .map(|(n, s)| format!("{n} {s:.0}s"))
+                .collect();
+            println!("  Top stages: {}", top.join(" | "));
+        }
+    }
     0
 }
 

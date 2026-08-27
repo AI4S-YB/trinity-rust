@@ -21,6 +21,36 @@ pub fn for_each_kmer(seq: &[u8], k: usize, ds: bool, mut f: impl FnMut(KmerId)) 
     };
     let mut kmer: KmerId = 0;
     let mut valid: usize = 0;
+    // M7-norm: 滚动 revcomp（revcomp(km<<2|v) == (revcomp(km)>>2) | (v^3)<<(2k-2)），
+    // 免去每 kmer 的 25 迭代 revcomp_val 循环; 与 get_ds_kmer_val(kmer,k) 数值恒等。
+    // k > 32 时移位会溢出（MAX_KMER_LENGTH 之外本就无定义），回落旧路径防御。
+    if ds && k <= 32 {
+        let rev_shift: u32 = (2 * k - 2) as u32;
+        let mut rev: KmerId = 0;
+        for &c in seq {
+            let v = match c {
+                b'G' | b'g' => 0u64,
+                b'A' | b'a' => 1,
+                b'T' | b't' => 2,
+                b'C' | b'c' => 3,
+                _ => {
+                    valid = 0;
+                    kmer = 0;
+                    rev = 0;
+                    continue;
+                }
+            };
+            kmer = ((kmer << 2) | v) & mask;
+            rev = ((rev >> 2) | ((v ^ 3) << rev_shift)) & mask;
+            if valid < k {
+                valid += 1;
+            }
+            if valid == k {
+                f(if rev > kmer { rev } else { kmer });
+            }
+        }
+        return;
+    }
     for &c in seq {
         let v = match c {
             b'G' | b'g' => 0u64,
@@ -119,6 +149,7 @@ fn merge_counts(mut a: CountMap, b: CountMap) -> CountMap {
     a
 }
 
+/// mer_counts 二进制记录布局: `u64 key, u32 count`（小端）, 头部魔数
 /// Trinity:2598-2604 hash 大小护栏（信息性容量提示用，语义与原版一致）
 pub fn estimate_hash_size(max_memory: u64, read_file_size: u64) -> u64 {
     let mut h = if max_memory > read_file_size {
@@ -241,6 +272,35 @@ mod tests {
         assert_eq!(m[&key("CGTT")], 1);
         assert_eq!(m[&key("GTTT")], 1);
         assert_eq!(m.len(), 6);
+    }
+
+    /// M7-norm oracle: 滚动 revcomp 路径产出的 DS 键与逐 kmer get_ds_kmer_val 恒等
+    /// （含 N 断窗、小写、滑窗恢复、k=1/k=2 边界）。
+    #[test]
+    fn rolling_revcomp_matches_get_ds_kmer_val() {
+        let seqs = [
+            "ACGTACGTACGTACGTACGTACGTACG",
+            "acgtNNNNacgtacgtacgtacgtacg",
+            "GGGGG",
+            "TTTTGGGGCCCCAAAATTTTGGGGCACGTN",
+        ];
+        for &seq in &seqs {
+            for k in [1usize, 2, 4, 25] {
+                let mut rolling: Vec<KmerId> = Vec::new();
+                for_each_kmer(seq.as_bytes(), k, true, |key| rolling.push(key));
+                // naive: 逐窗口 kmer_to_intval + get_ds_kmer_val
+                let b = seq.as_bytes();
+                let mut naive: Vec<KmerId> = Vec::new();
+                let mut i = 0;
+                while i + k <= b.len() {
+                    if let Ok(v) = trinity_common::kmer::kmer_to_intval(&b[i..i + k]) {
+                        naive.push(get_ds_kmer_val(v, k));
+                    }
+                    i += 1;
+                }
+                assert_eq!(rolling, naive, "seq={seq} k={k}");
+            }
+        }
     }
 
     #[test]

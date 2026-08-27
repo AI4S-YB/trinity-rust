@@ -106,6 +106,25 @@ pub fn populate_from_kmers(
     Ok((kcounter, parsed))
 }
 
+/// 计数表直桥（M7）: 跳过 dump 文本格式化/解析, 直接从 KmerCountTable 构建。
+/// 与 populate_from_kmers(dump 文本, k, ds) 全量等价（表键 = KmerId,
+/// add_kmer 的 DS canonical 与计数表 DS 代表 max(kmer,revcomp) 同一折叠,
+/// 幂等）; min_kmer_count 过滤由调用方 prune_some_kmers 承担
+/// （与原 dump -L 语义等价）。返回 (计数器, 条目数)。
+pub fn populate_from_table(
+    table: &trinity_kmer::counter::CountMap,
+    kmer_length: usize,
+    ds: bool,
+) -> Result<(KmerCounter, usize), CommonError> {
+    let mut kcounter = KmerCounter::new(kmer_length, ds);
+    // 与 populate_from_kmers 的插入路径一致: get_kmer_intval(编码) → add_kmer
+    // （DS 折叠在 add_kmer）。表键已是同编码的 KmerId，直接走同一 add_kmer。
+    for (&key, &count) in table.iter() {
+        kcounter.add_kmer(key, count);
+    }
+    Ok((kcounter, table.len()))
+}
+
 /// populate_Kmers_from_fasta（IRKE.cpp:157-280，非 reassemble 路径）—— `--reads` 模式。
 /// 返回 (counter, parsed)；parsed 含空序列与短记录（hasNext 循环无终止哨兵）。
 /// reassembleIworm 分支（IRKE.cpp:211-249）与 PRUNE_SINGLETON_READ_INTERVAL
@@ -1172,6 +1191,38 @@ mod tests {
         for &(input, expected) in cases {
             assert_eq!(c_atoi(input), expected, "c_atoi({:?})", input);
         }
+    }
+
+    // ---- populate_from_table（M7 直桥） ------------------------------------
+
+    /// 表直桥 与 dump文本往返 构建的计数器等价。
+    #[test]
+    fn populate_from_table_matches_text_roundtrip() {
+        // 3 条记录（含小写与 N 窗口滑动），k=7, DS
+        let fasta = b">r1\nACGTTGCAAGGCTTACGATTCAAGGCTA\n\
+                     >r2\ngcttacggatcctaaggttccaagt\n\
+                     >r3\nTTGCAAGNCTTACGATTCAAGGCTAACGT\n";
+        let counts = trinity_kmer::counter::KmerCountTable::count_fasta_data(fasta, 7, true);
+        assert!(!counts.is_empty());
+        // 文本往返: dump(min_cov=1 全量) → populate_from_kmers
+        let mut buf = Vec::new();
+        trinity_kmer::dump::write_dump(&mut buf, &counts, 7, 1, true).unwrap();
+        let (via_text, parsed_text) = populate_from_kmers(&buf, 7, true).unwrap();
+        let (via_table, parsed_table) = populate_from_table(&counts, 7, true).unwrap();
+        // 条目数: 文本每个表条目恰一行（count>=1 全保留）
+        assert_eq!(parsed_text, counts.len());
+        assert_eq!(parsed_table, counts.len());
+        assert_eq!(via_text.size(), via_table.size());
+        // 全量多重集等价（含 0 计键的键域与计数和）
+        let mut text_entries: Vec<(KmerId, u32)> = via_text.iter_all().collect();
+        let mut table_entries: Vec<(KmerId, u32)> = via_table.iter_all().collect();
+        text_entries.sort_unstable();
+        table_entries.sort_unstable();
+        assert_eq!(text_entries, table_entries);
+        assert_eq!(
+            text_entries.iter().map(|&(_, c)| c).sum::<u32>(),
+            table_entries.iter().map(|&(_, c)| c).sum::<u32>()
+        );
     }
 
     // ---- populate_from_kmers ----------------------------------------------

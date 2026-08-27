@@ -154,6 +154,11 @@ pub fn fq_records_to_fa(
     read_type: ReadType,
     revcomp: bool,
 ) -> Result<Vec<u8>, CommonError> {
+    // M7-norm: 良构输入走并行快路径; 任何畸形（含 UTF-8/校验错）回落串行路径
+    // 产出逐字一致的错误。快路径与串行路径输出逐字节一致的 oracle 测试锁定。
+    if let Some(out) = fq_records_to_fa_par(input, read_type, revcomp) {
+        return Ok(out);
+    }
     let mut reader = FastqReader::new(BufReader::new(input));
     let mut out = Vec::new();
     let mut n_seqs = 0usize;
@@ -179,6 +184,96 @@ pub fn fq_records_to_fa(
         ));
     }
     Ok(out)
+}
+
+/// 并行快路径: 字节级定位各记录的 (header 行, seq 行) 内容区间 → rayon 逐记录
+/// 名字规范化 + fa 渲染 → 按序拼接。返回 None = 输入非良构（调用方回落串行）。
+/// 良构判定逐条镜像 FastqReader: 记录边界跳空行; 记录内空行/非 '@'/非 '+'/
+/// seq-qual 长度不符/非 UTF-8 → None; 名字规范化 Err 也回落（错误逐字）。
+fn fq_records_to_fa_par(input: &[u8], read_type: ReadType, revcomp: bool) -> Option<Vec<u8>> {
+    use rayon::prelude::*;
+    let mut spans: Vec<(std::ops::Range<usize>, std::ops::Range<usize>)> = Vec::new();
+    let mut pos = 0usize;
+    while pos < input.len() {
+        // 记录边界: 跳过空行（trim_end \n\r 后为空——next_nonempty_line(at_record_start) 语义）
+        let (hs, he, hn) = next_fq_line(input, pos);
+        if input[hs..he].is_empty() {
+            pos = hn;
+            continue;
+        }
+        if input[hs] != b'@' {
+            return None;
+        }
+        let (ss, se, sn) = next_fq_line(input, hn);
+        if input[ss..se].is_empty() {
+            return None;
+        }
+        let (ps, pe, pn) = next_fq_line(input, sn);
+        if input[ps..pe].is_empty() || input[ps] != b'+' {
+            return None;
+        }
+        let (qs, qe, qn) = next_fq_line(input, pn);
+        if input[qs..qe].is_empty() || qe - qs != se - ss {
+            return None;
+        }
+        // UTF-8（read_line 语义: 非 UTF-8 → Err → 回落）
+        let header = std::str::from_utf8(&input[hs + 1..he]).ok()?;
+        std::str::from_utf8(&input[ss..se]).ok()?;
+        std::str::from_utf8(&input[ps..pe]).ok()?;
+        std::str::from_utf8(&input[qs..qe]).ok()?;
+        let (name, comment) = split_name_comment(header);
+        // 名字规范化 Err → 回落串行（错误逐字）
+        if update_read_name_for_trinity(name, comment, read_type).is_err() {
+            return None;
+        }
+        spans.push((hs + 1..he, ss..se));
+        pos = qn;
+    }
+    if spans.is_empty() {
+        return None; // "no records" 错误走串行路径逐字产出
+    }
+    let chunks: Vec<Vec<u8>> = spans
+        .par_iter()
+        .map(|(hr, sr)| {
+            let header = std::str::from_utf8(&input[hr.clone()]).expect("上方已校验 UTF-8");
+            let seq = &input[sr.clone()];
+            let (name, comment) = split_name_comment(header);
+            let new_name = update_read_name_for_trinity(name, comment, read_type)
+                .expect("上方已校验规范化成功");
+            let mut out = Vec::with_capacity(new_name.len() + seq.len() + 3);
+            out.push(b'>');
+            out.extend_from_slice(new_name.as_bytes());
+            out.push(b'\n');
+            if revcomp {
+                out.extend_from_slice(&revcomp_seq(seq));
+            } else {
+                out.extend_from_slice(seq);
+            }
+            out.push(b'\n');
+            out
+        })
+        .collect();
+    let total: usize = chunks.iter().map(|c| c.len()).sum();
+    let mut out = Vec::with_capacity(total);
+    for c in chunks {
+        out.extend_from_slice(&c);
+    }
+    Some(out)
+}
+
+/// fq 行切片: (内容起始, 内容尾不含 \n\r, 下一行起始)。pos >= len → 内容为空的末行。
+fn next_fq_line(data: &[u8], pos: usize) -> (usize, usize, usize) {
+    let mut end = pos;
+    while end < data.len() && data[end] != b'\n' {
+        end += 1;
+    }
+    let content_end = if end > pos && data[end - 1] == b'\r' {
+        end - 1
+    } else {
+        end
+    };
+    let next = (end + 1).min(data.len());
+    (pos, content_end, next)
 }
 
 /// 抽取阶段的 core 名（make_normalized_reads_file 的 fq 路径）:
@@ -446,6 +541,73 @@ mod tests {
         assert!(fq_records_to_fa(b"rd1\nACGT\n+\nIIII\n", ReadType::R1, false).is_err());
         // seq/qual 长度不一致
         assert!(fq_records_to_fa(b"@rd1\nACGTA\n+\nIIII\n", ReadType::R1, false).is_err());
+    }
+
+    /// M7-norm oracle: 并行快路径与串行 FastqReader 路径逐字节一致
+    /// （含边界空行、CRLF、无尾换行、大写小写、四种 header 形态混排）。
+    #[test]
+    fn fq_to_fa_parallel_matches_serial_oracle() {
+        let inputs: Vec<Vec<u8>> = vec![
+            p5_clean(),
+            b"@a\nACGT\n+\nIIII\n".to_vec(),
+            b"\n\n@a 1:N:0:2\nAC\r\n+\nII\r\n\n@b/2\nTT\n+\nII".to_vec(), // 边界空行+CRLF+无尾换行
+            b"@x_forward/1\nacgtN\n+\nIIIII\n@y 2:N:0:2\ntttt\n+\nIIII\n".to_vec(),
+        ];
+        for inp in &inputs {
+            for rt in [ReadType::R1, ReadType::R2] {
+                for rc in [false, true] {
+                    let par = fq_records_to_fa(inp, rt, rc);
+                    let ser = fq_records_to_fa_serial_ref(inp, rt, rc);
+                    match (&par, &ser) {
+                        (Ok(p), Ok(s)) => assert_eq!(
+                            p,
+                            s,
+                            "inp={:?} rt={rt:?} rc={rc}",
+                            String::from_utf8_lossy(inp)
+                        ),
+                        (Err(e1), Err(e2)) => assert_eq!(e1.to_string(), e2.to_string()),
+                        _ => panic!("结果分歧: par={par:?} ser={ser:?}"),
+                    }
+                }
+            }
+        }
+        // 良构路径确实命中快路径（None 只在畸形时）
+        assert!(fq_records_to_fa_par(&p5_clean(), ReadType::R1, false).is_some());
+        assert!(fq_records_to_fa_par(b"", ReadType::R1, false).is_none());
+        assert!(fq_records_to_fa_par(b"r1\nAC\n+\nII\n", ReadType::R1, false).is_none());
+        assert!(fq_records_to_fa_par(b"@r\nACGTA\n+\nIIII\n", ReadType::R1, false).is_none());
+        assert!(fq_records_to_fa_par(b"@r 2:N:0:2\nAC\n+\nII\n", ReadType::R1, false).is_none());
+    }
+
+    /// 串行参考实现（= 原 fq_records_to_fa 主体，供 oracle 对拍）。
+    fn fq_records_to_fa_serial_ref(
+        input: &[u8],
+        read_type: ReadType,
+        revcomp: bool,
+    ) -> Result<Vec<u8>, CommonError> {
+        let mut reader = FastqReader::new(BufReader::new(input));
+        let mut out = Vec::new();
+        let mut n_seqs = 0usize;
+        while let Some(rec) = reader.next_record()? {
+            n_seqs += 1;
+            let (name, comment) = split_name_comment(&rec.header);
+            let new_name = update_read_name_for_trinity(name, comment, read_type)?;
+            out.push(b'>');
+            out.extend_from_slice(new_name.as_bytes());
+            out.push(b'\n');
+            if revcomp {
+                out.extend_from_slice(&revcomp_seq(rec.sequence.as_bytes()));
+            } else {
+                out.extend_from_slice(rec.sequence.as_bytes());
+            }
+            out.push(b'\n');
+        }
+        if n_seqs == 0 {
+            return Err(CommonError::FastqFormat(
+                "Error, no records were correctly parsed from input".to_string(),
+            ));
+        }
+        Ok(out)
     }
 
     /// kseq 的 name/comment 分隔是任意行内空白（空格或制表符）。

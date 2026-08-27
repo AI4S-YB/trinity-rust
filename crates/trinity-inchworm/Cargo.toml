@@ -5,6 +5,7 @@ edition.workspace = true
 
 [dependencies]
 trinity-common = { path = "../trinity-common" }
+trinity-kmer = { path = "../trinity-kmer" }
 rustc-hash = { workspace = true }
 dashmap = { workspace = true }
 rayon = { workspace = true }

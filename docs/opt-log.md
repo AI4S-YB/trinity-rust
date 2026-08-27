@@ -392,3 +392,53 @@ dev1 上"reads 里存在但组装丢失的末端" ≈ 极少, 蛋白引导延长
   **全部在真实数据上复现**; M5 是唯一在两套数据上都净正的机制
 - 真实数据 R_full 绝对值低（3.5-3.9% vs dev 8.3-8.6%）是度量口径现象
   （单样本 vs 全注释 48,359 条参考）, 不影响配置间排序
+| 2026-08-25 | m7-probe-smoke | R=8.3% P=84.2% **F1=15.0%** | N50=1728 n=7882 | --path-engine pogflow --max_memory 16G --CPU 8 |
+| 2026-08-25 | m7-nodump-dev1 | R=8.3% P=84.4% **F1=15.1%** | N50=1730 n=7866 | --path-engine pogflow --max_memory 16G --CPU 8 |
+| 2026-08-26 | m7-checkpoint | R=3.5% P=82.3% **F1=6.7%** | N50=1568 n=32844 | --max_memory 16G --CPU 8 |
+
+### M7 中期 checkpoint（2026-08-25, m7-checkpoint, 消 dump 后冷跑）
+
+| 配置 | wall | Top stages |
+|---|---|---|
+| real-classic 基线（mtime 口径, 漏 normalize） | ~44+11 min | — |
+| m7-checkpoint（T1 探针 + T2 消 dump） | **46 min** | rtt 1246s · normalize 672s · partition 188s · butterfly 175s |
+
+- 指标: R=3.5 F1=6.7 持平; P 82.3（基线 82.8, 并行抖动边缘, 终验收复跑核对）
+- **原"44 分钟"基线漏算 normalize 11 分钟**; dump 消灭实际省 ~8 min（54→46）
+- RTT（45%）+ normalize（24%）合计 70% 且均已 8 线程并行——固定线程下只剩算法级路线
+- **Gate 回谈结论（用户 2026-08-25）**: 固定 --CPU 8, 能压多少算多少（无硬数字）;
+  优先级: RTT 查询结构 > normalize 内部 > partition 批量写
+| 2026-08-26 | m7-rtt-dev1 | R=8.3% P=84.0% **F1=15.0%** | N50=1728 n=7891 | --path-engine pogflow --max_memory 16G --CPU 8 |
+| 2026-08-26 | m7-norm-dev1 | R=8.3% P=84.3% **F1=15.1%** | N50=1730 n=7875 | --path-engine pogflow --max_memory 16G --CPU 8 |
+| 2026-08-26 | m7-part-dev1 | R=8.2% P=84.5% **F1=15.0%** | N50=1728 n=7869 | --path-engine pogflow --max_memory 16G --CPU 8 |
+| 2026-08-26 | m7-final-classic | R=3.5% P=82.3% **F1=6.7%** | N50=1565 n=32833 | --max_memory 16G --CPU 8 |
+| 2026-08-26 | m7-final-pogflow | R=3.5% P=84.2% **F1=6.7%** | N50=1524 n=33041 | --path-engine pogflow --max_memory 16G --CPU 8 |
+| 2026-08-26 | evalv2-dev1-m5 | R=8.6% P=83.6% **F1=15.7%** | N50=1737 n=8190 | --path-engine pogflow --model-guided --max_memory 16G --CPU 8 |
+| 2026-08-26 | evalv2-dev1-m5 | R=8.6% P=83.6% **F1=15.7%** | N50=1737 n=8190 | --path-engine pogflow --model-guided --max_memory 16G --CPU 8 |
+| 2026-08-26 | evalv2-dev1-plain | R=8.6% P=83.6% **F1=15.7%** | N50=1737 n=8190 | --path-engine pogflow --model-guided --max_memory 16G --CPU 8 |
+| 2026-08-26 | evalv2-dev1-m5 | R=8.6% P=83.6% **F1=15.7%** | N50=1737 n=8190 | --path-engine pogflow --model-guided --max_memory 16G --CPU 8 |
+
+### M7 终验收（2026-08-26, 固定 --CPU 8, 能压多少算多少）
+
+| 配置 | wall | 指标 vs 基线 | Top stages |
+|---|---|---|---|
+| real-classic 基线 | ~54 min（44 mtime 口径 + normalize 11, 漏算修正后） | R=3.5 P=82.8 F1=6.7 | — |
+| m7-checkpoint（消 dump 后） | 46 min | R=3.5 P=82.3 F1=6.7 | rtt 1246s · normalize 672s |
+| **m7-final-classic** | **~17 min** | R=3.5 P=82.3 F1=6.7 ✓ | chrysalis_total 360s · normalize 189s · butterfly 168s |
+| **m7-final-pogflow** | **~17 min**（两配置合计 34 min） | R=3.5 P=84.2 F1=6.7 **逐位同基线** | chrysalis_total 427s · butterfly 198s · normalize 183s |
+
+- **总提速: 54→17 min（-69%）/ 46→17（-63%, checkpoint 口径）**——原始 ≤15min 目标
+  差 2 分钟, 在"能压多少算多少"裁定下收官
+- 四项优化全部带 oracle/字节级等价验证: 消 dump（二进制直桥）、RTT 16.3×
+  （打包哈希索引+滑窗熵）、normalize 3.6×（并行覆盖统计+滚动 revcomp;
+  dev1 口径 2.2×）、partition 5.5×（BufWriter, 原每行裸写 ~45M 系统调用）
+- workspace 598 测试全绿; 全程零 git 提交（冻结）
+- 剩余热点: butterfly（168-198s, 组件池已并行）、inchworm（146-151s,
+  并行固有非确定段）——进一步提速需算法级, 未立项
+| 2026-08-26 | evalv2-dev1-m5-sa | R=8.6% P=83.6% **F1=15.7%** | N50=1737 n=8190 | --path-engine pogflow --model-guided --max_memory 16G --CPU 8 |
+| 2026-08-26 | v2-real-classic | R=3.5% P=82.3% **F1=6.7%** | N50=1565 n=32833 | --max_memory 16G --CPU 8 |
+| 2026-08-26 | v2-real-pogflow | R=3.5% P=84.2% **F1=6.7%** | N50=1524 n=33041 | --path-engine pogflow --max_memory 16G --CPU 8 |
+| 2026-08-26 | v2-real-classic | R=3.5% P=82.3% **F1=6.7%** | N50=1565 n=32833 | --max_memory 16G --CPU 8 |
+| 2026-08-26 | v2-real-m6a | R=3.5% P=83.6% **F1=6.8%** | N50=1546 n=33017 | --path-engine pogflow --protein-guided --protein-db /storage/home/senior007/test/athal/bench/real/alyr_pep.fa --max_memory 16G --CPU 8 |
+| 2026-08-26 | evalv2-dev1-m5-sa | R=8.6% P=83.6% **F1=15.7%** | N50=1737 n=8190 | --path-engine pogflow --model-guided --max_memory 16G --CPU 8 |
+

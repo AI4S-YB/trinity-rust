@@ -12,14 +12,14 @@
 //!   （count 与 dump 两个 checkpoint 之间传递, 原版 .jf 在 dump 后即删）。
 
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use trinity_chrysalis::pipeline::{run_chrysalis_pipeline, ChrysalisParams};
 use trinity_common::error::CommonError;
 use trinity_inchworm::irke::{
     compute_sequence_assemblies, compute_sequence_assemblies_parallel, populate_from_kmers,
-    prune_some_kmers, write_kmer_count_report, AssemblyParams, IrkeParams, Monitor,
+    populate_from_table, prune_some_kmers, write_kmer_count_report, AssemblyParams, IrkeParams,
+    Monitor,
 };
 use trinity_kmer::counter::{estimate_hash_size, KmerCountTable};
 use trinity_kmer::diginorm::{self, DigiNormParams, ReadsInput};
@@ -229,39 +229,45 @@ pub fn run_trinity(args: &TrinityArgs) -> Result<PathBuf, CommonError> {
 
     // ---- 1. 归一化（L1441-1453; checkpoint insilico_read_normalization/normalization.ok）----
     if !args.no_normalize_reads {
-        // 硬护栏: 归一化需把两侧读入整读进内存。
-        if let Some(msg) = memory_guard_error(
-            args.max_memory,
-            input_files_bytes(args),
-            "read normalization",
-        ) {
-            return Err(CommonError::Parse(msg));
-        }
-        let norm_dir = outdir.join("insilico_read_normalization");
-        let norm_ok = norm_dir.join("normalization.ok");
-        if !run_with_checkpoint(&norm_ok, "In silico Read Normalization", || {
-            let params = diginorm_params(args, paired);
-            let reads = if paired {
-                ReadsInput::Paired(a.left.clone(), a.right.clone())
-            } else {
-                ReadsInput::Single(a.single.clone())
-            };
-            diginorm::run(&params, &reads, &norm_dir)?;
-            Ok(())
-        })? {
-            // skipped: 输出文件应已在（resume 语义）。
-        }
-        let ext = ext_of(args.seq_type);
-        if paired {
-            a.left = vec![norm_dir.join(format!("left.norm.{ext}"))];
-            a.right = vec![norm_dir.join(format!("right.norm.{ext}"))];
-        } else {
-            a.single = vec![norm_dir.join(format!("single.norm.{ext}"))];
-        }
+        let norm: Result<(), CommonError> =
+            trinity_common::timer::timed(&outdir, "normalize", || {
+                // 硬护栏: 归一化需把两侧读入整读进内存。
+                if let Some(msg) = memory_guard_error(
+                    args.max_memory,
+                    input_files_bytes(args),
+                    "read normalization",
+                ) {
+                    return Err(CommonError::Parse(msg));
+                }
+                let norm_dir = outdir.join("insilico_read_normalization");
+                let norm_ok = norm_dir.join("normalization.ok");
+                if !run_with_checkpoint(&norm_ok, "In silico Read Normalization", || {
+                    let params = diginorm_params(args, paired);
+                    let reads = if paired {
+                        ReadsInput::Paired(a.left.clone(), a.right.clone())
+                    } else {
+                        ReadsInput::Single(a.single.clone())
+                    };
+                    diginorm::run(&params, &reads, &norm_dir)?;
+                    Ok(())
+                })? {
+                    // skipped: 输出文件应已在（resume 语义）。
+                }
+                let ext = ext_of(args.seq_type);
+                if paired {
+                    a.left = vec![norm_dir.join(format!("left.norm.{ext}"))];
+                    a.right = vec![norm_dir.join(format!("right.norm.{ext}"))];
+                } else {
+                    a.single = vec![norm_dir.join(format!("single.norm.{ext}"))];
+                }
+                Ok(())
+            });
+        norm?;
     }
 
     // ---- 2. prep → both.fa/single.fa + .read_count（L1604-1705）----
-    let (target_fa, read_count) = prep_reads(&a, &outdir)?;
+    let (target_fa, read_count) =
+        trinity_common::timer::timed(&outdir, "prep", || prep_reads(&a, &outdir))?;
     let read_count_file = outdir.join(format!(
         "{}.read_count",
         target_fa.file_name().unwrap_or_default().to_string_lossy()
@@ -342,48 +348,28 @@ pub fn run_trinity(args: &TrinityArgs) -> Result<PathBuf, CommonError> {
         ".jellyfish_count.{k}.mincov{}.{SR_FLAG}.ok",
         args.min_kmer_count
     ));
-    let dump_ok = outdir.join(format!(
-        ".jellyfish_dump.{k}.mincov{}.{SR_FLAG}.ok",
-        args.min_kmer_count
-    ));
-    let kmer_fa = outdir.join(format!("jellyfish.kmers.{k}.{SR_FLAG}.fa"));
     let counts_bin = outdir.join(format!("mer_counts.{k}.{SR_FLAG}.rs.bin"));
-    if !checkpoint_exists(&count_ok) {
-        eprintln!("-- Trinity (rust) | Jellyfish count (K={k})");
-        // 硬护栏: target_fa 整读进内存 + 计数哈希。
-        if let Some(msg) =
-            memory_guard_error(args.max_memory, file_len(&target_fa), "k-mer counting")
-        {
-            return Err(CommonError::Parse(msg));
-        }
-        let data = fs::read(&target_fa)?;
-        // estimate_hash_size（Trinity:2598-2604 容量提示语义）→ 计数
-        // HashMap 预 reserve（每线程 estimate/18/CPU，函数内部再截上限）,
-        // 避免增长期 rehash 内存峰值。
-        let estimate = estimate_hash_size(args.max_memory, data.len() as u64);
-        let per_thread = (estimate / KMER_ENTRY_BYTES / args.cpu.max(1) as u64) as usize;
-        let counts = KmerCountTable::count_fasta_data_with_capacity(&data, k, ds, per_thread);
-        save_counts(&counts_bin, &counts, k, ds)?;
-        fs::write(&count_ok, b"")?;
-    }
-    if !checkpoint_exists(&dump_ok) {
-        eprintln!(
-            "-- Trinity (rust) | Jellyfish dump -L {}",
-            args.min_kmer_count
-        );
-        let counts = if checkpoint_exists(&counts_bin) {
-            load_counts(&counts_bin, k, ds)?
-        } else {
+    trinity_common::timer::timed(&outdir, "kmer_count", || -> Result<(), CommonError> {
+        if !checkpoint_exists(&count_ok) {
+            eprintln!("-- Trinity (rust) | Jellyfish count (K={k})");
+            // 硬护栏: target_fa 整读进内存 + 计数哈希。
+            if let Some(msg) =
+                memory_guard_error(args.max_memory, file_len(&target_fa), "k-mer counting")
+            {
+                return Err(CommonError::Parse(msg));
+            }
             let data = fs::read(&target_fa)?;
+            // estimate_hash_size（Trinity:2598-2604 容量提示语义）→ 计数
+            // HashMap 预 reserve（每线程 estimate/18/CPU，函数内部再截上限）,
+            // 避免增长期 rehash 内存峰值。
             let estimate = estimate_hash_size(args.max_memory, data.len() as u64);
             let per_thread = (estimate / KMER_ENTRY_BYTES / args.cpu.max(1) as u64) as usize;
-            KmerCountTable::count_fasta_data_with_capacity(&data, k, ds, per_thread)
-        };
-        let mut out = fs::File::create(&kmer_fa)?;
-        write_dump(&mut out, &counts, k, args.min_kmer_count.max(1), ds)?;
-        out.flush()?;
-        fs::write(&dump_ok, b"")?;
-    }
+            let counts = KmerCountTable::count_fasta_data_with_capacity(&data, k, ds, per_thread);
+            save_counts(&counts_bin, &counts, k, ds)?;
+            fs::write(&count_ok, b"")?;
+        }
+        Ok(())
+    })?;
 
     // ---- 4. inchworm（L2654-2727）----
     // 命名镜像 L1576-1580: SS → inchworm.fa, 无 SS → inchworm.DS.fa。
@@ -395,36 +381,55 @@ pub fn run_trinity(args: &TrinityArgs) -> Result<PathBuf, CommonError> {
     let iworm_fa = outdir.join(iworm_name);
     let iworm_tmp = outdir.join(format!("{iworm_name}.tmp"));
     let iworm_ok = outdir.join(format!(".iworm.{k}.{SR_FLAG}.ok"));
-    run_with_checkpoint(&iworm_ok, "Inchworm (linear contig construction)", || {
-        let data = fs::read(&kmer_fa)?;
-        let (mut counter, _parsed) = populate_from_kmers(&data, k, ds)?;
-        write_kmer_count_report(&outdir.join("inchworm.kmer_count"), counter.size())?;
-        // 主线实参: --min_any_entropy 1.0 --no_prune_error_kmers（L1050/L2707）
-        // + dump -L 已按 min_kmer_cov 过滤（minKmerCount 此处为等价二次过滤）。
-        eprintln!(
-            "Pruning kmers (min_kmer_count={} min_any_entropy=1 min_ratio_non_error=0.005)",
-            args.min_kmer_count
-        );
-        prune_some_kmers(&mut counter, args.min_kmer_count, 1.0, false, 0.005);
-        let params = IrkeParams::default();
-        // -L = MIN_IWORM_LEN = KMER_SIZE（L1064/L2698）
-        let aparams = AssemblyParams {
-            min_assembly_length: k,
-            ..Default::default()
-        };
-        let monitor = Monitor::new(1);
-        let mut buf = Vec::new();
-        compute_sequence_assemblies_parallel(
-            counter,
-            &params,
-            &aparams,
-            &monitor,
-            true, // TWO_PHASE 默认开（IRKE.cpp:59）
-            Some(args.inchworm_cpu),
-            &mut buf,
-        )?;
-        fs::write(&iworm_tmp, &buf)?;
-        Ok(())
+    trinity_common::timer::timed(&outdir, "inchworm", || {
+        run_with_checkpoint(&iworm_ok, "Inchworm (linear contig construction)", || {
+            // M7 直桥: 计数表（checkpoint 二进制或重算）直接构建 counter,
+            // 跳过 jellyfish dump 文本往返; 原 dump 的 -L min_cov 过滤由
+            // 下方 prune_some_kmers 等价承担。
+            let (mut counter, _parsed) = trinity_common::timer::timed(
+                &outdir,
+                "kmer_load",
+                || -> Result<(trinity_inchworm::kmer_counter::KmerCounter, usize), CommonError> {
+                    let counts = if checkpoint_exists(&counts_bin) {
+                        load_counts(&counts_bin, k, ds)?
+                    } else {
+                        let data = fs::read(&target_fa)?;
+                        let estimate = estimate_hash_size(args.max_memory, data.len() as u64);
+                        let per_thread =
+                            (estimate / KMER_ENTRY_BYTES / args.cpu.max(1) as u64) as usize;
+                        KmerCountTable::count_fasta_data_with_capacity(&data, k, ds, per_thread)
+                    };
+                    populate_from_table(&counts, k, ds)
+                },
+            )?;
+            write_kmer_count_report(&outdir.join("inchworm.kmer_count"), counter.size())?;
+            // 主线实参: --min_any_entropy 1.0 --no_prune_error_kmers（L1050/L2707）
+            // + dump -L 已按 min_kmer_cov 过滤（minKmerCount 此处为等价二次过滤）。
+            eprintln!(
+                "Pruning kmers (min_kmer_count={} min_any_entropy=1 min_ratio_non_error=0.005)",
+                args.min_kmer_count
+            );
+            prune_some_kmers(&mut counter, args.min_kmer_count, 1.0, false, 0.005);
+            let params = IrkeParams::default();
+            // -L = MIN_IWORM_LEN = KMER_SIZE（L1064/L2698）
+            let aparams = AssemblyParams {
+                min_assembly_length: k,
+                ..Default::default()
+            };
+            let monitor = Monitor::new(1);
+            let mut buf = Vec::new();
+            compute_sequence_assemblies_parallel(
+                counter,
+                &params,
+                &aparams,
+                &monitor,
+                true, // TWO_PHASE 默认开（IRKE.cpp:59）
+                Some(args.inchworm_cpu),
+                &mut buf,
+            )?;
+            fs::write(&iworm_tmp, &buf)?;
+            Ok(())
+        })
     })?;
     let iworm_renamed_ok = outdir.join(format!("iworm_renamed.{k}.{SR_FLAG}.ok"));
     run_with_checkpoint(&iworm_renamed_ok, "mv inchworm.fa.tmp", || {
@@ -500,26 +505,28 @@ pub fn run_trinity(args: &TrinityArgs) -> Result<PathBuf, CommonError> {
 
     let mut listing_opt: Option<Vec<(u64, PathBuf)>> = None;
     let quantify_ok = outdir.join(".quantify_graph.ok");
-    run_with_checkpoint(
-        &quantify_ok,
-        "Chrysalis (clustering & de Bruijn graph)",
-        || {
-            let listing = run_chrysalis_pipeline(
-                &iworm_data,
-                &chrysalis_reads,
-                &chrysalis_dir,
-                &ChrysalisParams {
-                    strand: ss.is_some(),
-                    min_contig_length: args.min_contig_length,
-                    max_reads: args.max_reads_per_graph,
-                    threads: args.cpu.max(1),
-                    ..Default::default()
-                },
-            )?;
-            listing_opt = Some(listing);
-            Ok(())
-        },
-    )?;
+    trinity_common::timer::timed(&outdir, "chrysalis_total", || {
+        run_with_checkpoint(
+            &quantify_ok,
+            "Chrysalis (clustering & de Bruijn graph)",
+            || {
+                let listing = run_chrysalis_pipeline(
+                    &iworm_data,
+                    &chrysalis_reads,
+                    &chrysalis_dir,
+                    &ChrysalisParams {
+                        strand: ss.is_some(),
+                        min_contig_length: args.min_contig_length,
+                        max_reads: args.max_reads_per_graph,
+                        threads: args.cpu.max(1),
+                        ..Default::default()
+                    },
+                )?;
+                listing_opt = Some(listing);
+                Ok(())
+            },
+        )
+    })?;
     let listing = match listing_opt {
         Some(l) => l,
         None => read_component_base_listing(
@@ -536,24 +543,27 @@ pub fn run_trinity(args: &TrinityArgs) -> Result<PathBuf, CommonError> {
 
     // ---- 6. butterfly 组件池（checkpoint .butterfly.ok; L1934-1936）----
     warn_memory(args.max_memory, file_len(&iworm_fa), "Butterfly");
-    run_with_checkpoint(
-        &outdir.join(".butterfly.ok"),
-        "Butterfly (component pool)",
-        || {
-            run_butterfly_pool(
-                &listing,
-                &outdir,
-                &ButterflyPoolParams {
-                    cpu: args.cpu.max(1),
-                    min_contig_length: args.min_contig_length,
-                    group_pairs_distance: args.group_pairs_distance,
-                    stack_size_mb: args.bfly_stack_mb,
-                    path_engine: args.path_engine,
-                    kmer_size: args.kmer_size,
-                },
-            )
-        },
-    )?;
+    trinity_common::timer::timed(&outdir, "butterfly", || {
+        run_with_checkpoint(
+            &outdir.join(".butterfly.ok"),
+            "Butterfly (component pool)",
+            || {
+                run_butterfly_pool(
+                    &listing,
+                    &outdir,
+                    &ButterflyPoolParams {
+                        cpu: args.cpu.max(1),
+                        min_contig_length: args.min_contig_length,
+                        group_pairs_distance: args.group_pairs_distance,
+                        stack_size_mb: args.bfly_stack_mb,
+                        path_engine: args.path_engine,
+                        kmer_size: args.kmer_size,
+                    },
+                )
+            },
+        )
+    })?;
+
     // ---- 6b. 蛋白引导延长（M6a; checkpoint .protein_guided.ok）----
     if args.protein_guided {
         trinity_common::timer::timed(&outdir, "protein_guided", || {
@@ -563,7 +573,9 @@ pub fn run_trinity(args: &TrinityArgs) -> Result<PathBuf, CommonError> {
 
     // ---- 7. 汇总（无 checkpoint; 每次重写 Trinity.tmp.fasta, L1916/L1943）----
     let trinity_tmp = outdir.join("Trinity.tmp.fasta");
-    let n_transcripts = harvest(&listing, args.min_contig_length, &trinity_tmp)?;
+    let n_transcripts = trinity_common::timer::timed(&outdir, "harvest", || {
+        harvest(&listing, args.min_contig_length, &trinity_tmp)
+    })?;
     if n_transcripts == 0 {
         return Err(CommonError::Parse(
             "WARNING: no transcripts harvested from butterfly output".to_string(),
@@ -589,7 +601,6 @@ pub fn run_trinity(args: &TrinityArgs) -> Result<PathBuf, CommonError> {
         for p in [
             &target_fa,
             &counts_bin,
-            &kmer_fa,
             &outdir.join("left.fa"),
             &outdir.join("right.fa"),
         ] {
