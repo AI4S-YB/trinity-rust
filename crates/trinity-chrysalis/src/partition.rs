@@ -4,29 +4,29 @@
 //! 镜像语义：
 //! - **图分区**：按 `Component` 行切块（Component_reader::next_component）；
 //!   `num_kmers = 块体行数`；`num_kmers + 24 < min_contig_length` 跳过
-//!   （假定 25-mer）；通过者从 1 计数，目录 `Cbin<通过数/1000>`，每组件写
-//!   `<Cbin>/c<id>.graph.tmp`（完整块文本含头行），登记 `comp_id → base`；
+//!   （假定 25-mer）；通过者从 1 计数，目录 `Cbin<通过数/1000>`，每组件一条
+//!   graph.tmp 记录（完整块文本含头行），登记 `comp_id → base`；
 //!   **块体为空的组件终止整个读取循环**（perl `if (@lines) ... else undef`）。
 //! - **reads 分区**：输入行 `comp \t acc \t pct \t read`（假定已按 comp 排序，
-//!   未排序时同 comp 第二段会重开文件截断——照抄）；comp 变化时开新文件
-//!   （登记表有的才写，没有的静默丢）；每条 `>acc pct\nread\n`（acc 含 '>'）。
+//!   未排序时同 comp 第二段**截断重写**——由 pack 索引"同 key 后者覆盖"镜像）；
+//!   comp 变化时换组件（登记表有的才写，没有的静默丢）；每条 `>acc pct\nread\n`
+//!   （acc 含 '>'）。
 //! - **component_base_listing.txt**：comp id 数值升序，graph.tmp 与 reads.tmp
-//!   **都存在且非空**才输出 `id \t base`，同时作为本函数返回值。
+//!   记录**都存在且非空**才输出 `id \t base`，同时作为本函数返回值。
 //!
-//! 性能（M7）：reads 分区每行 `write!` 直写裸 `File` 曾是每行多次 write(2)
-//! ——dev1 7.6M 行 ≈ 45M 次系统调用；现用 128KB `BufWriter`。图分区改为
-//! 原文**借用切片**（不再全量 `split('\n').collect()` + 每组件 String 复制；
-//! 仅 EOF 无换行的末组件补一个 '\n'，与原 join+"\n" 逐字节一致）。
+//! 输出布局（IO 优化, M8）：per-component 的 cN.graph.tmp / cN.reads.tmp 文件
+//! 改为每 Cbin 一个 `tmp.pack`+`tmp.idx` 打包（见 pack 模块）——28444 组件
+//! 场景再省 ~5.7 万次 create/unlink。逻辑布局（id → 记录字节）与旧文件布局
+//! 逐字节等价（partition 测试的 oracle 对拍锁定）。
 
 use std::borrow::Cow;
 use std::collections::HashMap;
-use std::io::BufWriter;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use trinity_common::error::CommonError;
 
-/// reads.tmp 写缓冲（dev1 平均文件 ~127KB；小于缓冲的文件退化为单次 write）。
-const READS_BUF_CAP: usize = 128 * 1024;
+use crate::pack::{PackWriter, KIND_GRAPH_TMP, KIND_READS_TMP, TMP_PACK};
 
 /// `-N`（每分区图数，默认 1000）与 `-L`（最短 contig 长度，默认 200；
 /// 判据 `num_kmers + 24 < L`，25-mer 假定）。
@@ -45,9 +45,10 @@ impl Default for PartParams {
     }
 }
 
-/// 分区主流程。`debruijn_text` = bundled_iworm_contigs.fasta.deBruijn 全文，
+/// 分区主流程。`debruijn_text` = bundled_iworm_contigs.fasta.deBruijn 全文,
 /// `sorted_reads_to_components` = readsToComponents.out.sort 全文（已按 comp
-/// 排序），输出目录 `out_dir`（对应原版 `<db 目录>/Component_bins`）。
+/// 排序）, 输出目录 `out_dir`（对应原版 `<db 目录>/Component_bins`）——
+/// 产物为每 Cbin 一个 `tmp.pack`+`tmp.idx`（打包布局, 见 pack 模块）。
 /// 返回 listing 内容（comp id 升序的 (id, base)，双非空过滤后）。
 pub fn partition(
     debruijn_text: &str,
@@ -58,8 +59,9 @@ pub fn partition(
     std::fs::create_dir_all(out_dir)?;
 
     let mut registry: HashMap<u64, PathBuf> = HashMap::new();
+    // 每 Cbin 一个 tmp 包写句柄（延迟创建; 数量 = 组件数/N, 很小）。
+    let mut writers: HashMap<PathBuf, PackWriter> = HashMap::new();
     let mut passed: usize = 0;
-    let mut last_cbin: Option<PathBuf> = None; // 同 bin 只 create_dir_all 一次
 
     for comp in components(debruijn_text) {
         if comp.body_lines + 24 < p.min_contig_length {
@@ -67,56 +69,69 @@ pub fn partition(
         }
         passed += 1;
         let cbin = out_dir.join(format!("Cbin{}", passed / p.graphs_per_partition));
-        if last_cbin.as_deref() != Some(cbin.as_path()) {
-            std::fs::create_dir_all(&cbin)?;
-            last_cbin = Some(cbin.clone());
-        }
-        let graph_tmp = cbin.join(format!("c{}.graph.tmp", comp.id));
-        std::fs::write(&graph_tmp, comp.text.as_bytes())?;
+        let w = match writers.get_mut(&cbin) {
+            Some(w) => w,
+            None => {
+                std::fs::create_dir_all(&cbin)?;
+                writers.insert(cbin.clone(), PackWriter::create(&cbin, TMP_PACK)?);
+                writers.get_mut(&cbin).unwrap()
+            }
+        };
+        w.append(comp.id, KIND_GRAPH_TMP, comp.text.as_bytes())?;
         registry.insert(comp.id, cbin.join(format!("c{}", comp.id)));
     }
 
-    // reads 分区：comp 变化时（数值比较）开新文件；未登记的 comp 静默丢弃。
-    // BufWriter 聚行成块（轮换/结束时显式 flush 传播错误）。
+    // reads 分区: comp 变化时（数值比较）flush 上一组件的缓冲为一条记录;
+    // 未登记的 comp 静默丢弃。同 comp 再现（未排序输入）= 截断重写——
+    // 追加新记录 + reads_len 覆盖, 由 PackIndex "同 key 后者覆盖" 镜像。
+    // （原版此时对已截断文件持续写入; 末次内容 = 有效记录。）
     let mut prev_comp: i64 = -1;
-    let mut cur: Option<BufWriter<std::fs::File>> = None;
-    use std::io::Write;
+    let mut prev_registered = false;
+    let mut buf: Vec<u8> = Vec::new();
+    let mut reads_len: HashMap<u64, u64> = HashMap::new(); // comp → 末次记录长度
     for line in sorted_reads_to_components.lines() {
         let mut f = line.split('\t');
         let comp = perl_num(f.next().unwrap_or(""));
         if comp != prev_comp {
-            if let Some(mut old) = cur.take() {
-                old.flush()?;
-            }
-            if let Some(base) = registry.get(&(comp as u64)) {
-                cur = Some(BufWriter::with_capacity(
-                    READS_BUF_CAP,
-                    std::fs::File::create(base.with_extension("reads.tmp"))?,
-                ));
-            }
+            flush_reads(
+                &mut writers,
+                &registry,
+                &mut reads_len,
+                prev_comp,
+                prev_registered,
+                &buf,
+            )?;
+            prev_registered = registry.contains_key(&(comp as u64));
+            buf.clear();
         }
-        if let Some(fh) = cur.as_mut() {
+        if prev_registered {
             let acc = f.next().unwrap_or("");
             let pct = f.next().unwrap_or("");
             let read = f.next().unwrap_or("");
-            write!(fh, "{acc} {pct}\n{read}\n")?;
+            write!(buf, "{acc} {pct}\n{read}\n")?;
         }
         prev_comp = comp;
     }
-    if let Some(mut last) = cur.take() {
-        last.flush()?;
+    flush_reads(
+        &mut writers,
+        &registry,
+        &mut reads_len,
+        prev_comp,
+        prev_registered,
+        &buf,
+    )?;
+    for w in writers.values_mut() {
+        w.finish()?;
     }
 
-    // listing：数值升序 + 双非空
+    // listing：数值升序 + 双非空（graph 记录恒非空; reads 看末次记录长度）
     let mut ids: Vec<u64> = registry.keys().copied().collect();
     ids.sort_unstable();
     let mut listing = Vec::new();
     let mut text = String::new();
     for id in ids {
         let base = &registry[&id];
-        let g = base.with_extension("graph.tmp");
-        let r = base.with_extension("reads.tmp");
-        let ok = files_nonempty(&g) && files_nonempty(&r);
+        let ok = reads_len.get(&id).copied().unwrap_or(0) > 0;
         if ok {
             text.push_str(&format!("{id}\t{}\n", base.display()));
             listing.push((id, base.clone()));
@@ -126,8 +141,30 @@ pub fn partition(
     Ok(listing)
 }
 
-fn files_nonempty(p: &Path) -> bool {
-    matches!(std::fs::metadata(p), Ok(m) if m.len() > 0)
+/// 把上一组件的 reads 缓冲 flush 为一条 tmp 包记录（已登记组件才写;
+/// 空缓冲也写——镜像原版"comp 变化即创建（截断）文件"的空文件语义）。
+fn flush_reads(
+    writers: &mut HashMap<PathBuf, PackWriter>,
+    registry: &HashMap<u64, PathBuf>,
+    reads_len: &mut HashMap<u64, u64>,
+    prev_comp: i64,
+    prev_registered: bool,
+    buf: &[u8],
+) -> Result<(), CommonError> {
+    if !prev_registered {
+        return Ok(());
+    }
+    let id = prev_comp as u64;
+    let cbin = registry[&id]
+        .parent()
+        .map(|d| d.to_path_buf())
+        .unwrap_or_default();
+    let w = writers
+        .get_mut(&cbin)
+        .expect("已登记组件的 Cbin 写句柄必存在");
+    w.append(id, KIND_READS_TMP, buf)?;
+    reads_len.insert(id, buf.len() as u64);
+    Ok(())
 }
 
 /// perl 数值上下文（`$comp != $prev_comp`）：最长数字前缀，无数字 → 0。
@@ -244,6 +281,7 @@ fn regex_component_id(line: &str) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pack::{self, PackIndex};
 
     fn tmpdir(name: &str) -> std::path::PathBuf {
         let d = std::env::temp_dir().join(name);
@@ -258,6 +296,15 @@ mod tests {
             s.push_str(&format!("{i}\t-1\t1\tACGTACGTACGTACGTACGTACGT\t1\n"));
         }
         s
+    }
+
+    /// 打包布局的"逐组件可定位"读接口（等价旧布局的读文件断言）:
+    /// 读 `dir/Cbin*? /tmp.pack` 中 (id, kind) 的记录。
+    fn tmp_record(cbin: &Path, id: u64, kind: u64) -> Option<Vec<u8>> {
+        let idx = PackIndex::load(&cbin.join(format!("{}.idx", pack::TMP_PACK))).unwrap();
+        let (off, len) = idx.find(id, kind)?;
+        let f = std::fs::File::open(cbin.join(format!("{}.pack", pack::TMP_PACK))).unwrap();
+        Some(pack::read_at(&f, off, len).unwrap())
     }
 
     #[test]
@@ -275,12 +322,16 @@ mod tests {
             },
         )
         .unwrap();
-        // 只有 comp 2 通过；reads 全空 → listing 空（reads.tmp 不存在）
+        // 只有 comp 2 通过；reads 全空 → listing 空（reads 记录不存在）
         assert!(l.is_empty());
-        assert!(d.join("Cbin0/c2.graph.tmp").metadata().unwrap().len() > 0);
-        assert!(!d.join("Cbin0/c1.graph.tmp").exists());
-        // listing 文件本身存在
+        let cbin0 = d.join("Cbin0");
+        assert!(!tmp_record(&cbin0, 2, pack::KIND_GRAPH_TMP)
+            .unwrap()
+            .is_empty());
+        assert!(tmp_record(&cbin0, 1, pack::KIND_GRAPH_TMP).is_none());
+        // listing 文件本身存在; per-component 小文件不再产生
         assert!(d.join("component_base_listing.txt").exists());
+        assert!(!d.join("Cbin0/c2.graph.tmp").exists());
     }
 
     #[test]
@@ -303,15 +354,15 @@ mod tests {
         assert_eq!(l[0], (1, d.join("Cbin0/c1")));
         assert_eq!(l[1], (5, d.join("Cbin2/c5")));
         // graph.tmp 含头行的完整块
-        let g = std::fs::read_to_string(d.join("Cbin0/c1.graph.tmp")).unwrap();
+        let g = String::from_utf8(tmp_record(&d.join("Cbin0"), 1, pack::KIND_GRAPH_TMP).unwrap())
+            .unwrap();
         assert!(g.starts_with("Component 1\n"));
         assert_eq!(g.lines().count(), 201);
-        // reads.tmp：acc 含 '>'，pct 分隔；未登记 comp（此处 comp 5 的 reads
-        // 有写入）… comp 1 有 1 条
-        let r1 = std::fs::read_to_string(d.join("Cbin0/c1.reads.tmp")).unwrap();
-        assert_eq!(r1, ">r1 50%\nTTTT\n");
-        let r5 = std::fs::read_to_string(d.join("Cbin2/c5.reads.tmp")).unwrap();
-        assert_eq!(r5, ">r9 50%\nACGT\n>r8 50%\nACGT\n");
+        // reads.tmp：acc 含 '>'，pct 分隔；comp 1 有 1 条
+        let r1 = tmp_record(&d.join("Cbin0"), 1, pack::KIND_READS_TMP).unwrap();
+        assert_eq!(r1, b">r1 50%\nTTTT\n");
+        let r5 = tmp_record(&d.join("Cbin2"), 5, pack::KIND_READS_TMP).unwrap();
+        assert_eq!(r5, b">r9 50%\nACGT\n>r8 50%\nACGT\n");
         // listing 内容
         let lst = std::fs::read_to_string(d.join("component_base_listing.txt")).unwrap();
         assert_eq!(
@@ -331,10 +382,10 @@ mod tests {
         let d = tmpdir("p3_t6_part_drop");
         let l = partition(&db, reads, &d, &PartParams::default()).unwrap();
         assert_eq!(l, vec![(7, d.join("Cbin0/c7"))]);
-        assert!(!d.join("Cbin0/c99.reads.tmp").exists());
+        assert!(tmp_record(&d.join("Cbin0"), 99, pack::KIND_READS_TMP).is_none());
         assert_eq!(
-            std::fs::read_to_string(d.join("Cbin0/c7.reads.tmp")).unwrap(),
-            ">rB 50%\nACGT\n"
+            tmp_record(&d.join("Cbin0"), 7, pack::KIND_READS_TMP).unwrap(),
+            b">rB 50%\nACGT\n"
         );
     }
 
@@ -346,9 +397,11 @@ mod tests {
         let d = tmpdir("p3_t6_part_listing");
         let l = partition(&db, reads, &d, &PartParams::default()).unwrap();
         assert_eq!(l, vec![(7, d.join("Cbin0/c7"))]);
-        // c8.graph.tmp 已写出（非空）但 reads.tmp 缺 → 被过滤
-        assert!(d.join("Cbin0/c8.graph.tmp").exists());
-        assert!(!d.join("Cbin0/c8.reads.tmp").exists());
+        // c8 的 graph 记录已写入（非空）但 reads 记录缺 → 被过滤
+        assert!(!tmp_record(&d.join("Cbin0"), 8, pack::KIND_GRAPH_TMP)
+            .unwrap()
+            .is_empty());
+        assert!(tmp_record(&d.join("Cbin0"), 8, pack::KIND_READS_TMP).is_none());
     }
 
     #[test]
@@ -358,8 +411,8 @@ mod tests {
         let d = tmpdir("p3_t6_part_empty");
         let l = partition(&db, "", &d, &PartParams::default()).unwrap();
         assert!(l.is_empty());
-        assert!(d.join("Cbin0/c1.graph.tmp").exists());
-        assert!(!d.join("Cbin0/c3.graph.tmp").exists());
+        assert!(tmp_record(&d.join("Cbin0"), 1, pack::KIND_GRAPH_TMP).is_some());
+        assert!(tmp_record(&d.join("Cbin0"), 3, pack::KIND_GRAPH_TMP).is_none());
     }
 
     #[test]
@@ -537,10 +590,47 @@ mod tests {
         m
     }
 
-    /// 全目录树字节对拍。`component_base_listing.txt` 内嵌各自 out_dir 的
+    /// 打包布局目录 → 虚拟"逐组件文件树"（key 与旧文件布局一致:
+    /// `CbinN/c<id>.graph.tmp` 等）——oracle 对拍在新旧布局间比较同一逻辑内容,
+    /// "逐组件可定位"由 pack 索引上的等价位接口（PackIndex::entries + read_at）
+    /// 承担。
+    fn tree_packed(root: &Path) -> std::collections::BTreeMap<std::path::PathBuf, Vec<u8>> {
+        let mut m = std::collections::BTreeMap::new();
+        let lst = root.join("component_base_listing.txt");
+        if lst.exists() {
+            m.insert(
+                std::path::PathBuf::from("component_base_listing.txt"),
+                std::fs::read(&lst).unwrap(),
+            );
+        }
+        for e in std::fs::read_dir(root).unwrap() {
+            let d = e.unwrap().path();
+            if !d.is_dir() {
+                continue;
+            }
+            let cbin = d.file_name().unwrap().to_string_lossy().into_owned();
+            let idx = PackIndex::load(&d.join(format!("{}.idx", pack::TMP_PACK))).unwrap();
+            let f = std::fs::File::open(d.join(format!("{}.pack", pack::TMP_PACK))).unwrap();
+            for (id, kind, off, len) in idx.entries() {
+                let ext = match kind {
+                    pack::KIND_GRAPH_TMP => "graph.tmp",
+                    pack::KIND_READS_TMP => "reads.tmp",
+                    other => panic!("unexpected kind {other}"),
+                };
+                m.insert(
+                    std::path::PathBuf::from(format!("{cbin}/c{id}.{ext}")),
+                    pack::read_at(&f, off, len).unwrap(),
+                );
+            }
+        }
+        m
+    }
+
+    /// 全目录树字节对拍（a = reference 文件布局, b = 新打包布局）。
+    /// `component_base_listing.txt` 内嵌各自 out_dir 的
     /// 绝对路径——比较前把两个根路径规范化为占位符（其余文件原样字节比）。
     fn assert_trees_identical(a: &Path, b: &Path) {
-        let (mut ta, mut tb) = (tree(a), tree(b));
+        let (mut ta, mut tb) = (tree(a), tree_packed(b));
         let keys: Vec<_> = ta.keys().collect();
         assert_eq!(
             keys,

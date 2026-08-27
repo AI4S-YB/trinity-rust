@@ -198,39 +198,55 @@ pub fn run_partition_pool(
         .build()
         .map_err(|e| CommonError::Parse(format!("cannot build partition pool: {e}")))?;
 
-    // (id, mini.fa 路径, reads.tmp 路径)——reads.tmp = base.with_extension
-    // （照抄 pipeline.rs quantify 段的既有用法）
+    // (id, mini.fa 路径, Cbin 目录)——reads.tmp 记录在 Cbin 的 tmp 包内
     let jobs: Vec<(u64, PathBuf, PathBuf)> = listing
         .iter()
         .map(|(id, base)| {
             (
                 *id,
                 outdir.join(format!("c{id}.mini.fa")),
-                base.with_extension("reads.tmp"),
+                base.parent().map(|d| d.to_path_buf()).unwrap_or_default(),
             )
         })
         .collect();
 
-    // 大分区优先（reads.tmp 字节数降序）: 最重/最易失败的任务先暴露问题,
+    // 每 Cbin 载一次 tmp 索引（大分区优先排序 + 后续读记录共用）。
+    let mut tmp_indexes: std::collections::HashMap<PathBuf, pack::PackIndex> =
+        std::collections::HashMap::new();
+    for (_, _, dir) in &jobs {
+        if !tmp_indexes.contains_key(dir) {
+            tmp_indexes.insert(
+                dir.clone(),
+                pack::PackIndex::load(&dir.join(format!("{}.idx", pack::TMP_PACK)))?,
+            );
+        }
+    }
+
+    // 大分区优先（reads.tmp 记录字节数降序）: 最重/最易失败的任务先暴露问题,
     // 也让长尾分区填充尾部空闲槽位。
     let mut jobs = jobs;
-    jobs.sort_by_key(|(_, _, reads_tmp)| {
-        std::cmp::Reverse(fs::metadata(reads_tmp).map(|m| m.len()).unwrap_or(0))
+    jobs.sort_by_key(|(id, _, dir)| {
+        std::cmp::Reverse(
+            tmp_indexes[dir]
+                .find(*id, pack::KIND_READS_TMP)
+                .map(|(_, len)| len)
+                .unwrap_or(0),
+        )
     });
 
     pool.install(|| {
-        jobs.par_iter().for_each(|(id, mini_fa, reads_tmp)| {
+        jobs.par_iter().for_each(|(id, mini_fa, dir)| {
             if mini_fa.exists() {
                 return; // 断点: 已完成分区
             }
-            let data = match fs::read(reads_tmp) {
+            let data = match pack::read_entry(dir, pack::TMP_PACK, *id, pack::KIND_READS_TMP) {
                 Ok(d) => d,
                 Err(e) => {
                     eprintln!("-read partition {id} failed: cannot read {e}");
                     failed
                         .lock()
                         .unwrap()
-                        .push((*id, format!("{}: {e}", reads_tmp.display())));
+                        .push((*id, format!("{}: {e}", dir.display())));
                     return;
                 }
             };
