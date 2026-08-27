@@ -70,6 +70,8 @@ Five crates plus an orchestrating CLI; the data flow mirrors the upstream pipeli
 
 **Extension**: `--bfly_stack_mb` explicitly controls the Butterfly worker thread stack limit (upstream derives this implicitly from the JVM `-Xss` setting).
 
+**Intermediate layout (performance, accepted difference)**: `chrysalis/Component_bins/Cbin*/` no longer holds per-component `cN.graph.out` / `cN.graph.reads` / `cN.graph.allProbPaths.fasta` files (28k components ≈ 85k small files — prohibitive metadata round-trips on NFS). Instead each Cbin has two packed stores: `graphs.pack`/`graphs.idx` (QuantifyGraph output) and `butterfly.pack`/`butterfly.idx` (Butterfly output); the `.idx` is a fixed-size 32-byte record stream (component id / kind / offset / len, little-endian). The normalization `left.norm.*` convenience names are hard links to the long-named files (upstream uses symlinks) instead of physical duplicate writes.
+
 **Known tie-break differences (accepted divergence band)**:
 
 - The inchworm parallel seed tie-breaking order is non-deterministic, exactly like upstream `--PARALLEL_IWORM` — even two runs of the same implementation drift in their transcript multiset (observed coverage band 78–94%); cross-implementation end-to-end bidirectional coverage measured at 57–71% (see the threshold calibration notes in `docs/xcheck-trinity-report.md`). The differences are dominated by end-truncated variants of identical sequences (100%-identity containment), not porting errors.

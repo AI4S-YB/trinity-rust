@@ -8,7 +8,9 @@
 //! CreateIwormFastaBundle → ReadsToTranscripts → sort → FastaToDeBruijn
 //! (-K 24) → partition → QuantifyGraph（rayon 线程池，`-t` 语义保持）。
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 use rayon::prelude::*;
 use trinity_common::error::CommonError;
@@ -20,8 +22,9 @@ use crate::bubble_up::{bubble_up_clustering, BubbleParams};
 use crate::bundle::create_iworm_fasta_bundle;
 use crate::dna_vector::{read_fasta_bytes, stream_fasta_records};
 use crate::graph_from_fasta::{graph_from_fasta, sort_weld_graph, GffParams};
+use crate::pack::{PackWriter, GRAPHS_PACK, KIND_GRAPH_OUT, KIND_GRAPH_READS};
 use crate::partition::{partition, PartParams};
-use crate::quantify::{quantify_graph, reads_ext_filename, QgParams};
+use crate::quantify::{quantify_graph_mem, QgParams};
 use crate::reads_to_transcripts::{reads_to_transcripts, sort_reads_to_components, RttParams};
 
 /// chrysalis-all 管线参数（CLI `-o` 之外的全部旗标面）。
@@ -157,8 +160,10 @@ pub fn run_chrysalis_pipeline(
     })?;
 
     // 6. QuantifyGraph 逐组件（rayon 并行，组件独立）
-    //    skip_quantify: 递归模式分割点——止于分区, 保留 .tmp（run_quantify_for_all
-    //    成功后会删 .tmp 输入, skip 分支不进入该函数）
+    //    skip_quantify: 递归模式分割点——止于分区, 保留 .tmp 供递归分区池消费。
+    //    产物写每 Cbin 一个 `graphs.pack`+`graphs.idx` 打包文件（IO 优化:
+    //    替代 per-component 的 cN.graph.out / cN.graph.reads 小文件）;
+    //    包在阶段开始 truncate 重建（= 阶段级 checkpoint 重跑的幂等语义）。
     if !p.skip_quantify {
         println!(
             "-running QuantifyGraph on {} components ({} threads)...",
@@ -170,6 +175,16 @@ pub fn run_chrysalis_pipeline(
             max_reads: p.max_reads as i64,
             ..Default::default()
         };
+        let mut writers: HashMap<PathBuf, Mutex<PackWriter>> = HashMap::new();
+        for (_, base) in &listing {
+            let dir = base.parent().map(|d| d.to_path_buf()).unwrap_or_default();
+            if !writers.contains_key(&dir) {
+                writers.insert(
+                    dir.clone(),
+                    Mutex::new(PackWriter::create(&dir, GRAPHS_PACK)?),
+                );
+            }
+        }
         let failures: Vec<String> = timed(
             out_dir,
             "quantify",
@@ -181,11 +196,12 @@ pub fn run_chrysalis_pipeline(
                 Ok(pool.install(|| {
                     listing
                         .par_iter()
-                        .filter_map(|(_, base)| {
+                        .filter_map(|(id, base)| {
                             let g = base.with_extension("graph.tmp");
                             let r = base.with_extension("reads.tmp");
-                            let out = base.with_extension("graph.out");
-                            match run_quantify_for_all(&g, &r, &out, &qg) {
+                            let dir = base.parent().map(|d| d.to_path_buf()).unwrap_or_default();
+                            let w = writers.get(&dir).expect("writer per Cbin pre-created");
+                            match run_quantify_packed(*id, &g, &r, w, &qg) {
                                 Ok(()) => None,
                                 Err(e) => Some(format!("{}: {e}", base.display())),
                             }
@@ -194,6 +210,9 @@ pub fn run_chrysalis_pipeline(
                 }))
             },
         )?;
+        for w in writers.values() {
+            w.lock().unwrap().finish()?;
+        }
         if !failures.is_empty() {
             return Err(CommonError::Parse(format!(
                 "QuantifyGraph failed for {} components: {}",
@@ -210,16 +229,25 @@ pub fn run_chrysalis_pipeline(
     Ok(listing)
 }
 
-fn run_quantify_for_all(g: &Path, r: &Path, out: &Path, p: &QgParams) -> Result<(), String> {
-    let o =
-        quantify_graph(&g.to_string_lossy(), &r.to_string_lossy(), p).map_err(|e| e.to_string())?;
-    let want = out.to_string_lossy().to_string();
-    let derived = PathBuf::from(&o.graph_out);
-    if derived != out {
-        std::fs::rename(&derived, out).map_err(|e| e.to_string())?;
-        std::fs::rename(o.reads_out, reads_ext_filename(&want)).map_err(|e| e.to_string())?;
+/// 逐组件 QuantifyGraph → 追加进 Cbin 的 graphs 包; 成功后删 .tmp 输入
+/// （原版 QuantifyGraph.cc:489-493 unlink 语义——.tmp 是独立文件, 照删）。
+fn run_quantify_packed(
+    id: u64,
+    g: &Path,
+    r: &Path,
+    writer: &Mutex<PackWriter>,
+    p: &QgParams,
+) -> Result<(), String> {
+    let graph = std::fs::read_to_string(g).map_err(|e| e.to_string())?;
+    let reads = std::fs::read(r).map_err(|e| e.to_string())?;
+    let (gout, rout) = quantify_graph_mem(&graph, &reads, p).map_err(|e| e.to_string())?;
+    {
+        let mut w = writer.lock().unwrap();
+        w.append(id, KIND_GRAPH_OUT, gout.as_bytes())
+            .map_err(|e| e.to_string())?;
+        w.append(id, KIND_GRAPH_READS, rout.as_bytes())
+            .map_err(|e| e.to_string())?;
     }
-    // 原版语义：成功后删输入
     let _ = std::fs::remove_file(g);
     let _ = std::fs::remove_file(r);
     Ok(())

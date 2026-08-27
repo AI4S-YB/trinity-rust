@@ -10,6 +10,7 @@ use std::sync::Mutex;
 
 use rayon::prelude::*;
 use trinity_butterfly::{run_component, ComponentParams};
+use trinity_chrysalis::pack;
 use trinity_chrysalis::pipeline::{run_chrysalis_pipeline, ChrysalisParams};
 use trinity_common::error::CommonError;
 use trinity_inchworm::irke::{
@@ -112,12 +113,18 @@ pub fn run_mini(reads_tmp: &[u8], p: &MiniParams) -> Result<MiniOut, CommonError
             )?;
             // ⑤ butterfly 每组件（run_component 自带大栈线程）; 组件名带分区前缀
             //    → header `{name}_c{comp}_g.._i..`, 跨分区唯一且匹配 gene_trans_map 正则
+            //    graph.out/graph.reads 从内层 chrysalis 的 graphs 包按偏移读（IO 优化）。
             let mut fasta = Vec::new();
-            for (_id, base) in &listing {
-                let g = fs::read_to_string(base.with_extension("graph.out"))
+            for (id, base) in &listing {
+                let dir = base.parent().map(|d| d.to_path_buf()).unwrap_or_default();
+                let g = pack::read_entry(&dir, pack::GRAPHS_PACK, *id, pack::KIND_GRAPH_OUT)
                     .map_err(|e| CommonError::Parse(format!("mini graph.out read: {e}")))?;
-                let r = fs::read_to_string(base.with_extension("graph.reads"))
+                let r = pack::read_entry(&dir, pack::GRAPHS_PACK, *id, pack::KIND_GRAPH_READS)
                     .map_err(|e| CommonError::Parse(format!("mini graph.reads read: {e}")))?;
+                let g = String::from_utf8(g)
+                    .map_err(|e| CommonError::Parse(format!("mini graph.out utf8: {e}")))?;
+                let r = String::from_utf8(r)
+                    .map_err(|e| CommonError::Parse(format!("mini graph.reads utf8: {e}")))?;
                 let comp_name = format!(
                     "{}_{}",
                     p.name,

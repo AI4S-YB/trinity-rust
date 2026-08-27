@@ -133,6 +133,13 @@ fn end_to_end_small() {
     assert!(!outdir.join("insilico_read_normalization").exists());
     // 单端 → single.fa（非 both.fa）
     assert!(outdir.join("single.fa").exists());
+    // 组件产物走打包布局: graphs/butterfly 包在, per-component 小文件不在
+    let cbin = outdir.join("chrysalis/Component_bins/Cbin0");
+    assert!(cbin.join("graphs.pack").exists());
+    assert!(cbin.join("graphs.idx").exists());
+    assert!(cbin.join("butterfly.pack").exists());
+    assert!(!cbin.join("c0.graph.out").exists());
+    assert!(!cbin.join("c0.graph.allProbPaths.fasta").exists());
 }
 
 #[test]
@@ -167,13 +174,17 @@ fn resume_skips_completed_stage() {
 fn butterfly_pool_isolates_failures() {
     let dir = tmpdir("bflypool");
     // 两个坏组件（graph.out 图文本非法）: 池应两者都跑完、都记录、聚合报错,
-    // 而不是第一个 Err 即中断。
+    // 而不是第一个 Err 即中断。包布局: 输入写在 Cbin0 的 graphs.pack。
+    use trinity_chrysalis::pack::{PackWriter, GRAPHS_PACK, KIND_GRAPH_OUT, KIND_GRAPH_READS};
     let comp_dir = dir.join("Cbin0");
     fs::create_dir_all(&comp_dir).unwrap();
+    let mut w = PackWriter::create(&comp_dir, GRAPHS_PACK).unwrap();
     for id in [1u64, 2u64] {
-        fs::write(comp_dir.join(format!("c{id}.graph.out")), "not a graph\n").unwrap();
-        fs::write(comp_dir.join(format!("c{id}.graph.reads")), ">r\nACGT\n").unwrap();
+        w.append(id, KIND_GRAPH_OUT, b"not a graph\n").unwrap();
+        w.append(id, KIND_GRAPH_READS, b">r\nACGT\n").unwrap();
     }
+    w.finish().unwrap();
+    drop(w);
     let listing = vec![(1u64, comp_dir.join("c1")), (2u64, comp_dir.join("c2"))];
     let err = run_butterfly_pool(
         &listing,
