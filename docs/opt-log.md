@@ -999,4 +999,41 @@ classic 产出（32,748 条, 中位 717bp）self-overlap → dovetail 2,621 边 
 覆盖; R_full 瓶颈是数据上限, 不是序列组织方式。Ra 本身在文献中不及
 Trinity 系的表现与此一致。短读 de novo 场景的 OLC/混合探索彻底闭环
 （从零几何不可行 + 合并两连负）; 可行域仍是 genome-guided / 长读长。
+
+## Ra 原版完整管线实测: 远逊 classic, OLC 从零路线终审（2026-08-27）
+
+用户裁定须跑 Ra 完整核心算法（非自制模拟）。修复 master 分支 5 处断点后
+编译全链（vendor/cpppoa 与 include/ra 全头文件补 <cstdint>; main.cpp
+命名不一致 writeOverlaps→write_overlaps; ra_layout 接口漂移
+readAfgOverlaps 缺 reads 参数 / AfgRead→Read; overlap 输出裸行 vs layout
+期望 afg OVL 的格式断点——转换器补 rds/adj/ahg/bhg 包装;
+updateOverlapIds 无定义补 no-op, read id 未重编号语义自洽）。
+
+### dev1 全链（单端 R1 5.8M reads, 16 线程, /tmp/ra_work）
+
+| 阶段 | 耗时 | 关键数 |
+|---|---|---|
+| ra_correct (k25 c2) | 5m | 修正 1.57% 碱基 |
+| ra_overlap (ESA 精确, -m 25) | 8m | dedup 69.86%（去重替代归一化的机制实证）, 3.04M overlap, contained -6.35% |
+| ra_layout | 11m | trimming 33 轮, bubble popping 0 个（max bucket 750）, 13,910 contigs |
+
+### 结果（transcripts.layout.fasta vs dev1.fa, 无屏蔽口径）
+
+| | R_full | R70 | P | n | 长度中位 |
+|---|---|---|---|---|---|
+| Ra 完整管线 | **0.2%** | **2.9%** | 84.7% | 13,910 | 183bp |
+| classic | 14.0% | 53.2% | 82.1% | 7,787 | ~700bp |
+
+**18 倍 R70 差距不在调参空间内**。机制: 共享外显子的 reads 全互连使转录组
+string graph 远比基因组复杂——bubble popping 因 bucket 过大一个不敢 pop,
+只能靠 trimming 狂剪（33 轮）, 图被剪碎成 183bp 中位片段; precision 尚可
+（碱基大多真实）但召回崩塌。文献"Ra 实验性、不及 Trinity 系"的量化实证。
+
+### 终审裁定
+
+- OLC 三形态全部实证收口: 从零（Ra 原版, R_full 0.2%）/ 产出合并（naive
+  -0.4pp）/ Ra 语义混合层（-0.3pp）。短读转录组 OLC 从零路线终审关闭。
+- Ra 思想的有效成分已被吸收或证伪: dedup=归一化的替代机制（classic 已有
+  归一化）、前置纠错（1.57% 修正量, 可单测）、bubble popping（转录组
+  bucket 爆炸不可用）。可行域回到 genome-guided / 长读长。
 | 2026-08-27 | dev1 | R=14.0% P=81.4% **F1=23.9%** | N50=1836 n=7835 | --CPU 8 --max_memory 8G |
