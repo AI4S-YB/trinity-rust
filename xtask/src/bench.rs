@@ -170,6 +170,8 @@ pub fn run(argv: &[String]) -> i32 {
     let mut reads = String::new();
     let mut reff = String::new();
     let mut prot_ref = String::new();
+    let mut junc_ref = String::new();
+    let mut genome = String::new();
     let mut i = 0;
     let mut passthrough: Vec<String> = Vec::new();
     while i < argv.len() {
@@ -190,6 +192,14 @@ pub fn run(argv: &[String]) -> i32 {
                 prot_ref = argv.get(i + 1).cloned().unwrap_or_default();
                 i += 2;
             }
+            "--junc-ref" => {
+                junc_ref = argv.get(i + 1).cloned().unwrap_or_default();
+                i += 2;
+            }
+            "--genome" => {
+                genome = argv.get(i + 1).cloned().unwrap_or_default();
+                i += 2;
+            }
             "--" => {
                 passthrough = argv[i + 1..].to_vec();
                 break;
@@ -202,6 +212,10 @@ pub fn run(argv: &[String]) -> i32 {
     }
     if tag.is_empty() || reads.is_empty() || reff.is_empty() {
         eprintln!("用法: cargo xtask bench --tag <名> --reads <L.fq.gz,R.fq.gz> --ref <ref.fa> [-- <trinity-cli 参数...>]");
+        return 2;
+    }
+    if junc_ref.is_empty() != genome.is_empty() {
+        eprintln!("--junc-ref 与 --genome 需同时提供");
         return 2;
     }
     let read_files: Vec<&str> = reads.split(',').collect();
@@ -309,12 +323,58 @@ pub fn run(argv: &[String]) -> i32 {
         }
         protein_recall(&tab, &lens)
     };
+    // junction 级指标（评估 v2）: StringTie GTF 参考链 vs minimap2 -x splice 内含子链
+    let mut jm: Option<crate::junction::JunctionMetrics> = None;
+    if !junc_ref.is_empty() && !genome.is_empty() {
+        let gtf =
+            std::fs::read_to_string(&junc_ref).unwrap_or_else(|e| panic!("read {junc_ref}: {e}"));
+        let model = crate::junction::parse_reference_gtf(&gtf);
+        // -c: PAF 输出 cg:Z: CIGAR（parse_splice_paf 依赖; 缺省 minimap2 不写 CIGAR）
+        let out = std::process::Command::new(MINIMAP2)
+            .args(["-x", "splice", "-c", "-t", "8", "--secondary=no"])
+            .arg(&genome)
+            .arg(&final_fa)
+            .output()
+            .expect("无法启动 minimap2");
+        if !out.status.success() {
+            eprintln!(
+                "minimap2 splice 失败: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            return 1;
+        }
+        let asm = crate::junction::parse_splice_paf(&String::from_utf8_lossy(&out.stdout));
+        jm = Some(crate::junction::eval_junction(&asm, &model));
+        let m = jm.as_ref().unwrap();
+        println!(
+            "  Junction: Jgene={:.1}% Jtx={:.1}% Jprec={:.1}% novelJ={:.1}% single={:.1}% (genes={} tx={} asm={})",
+            100.0 * m.j_gene,
+            100.0 * m.j_tx,
+            100.0 * m.j_prec,
+            100.0 * m.novel_j,
+            100.0 * m.single_exon,
+            m.n_gene,
+            m.n_tx,
+            m.n_asm
+        );
+    }
     // 指标落盘 cache/<key>/metrics.json（手写 JSON, 与 stdout 同口径; sweep 汇总用）
+    // junction 字段: 仅在 --junc-ref/--genome 同时给出时追加（jfields 后缀拼接）,
+    // 缺省时 JSON 与旧 schema 逐字节一致, 保证 sweep 汇总向后兼容。
+    let jfields = jm
+        .as_ref()
+        .map(|j| {
+            format!(
+                ",\"j_gene\":{:.4},\"j_tx\":{:.4},\"j_prec\":{:.4},\"novel_j\":{:.4},\"single_exon\":{:.4}",
+                j.j_gene, j.j_tx, j.j_prec, j.novel_j, j.single_exon
+            )
+        })
+        .unwrap_or_default();
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(
         dir.join("metrics.json"),
         format!(
-            "{{\"tag\":\"{tag}\",\"date\":\"{}\",\"r_full\":{:.4},\"r70\":{:.4},\"precision\":{:.4},\"f1\":{:.4},\"n50\":{},\"n\":{},\"p_full\":{:.4},\"p70\":{:.4},\"prot_total\":{},\"args\":\"{}\"}}\n",
+            "{{\"tag\":\"{tag}\",\"date\":\"{}\",\"r_full\":{:.4},\"r70\":{:.4},\"precision\":{:.4},\"f1\":{:.4},\"n50\":{},\"n\":{},\"p_full\":{:.4},\"p70\":{:.4},\"prot_total\":{},\"args\":\"{}\"{jfields}}}\n",
             chrono_free_date(),
             m.r_full,
             m.r70,

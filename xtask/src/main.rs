@@ -1,4 +1,5 @@
 mod bench;
+mod junction;
 
 use std::env;
 use std::path::{Path, PathBuf};
