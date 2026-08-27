@@ -27,8 +27,9 @@ Common options (same names as the upstream `Trinity` script):
 | `--normalize_max_read_cov` / `--no_normalize_reads` | Normalization cap / skip normalization |
 | `--bfly_stack_mb` | Butterfly thread stack (extension of this port; defaults to match upstream JVM stack behavior) |
 | `--no_cleanup` | Keep intermediate files (both.fa / left.fa / right.fa etc.) |
+| `--scratch <dir>` | Write all intermediates (normalization dir / both.fa / mer_counts / inchworm / chrysalis / butterfly) to `<scratch>/<output dir name>/`; the final `<output>.Trinity.fasta` and gene_trans_map are still delivered next to `--output` |
 
-Resume: each stage writes an `.ok` checkpoint file; rerunning with the same `--output` skips completed stages automatically.
+Resume: each stage writes an `.ok` checkpoint file; rerunning with the same `--output` skips completed stages automatically. **Note**: with `--scratch`, checkpoints live with the intermediates inside the scratch directory (scratch is treated as volatile storage) — changing the scratch directory means recomputing everything; always resume with the same `--scratch`.
 
 A `--recursive` mode (partitioned re-assembly) is also available.
 

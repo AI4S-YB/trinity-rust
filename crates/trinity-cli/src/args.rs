@@ -50,6 +50,12 @@ pub struct TrinityArgs {
     pub max_reads_per_graph: u64,
     /// 收尾不删中间文件。
     pub no_cleanup: bool,
+    /// **Rust 版扩展**: 中间产物（归一化目录、both.fa、mer_counts、inchworm、
+    /// chrysalis 整个目录、butterfly 中间物）全部写到 `<scratch>/<output 目录名>/`
+    /// 而非 --output 下; 最终 `<output>.Trinity.fasta` 与 gene_trans_map 仍落在
+    /// --output 旁。checkpoint（.ok）随产物放在 scratch 内——scratch 是易失的,
+    /// 换 scratch 目录 = 全部重算。默认 None = 原行为（全落 --output）。
+    pub scratch: Option<PathBuf>,
     /// `--recursive`（M1）: 递归分区模式——phase-1 chrysalis 止于分区
     /// （skip_quantify）, 逐分区进程内迷你 Trinity, 产物落
     /// `read_partitions/c<id>.mini.fa`（存在即跳过 = 断点）。
@@ -134,6 +140,7 @@ pub fn parse_args(argv: &[String]) -> Result<TrinityArgs, CliError> {
     let max_reads_per_graph: u64 = cli.uint_flag("--max_reads_per_graph", 200000)?;
     let no_cleanup = cli.bool_flag("--no_cleanup");
     let recursive = cli.bool_flag("--recursive");
+    let scratch = cli.value_flag("--scratch")?.map(PathBuf::from);
 
     cli.finish()?;
 
@@ -203,6 +210,44 @@ pub fn parse_args(argv: &[String]) -> Result<TrinityArgs, CliError> {
         bfly_stack_mb,
         max_reads_per_graph,
         no_cleanup,
+        scratch,
         recursive,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn argv(extra: &[&str]) -> Vec<String> {
+        let mut v: Vec<String> = [
+            "--seqType",
+            "fq",
+            "--left",
+            "l.fq",
+            "--right",
+            "r.fq",
+            "--max_memory",
+            "2G",
+            "--output",
+            "out",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        v.extend(extra.iter().map(|s| s.to_string()));
+        v
+    }
+
+    #[test]
+    fn scratch_defaults_to_none() {
+        let a = parse_args(&argv(&[])).unwrap();
+        assert_eq!(a.scratch, None);
+    }
+
+    #[test]
+    fn scratch_parses_dir() {
+        let a = parse_args(&argv(&["--scratch", "/tmp/scratch"])).unwrap();
+        assert_eq!(a.scratch, Some(PathBuf::from("/tmp/scratch")));
+    }
 }
