@@ -4,6 +4,8 @@
 
 **Goal:** `--model-guided` 模式：reads 招募到模型转录本的基因分组 → 每组定向重组装 → 合并。dev1 F1 ≥ 15.5%。
 
+> **状态（2026-08-24 回填）:** 全部完成，Gate PASS。dev1 F1 15.52%（≥15.5 目标，历史最佳），dev2 14.4% / dev3 14.1% 均超 classic，holdout 3.9% 持平。详见 docs/opt-log.md M5 段。
+
 **Architecture:** orchestrate 加 model-guided 分支：归一化+prep 共享 → [自引导 or 外部模型] → minimap2 招募 → 基因分组 → 每组 mini-assembly（复用 run_mini 但输入为组内 reads）→ 合并 harvest。
 
 **Tech Stack:** 既有组件 + minimap2（外部进程，读 PAF）。
@@ -23,7 +25,7 @@ docs/opt-log.md
 
 **Files:** Create `crates/trinity-cli/src/model_guided.rs`
 
-- [ ] **Step 1: 基因聚类**
+- [x] **Step 1: 基因聚类**
 
 ```rust
 /// 模型转录本按 ≥50% 序列重叠聚类成"基因"（弱连通分量）。
@@ -32,7 +34,7 @@ pub fn cluster_transcripts_to_genes(model_fa: &[u8]) -> Result<Vec<Vec<usize>>, 
 ```
 实现：minimap2 self-alignment（`-x asm5 --secondary=no`），PAF 中 identity ≥80% 且 target 覆盖 ≥50% 的 transcript 对建边 → 并查集弱连通分量。
 
-- [ ] **Step 2: reads 招募**
+- [x] **Step 2: reads 招募**
 
 ```rust
 /// reads 比对到模型 → 按 best hit 分配到基因。
@@ -45,7 +47,7 @@ pub fn recruit_reads(
 ```
 实现：minimap2 `-x sr -t 8` reads vs model → PAF → 每 read 的 best hit（最高 identity×coverage）→ 找到 transcript → 找到其基因 → 加入组。PE 对：read 名去 /1//2 后缀匹配，两端命中取并集（任一端命中即入组）。
 
-- [ ] **Step 3: 组装合并**
+- [x] **Step 3: 组装合并**
 
 ```rust
 /// 每组跑 mini-assembly（inchworm→chrysalis→pogflow）→ 合并 + 去冗余。
@@ -57,7 +59,7 @@ pub fn assemble_groups(
 ```
 实现：每组 `run_mini`（recursive.rs 已有），结果拼合 → 全局去冗余（min_len + 全序列 HashSet）。
 
-- [ ] **Step 4: 测试**（合成集手推）
+- [x] **Step 4: 测试**（合成集手推; 实际落了 3 个单测: cluster_and_recruit_synthetic / pe_union_uses_either_mate / orphan_reads_assembled）
 
 ```rust
 #[test]
@@ -80,9 +82,9 @@ fn orphan_reads_assembled() {
 
 **Files:** Modify `crates/trinity-cli/src/{args,orchestrate}.rs`
 
-- [ ] **Step 1: args.rs** `pub model_guided: bool`（`--model-guided`）+ `pub model: Option<PathBuf>`（`--model <fa>`）
+- [x] **Step 1: args.rs** `pub model_guided: bool`（`--model-guided`）+ `pub model: Option<PathBuf>`（`--model <fa>`）
 
-- [ ] **Step 2: orchestrate.rs** 在归一化+prep 后（both.fa 就绪后）分支：
+- [x] **Step 2: orchestrate.rs** 在归一化+prep 后（both.fa 就绪后）分支：
 
 ```rust
 if args.model_guided {
@@ -96,7 +98,7 @@ if args.model_guided {
 3. 输出命名/gene_trans_map 与现有格式一致
 4. checkpoint `.model_guided.ok`
 
-- [ ] **Step 3: e2e 测试**（合成集）
+- [x] **Step 3: e2e 测试**（合成集; 当初以手工 e2e 验证并入档 opt-log——3 转录本 → 2 基因组, 150/150 reads 入组, 产出 3 条转录本 + gene_trans_map。**2026-08-24 补齐自动化用例 tests/model_guided_e2e.rs**, 对齐 M4 的 super_reads_e2e.rs 惯例）
 
 ---
 
@@ -109,3 +111,5 @@ cargo run -q --release -p xtask -- bench --tag m5-dev1 \
   -- --path-engine pogflow --model-guided --max_memory 16G
 ```
 Gate: F1 ≥ 15.5% → dev2/3；否则记录分析。
+
+> **结果: PASS** — dev1 F1 **15.52%**（R=8.6 P=83.6, N50=1735 n=8165）→ 跑齐 dev2（14.4%）/ dev3（14.1%）/ holdout（3.9%, 持平 classic）。全部入档 opt-log M5 段。

@@ -14,6 +14,7 @@ pub mod pair_paths;
 pub mod paths;
 pub mod pog;
 pub mod postprocess;
+pub mod protein_extend;
 pub mod prune;
 pub mod threading;
 

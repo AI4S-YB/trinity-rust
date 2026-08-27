@@ -102,6 +102,10 @@ pub struct TrinityArgs {
     pub model_guided: bool,
     /// `--model <fa>`: 模型转录本 fasta（--model-guided 的外部模型）。
     pub model: Option<PathBuf>,
+    /// `--protein-guided`（M6a）: DIAMOND 蛋白模板引导延长。
+    pub protein_guided: bool,
+    /// `--protein-db <fa>`: 蛋白库（--protein-guided 必需）。
+    pub protein_db: Option<PathBuf>,
 }
 
 /// `--max_memory 10G` → 字节。镜像原版 L1156 `^(\d+)G`（大小写不敏感）;
@@ -185,6 +189,8 @@ pub fn parse_args(argv: &[String]) -> Result<TrinityArgs, CliError> {
     let super_reads = cli.bool_flag("--super_reads");
     let model_guided = cli.bool_flag("--model-guided");
     let model = cli.value_flag("--model")?.map(PathBuf::from);
+    let protein_guided = cli.bool_flag("--protein-guided");
+    let protein_db = cli.value_flag("--protein-db")?.map(PathBuf::from);
     let path_engine: PathEngine = match cli.value_flag("--path-engine")? {
         None => PathEngine::Classic,
         Some(v) => v
@@ -248,6 +254,19 @@ pub fn parse_args(argv: &[String]) -> Result<TrinityArgs, CliError> {
             )));
         }
     }
+    if protein_guided {
+        let Some(db) = &protein_db else {
+            return Err(CliError::usage(
+                "Error, --protein-guided requires --protein-db <fa>",
+            ));
+        };
+        if !db.exists() {
+            return Err(CliError::usage(format!(
+                "Error, --protein-db file not found: {}",
+                db.display()
+            )));
+        }
+    }
     if let Some(m) = &model {
         if !model_guided {
             eprintln!(
@@ -281,5 +300,7 @@ pub fn parse_args(argv: &[String]) -> Result<TrinityArgs, CliError> {
         path_engine,
         model_guided,
         model,
+        protein_guided,
+        protein_db,
     })
 }

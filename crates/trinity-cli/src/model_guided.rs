@@ -24,7 +24,7 @@ use trinity_common::error::CommonError;
 use crate::recursive::{harvest_mini, run_mini, MiniParams};
 
 /// minimap2 可执行文件（环境变量 `TRINITY_MINIMAP2` 可覆盖）。
-fn minimap2_bin() -> &'static str {
+pub(crate) fn minimap2_bin() -> &'static str {
     static DEFAULT: &str = "/public/home/senior007/miniconda3/envs/cactus/bin/minimap2";
     match std::env::var("TRINITY_MINIMAP2") {
         Ok(v) if !v.is_empty() => Box::leak(v.into_boxed_str()),

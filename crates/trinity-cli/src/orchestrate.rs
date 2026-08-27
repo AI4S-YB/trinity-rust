@@ -554,6 +554,12 @@ pub fn run_trinity(args: &TrinityArgs) -> Result<PathBuf, CommonError> {
             )
         },
     )?;
+    // ---- 6b. 蛋白引导延长（M6a; checkpoint .protein_guided.ok）----
+    if args.protein_guided {
+        trinity_common::timer::timed(&outdir, "protein_guided", || {
+            crate::protein_guided::run_protein_guided(&listing, args, &outdir, &target_fa)
+        })?;
+    }
 
     // ---- 7. 汇总（无 checkpoint; 每次重写 Trinity.tmp.fasta, L1916/L1943）----
     let trinity_tmp = outdir.join("Trinity.tmp.fasta");
