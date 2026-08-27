@@ -84,24 +84,51 @@ Five crates plus an orchestrating CLI; the data flow mirrors the upstream pipeli
 
 ## Performance summary
 
-See `docs/benchmarks.md` (per-stage cross-checks) and `docs/opt-log.md` (end-to-end optimization log) for details.
+See `docs/benchmarks.md` (per-stage cross-checks and thread scaling) and `docs/opt-log.md` (end-to-end optimization log) for full records.
 
-**Compared to upstream Trinity v2.15.2 (C++/Perl/Java toolchain):**
+**End-to-end (real data: Arabidopsis DRR095137 prefix subset, 10M PE reads, ~1.1 GB gz):**
 
-- k-mer count+dump: ~3.2× faster than jellyfish count+dump at ~1/7 peak memory, with byte-equivalent output multisets (sample_data PE 100k reads, 4 threads).
-- inchworm: ~2× faster, ~14% lower peak RSS (single-threaded).
-- chrysalis full chain: ~1/3.2 peak RSS (147 MB vs 466 MB).
-- butterfly: nearly an order of magnitude faster on small components with ~27× lower peak RSS (no JVM startup/baseline overhead).
-- End-to-end full sample_data run (30575 PE reads, 8 threads): this port ~9 s vs upstream (incl. Perl/JVM) ~26 s.
+| Version | 8 threads | 64 threads | Notes |
+|---|---|---|---|
+| v0.0.1 (straight port) | ~54 min | not measured | porting baseline, metrics anchored to upstream |
+| v0.3.0 | ~17 min | 12:29 | algorithmic optimizations (see below) |
+| **v0.4.0** | **11:20 (-79%)** | **7:37** | IO/system-overhead optimizations |
 
-**Compared to this project's v0.0.1 straight port (end-to-end speed work in the current version):**
+Small-set end-to-end (upstream sample_data, full 30575 PE reads, 8 threads): this port ~9 s vs upstream (incl. Perl/JVM) ~26 s.
 
-- Arabidopsis real data (PE, `--CPU 8`) end-to-end wall time **54 min → 11.3 min (-79%)**, with assembly metrics identical to baseline.
-- Four optimizations: k-mer dump elimination (direct binary bridge, saves ~8 min), ReadsToTranscripts query structure 16.3×, normalization 3.6×, component partition writing 5.5× — all verified oracle/byte-level equivalent.
+**Per-stage vs upstream Trinity v2.15.2 (equal thread counts, best-of-3):**
+
+| Stage | Upstream wall / peak RSS | This port wall / peak RSS | Speedup | Memory |
+|---|---|---|---|---|
+| k-mer count+dump (100k reads, 4 threads) | jellyfish 0.95 s / 626 MB | 0.30 s / 86 MB | ~3.2× | ~1/7 |
+| inchworm (288k kmers, single-threaded) | 0.72 s / 26.1 MB | 0.37 s / 22.5 MB | ~2.0× | -14% |
+| chrysalis full chain (55 components, single-threaded) | 11.6 s / 466 MB | 9.9 s / 147 MB | ~1.2× | ~1/3.2 |
+| butterfly small component (c0, N=4342) | 1.15 s / 244 MB | 0.03 s / 9.2 MB | ~40× | ~1/27 |
+| butterfly mid components (c1/c2, N≈10k) | 1.7 s / ~420 MB | 0.6 s / ~380 MB | ~2.5× | on par |
+
+Note: the chrysalis ReadsToTranscripts stage initially did not scale with threads (slower than upstream at `-t 4`); its query structure was rebuilt in v0.3.0 (16.3×). The dramatic small-component butterfly gap is mostly upstream JVM startup and baseline overhead.
+
+**Thread scaling (v0.4.0, real data, `--max_memory 64G`):**
+
+| Threads | Wall | Peak RSS | Speedup |
+|---|---|---|---|
+| 8 | 11:20 | 22.7 GB | 1.00× |
+| 16 | 9:12 | 28.5 GB | 1.23× |
+| 32 | 8:00 | 33.7 GB | 1.42× |
+| 64 | 7:37 | 37.2 GB | 1.49× |
+
+Scaling saturates beyond 32 threads (32→64 yields only 1.05×); peak RSS grows with thread count (k-mer counter concurrent-accumulator effect). At this data scale, 16-32 threads is the sweet spot.
+
+**Optimization breakdown:**
+
+- v0.3.0 (algorithmic): k-mer dump elimination (direct binary bridge, saves ~8 min), ReadsToTranscripts packed hash index + sliding-window entropy (16.3×), parallel coverage statistics + rolling revcomp normalization (3.6×), batched component partition writes (5.5× — the original issued ~45M raw per-line syscalls).
+- v0.4.0 (IO/system overhead): normalization double-write elimination via hard links (-2.6 GB written), intermediates on a local scratch dir by default (`--scratch` is now the default; output dir stays clean), full component-data packing (~140k per-component files eliminated, butterfly stage 136 s → 31 s), direct fa emission from normalization, mimalloc as the global allocator (sys time -85%, page faults -96%).
+
+All optimizations carry oracle/byte-level equivalence verification; assembly metrics are identical to the porting baseline (see the tie-break divergence band above).
 
 ## Validation
 
-- `cargo test --workspace`: 534 unit tests / component cross-checks, all green.
+- `cargo test --workspace`: 543 unit tests / component cross-checks, all green.
 - Three-layer cross-validation (`cargo xtask`):
   - `xcheck-kmer / xcheck-inchworm / xcheck-chrysalis / xcheck-butterfly` — layers 1 and 2 (unit/pipeline level, checked against upstream binaries or goldens);
   - `xcheck-trinity [--full]` — layer 3 end-to-end: truncated (default 50000 PE reads) / full-scale full-pipeline cross-checks in both directions + eval statistics + both.fa cross-feed spot checks + SS(RF) synthetic small set; decision thresholds and calibration rationale in `docs/xcheck-trinity-report.md`;

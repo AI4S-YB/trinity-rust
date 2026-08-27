@@ -81,22 +81,49 @@ target/release/trinity-cli \
 
 详见 `docs/benchmarks.md`（分阶段对拍）与 `docs/opt-log.md`（端到端优化记录）。
 
-**相较原版 Trinity v2.15.2（C++/Perl/Java 工具链）：**
+**端到端（真实数据：拟南芥 DRR095137 前缀子集，1000 万 PE reads，~1.1 GB gz）：**
 
-- k-mer 计数+dump：比 jellyfish count+dump 快 ~3.2×、峰值内存 ~1/7，输出多重集逐字节等价（sample_data PE 100k reads，4 线程）。
-- inchworm：约 2× 快，峰值内存低 ~14%（单线程）。
-- chrysalis 全链：峰值内存 ~1/3.2（147 MB vs 466 MB）。
-- butterfly：小组件快近一个量级、峰值内存低 ~27×（无 JVM 启动与基线开销）。
-- 端到端 sample_data 全量（30575 PE reads，8 线程）：本实现 ~9 s vs 原版（含 Perl/JVM）~26 s。
+| 版本 | 8 线程 | 64 线程 | 说明 |
+|---|---|---|---|
+| v0.0.1（直移植版） | ~54 min | 未测 | 移植基线，指标锚定原版 |
+| v0.3.0 | ~17 min | 12:29 | 算法级优化（见下） |
+| **v0.4.0** | **11:20（-79%）** | **7:37** | IO/系统开销优化 |
 
-**相较本项目的 v0.0.1 移植版（当前版本的端到端速度优化）：**
+端到端小集（原版 sample_data 全量 30575 PE reads，8 线程）：本实现 ~9 s vs 原版（含 Perl/JVM）~26 s。
 
-- 拟南芥真实数据（PE，`--CPU 8`）端到端 wall time **54 min → 11.3 min（-79%）**，组装指标与基线一致。
-- 四项优化：k-mer dump 落盘消除（二进制直桥，省 ~8 min）、ReadsToTranscripts 查询结构 16.3×、归一化 3.6×、组件分区写出 5.5×；全部带 oracle/字节级等价验证。
+**分阶段对比原版 Trinity v2.15.2（同等线程，3 次复测取代表值）：**
+
+| 阶段 | 原版 wall / 峰值 RSS | 本实现 wall / 峰值 RSS | 加速 | 内存 |
+|---|---|---|---|---|
+| k-mer 计数+dump（100k reads，4 线程） | jellyfish 0.95 s / 626 MB | 0.30 s / 86 MB | ~3.2× | ~1/7 |
+| inchworm（28.8 万 k-mer，单线程） | 0.72 s / 26.1 MB | 0.37 s / 22.5 MB | ~2.0× | -14% |
+| chrysalis 全链（55 组件，单线程） | 11.6 s / 466 MB | 9.9 s / 147 MB | ~1.2× | ~1/3.2 |
+| butterfly 小组件（c0, N=4342） | 1.15 s / 244 MB | 0.03 s / 9.2 MB | ~40× | ~1/27 |
+| butterfly 中组件（c1/c2, N≈1 万） | 1.7 s / ~420 MB | 0.6 s / ~380 MB | ~2.5× | 持平 |
+
+注：chrysalis 的 ReadsToTranscripts 阶段在移植初期多线程未生效（-t 4 一度慢于原版），v0.3.0 已重做其查询结构（16.3×）。butterfly 小组件的悬殊差距主要来自原版 JVM 启动与基线开销。
+
+**线程扩展性（v0.4.0，真实数据，`--max_memory 64G`）：**
+
+| 线程 | wall | 峰值 RSS | 加速比 |
+|---|---|---|---|
+| 8 | 11:20 | 22.7 GB | 1.00× |
+| 16 | 9:12 | 28.5 GB | 1.23× |
+| 32 | 8:00 | 33.7 GB | 1.42× |
+| 64 | 7:37 | 37.2 GB | 1.49× |
+
+32 线程后趋于饱和（32→64 仅 1.05×）；峰值内存随线程数上升（k-mer 计数器并发累加器效应）。本数据规模推荐 16-32 线程。
+
+**速度优化技术分解：**
+
+- v0.3.0（算法级）：k-mer dump 落盘消除（二进制直桥，省 ~8 min）、ReadsToTranscripts 打包哈希索引 + 滑窗熵（16.3×）、归一化并行覆盖统计 + 滚动 revcomp（3.6×）、组件分区批量写出（5.5×，原实现每行裸写 ~45M 次系统调用）。
+- v0.4.0（IO/系统开销）：归一化双写消重（-2.6 GB 写）、中间产物默认落本地临时目录（`--scratch` 默认化，输出目录零中间文件）、组件数据全量打包（消灭 ~14 万 per-component 小文件，butterfly 阶段 136 s → 31 s）、归一化直出 fa、mimalloc 全局分配器（sys time -85%，页面错误 -96%）。
+
+所有优化均带 oracle/字节级等价验证，组装指标与移植基线一致（并行平局序不确定带见"差异"节）。完整记录见 `docs/benchmarks.md` 与 `docs/opt-log.md`。
 
 ## 验证
 
-- `cargo test --workspace`：534 项单测/组件对拍全绿。
+- `cargo test --workspace`：543 项单测/组件对拍全绿。
 - 三层交叉验证（`cargo xtask`）：
   - `xcheck-kmer / xcheck-inchworm / xcheck-chrysalis / xcheck-butterfly`——第 1、2 层（单元/管线级，对拍原版二进制或黄金）；
   - `xcheck-trinity [--full]`——第 3 层端到端：截断（默认 50000 PE reads）/全量双侧全管线对拍 + eval 统计 + both.fa 互喂抽查 + SS(RF) 合成小集；判定阈值与校准依据见 `docs/xcheck-trinity-report.md`。
