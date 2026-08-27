@@ -721,7 +721,7 @@ pub fn run(argv: &[String]) -> i32 {
     let mut out = String::with_capacity(1 << 20);
     out.push_str(TSV_HEADER);
     out.push('\n');
-    let (mut n_pos, mut s1, mut s2, mut s3) = (0usize, 0usize, 0usize, 0usize);
+    let (mut n_pos, mut s_unk, mut s1, mut s2, mut s3) = (0usize, 0usize, 0usize, 0usize, 0usize);
     for c in &cands {
         let (orf_aa, orf_frac, orf_m) = orf_features(&c.seq);
         let cov = cov_features(&counts, &c.seq);
@@ -729,6 +729,7 @@ pub fn run(argv: &[String]) -> i32 {
         let label = if is_positive(qc) { 1 } else { 0 };
         n_pos += label;
         match c.support {
+            -1 => s_unk += 1, // classic 引擎无 support 字段
             1 => s1 += 1,
             2 => s2 += 1,
             _ => s3 += 1,
@@ -761,10 +762,11 @@ pub fn run(argv: &[String]) -> i32 {
     std::fs::write(&tsv, &out).unwrap_or_else(|e| panic!("write {tsv}: {e}"));
     eprintln!("[export-candidates] 写出 {tsv}");
     eprintln!(
-        "[export-candidates] 正例 {} / {}（{:.2}%）; support 分布: =1: {}, =2: {}, ≥3: {}",
+        "[export-candidates] 正例 {} / {}（{:.2}%）; support 分布: 未知(classic): {}, =1: {}, =2: {}, ≥3: {}",
         n_pos,
         cands.len(),
         100.0 * n_pos as f64 / cands.len().max(1) as f64,
+        s_unk,
         s1,
         s2,
         s3
