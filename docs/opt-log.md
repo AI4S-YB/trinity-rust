@@ -1209,4 +1209,31 @@ in-edge 回溯拼接）（3) 50 候选竞争取最长 contig（4) **迭代收缩
   支持（候选竞争标准从"最长"改"read 支持加权", 延伸门卫加 read 判定）
   ——python 原型可先验证, 成则 Rust 化。
 - 脚本: probe_gtasm_decode.py, gt_decode.py。
+
+## 杂交终测: read 局部证据在强解码下也无增量, python 原型到顶（2026-08-28, gt_decode2）
+
+GTasm 解码 × butterfly read 支持（edge_support）三变体:
+(A) 贪心候选分 = GT×支持因子 (B) 竞争标准 = read 支持总量 (C) A+B:
+
+| 变体 | R_full | R70 |
+|---|---|---|
+| 基线 GT×GTasm | 11.9% | 48.6% |
+| A / B / C | 11.9 / 11.8 / 11.7% | 48.5 / 48.4 / 48.3% |
+
+**全部打平**——与 oracle+triplet 互证: 24-mer 图上边级/triplet 级 read
+证据无判别力（图的边本就来自 read 相邻, 支持数与 GT 计数特征同源）。
+butterfly read 绑定的真实威力在**长程跨度**（read 的 PairPath 完整路径
+锁定 walk 不越过转录本边界, look-back 2500bp 语义）——那是 butterfly
+本体, python 重写无意义。
+
+### 全线终局（dev1 python 原型）
+
+- 分数通道: GT 可泛化分数 = oracle 上界（11.8 vs 11.9）——饱和。
+- 解码框架: GTasm 式（采样/双向/竞争/收缩）+1.4pp——已吸收。
+- read 局部证据（边支持/triplet）: 双重证伪——无增量。
+- 剩余 2.2pp（vs classic）= butterfly 的 read 长程绑定。
+- **可行动作**: (a) Rust 化——把 GTasm 解码思想（起点采样/双向/迭代收缩）
+  与 GT 分数先验加进 butterfly 本体（M5 终极形态, 与 read 绑定互补）;
+  (b) GT×GTasm 解码原型作为"无 read-threading 管线场景的轻量路径"保留。
+- 脚本: gt_decode2.py, gt_scores.pkl（GT 分数缓存）。
 | 2026-08-27 | dev1 | R=14.0% P=81.4% **F1=23.9%** | N50=1836 n=7835 | --CPU 8 --max_memory 8G |
