@@ -18,6 +18,13 @@ pub struct Metrics {
     pub r_full_p: f64,
     pub r70_p: f64,
     pub refs_principal: usize,
+    /// 高覆盖 principal 子集（reads 并集覆盖 >= HC_COV_THRESHOLD）上的召回。
+    /// 依据 2026-08-28 尸检: full 率被 read 铺满度单变量决定, 全体口径被
+    /// ~85% 无数据参照稀释; 高覆盖子集上算法差异才显形（dev1: 全体差 0.7pp
+    /// vs >=0.95 子集差 1.2-2.1pp）。
+    pub r_full_hc: f64,
+    pub r70_hc: f64,
+    pub refs_hc: usize,
     pub precision: f64, // 碱基级
     pub f1: f64,
     pub n50: usize,
@@ -40,12 +47,17 @@ fn principal_set(ref_lens: &HashMap<String, usize>) -> HashMap<String, usize> {
     best.into_values().map(|(n, l)| (n.to_string(), l)).collect()
 }
 
+/// 高覆盖子集阈值: reads 并集覆盖 >= 0.95 的 principal 参照进入 hc 口径。
+pub const HC_COV_THRESHOLD: f64 = 0.95;
+
 /// PAF 行: q qlen qs qe strand t tlen ts te mch aln ...
 /// ref_lens: 参照名→长度; denovo_lens: de novo 名→长度
+/// hc_cov: Some(参照名→reads 覆盖并集) 时启用高覆盖子集口径（r_full_hc 等）。
 pub fn compute_metrics(
     paf: &str,
     ref_lens: &HashMap<String, usize>,
     denovo_lens: &HashMap<String, usize>,
+    hc_cov: Option<&HashMap<String, f64>>,
 ) -> Metrics {
     let mut best: HashMap<&str, Option<(f64, f64)>> = HashMap::new(); // ref -> best (cov, ident)（按 cov*ident 取）; None=未见命中
     let mut qhit: HashMap<&str, usize> = HashMap::new();
@@ -107,6 +119,26 @@ pub fn compute_metrics(
             }
         }
     }
+    // 高覆盖子集: principal ∩ {reads 覆盖 >= 阈值}
+    let mut r_full_hc = 0usize;
+    let mut r70_hc = 0usize;
+    let mut refs_hc = 0usize;
+    if let Some(covs) = hc_cov {
+        for t in principal.keys() {
+            if covs.get(t.as_str()).copied().unwrap_or(0.0) < HC_COV_THRESHOLD {
+                continue;
+            }
+            refs_hc += 1;
+            if let Some(Some((cov, ident))) = best.get(t.as_str()) {
+                if *cov >= 0.95 && *ident >= 0.95 {
+                    r_full_hc += 1;
+                }
+                if *cov >= 0.70 && *ident >= 0.90 {
+                    r70_hc += 1;
+                }
+            }
+        }
+    }
     let total_bases: usize = denovo_lens.values().sum();
     let hit_bases: usize = qhit.values().sum();
     let precision = if total_bases > 0 {
@@ -155,6 +187,17 @@ pub fn compute_metrics(
             0.0
         },
         refs_principal: principal.len(),
+        r_full_hc: if refs_hc > 0 {
+            r_full_hc as f64 / refs_hc as f64
+        } else {
+            0.0
+        },
+        r70_hc: if refs_hc > 0 {
+            r70_hc as f64 / refs_hc as f64
+        } else {
+            0.0
+        },
+        refs_hc,
         precision,
         f1,
         n50,
@@ -206,6 +249,97 @@ fn bench_root() -> PathBuf {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("/storage/home/senior007/test/athal"))
         .join("bench")
+}
+
+/// reads→ref 的并集覆盖（minimap2 -x sr, mapq>=5）, 参照名 → 覆盖比例。
+/// 结果按 (ref 内容, reads 内容) 的 sha256 前 8 hex 缓存于 bench cache/refcov_*.tsv。
+fn read_coverage(reff: &str, read_files: &[&str], rcontents: &[Vec<u8>]) -> Option<HashMap<String, f64>> {
+    let ref_bytes = std::fs::read(reff).unwrap_or_default();
+    let mut h = Sha256::new();
+    h.update(&ref_bytes);
+    for r in rcontents {
+        h.update(r);
+        h.update([0u8]);
+    }
+    let kh: String = h.finalize().iter().take(8).map(|b| format!("{b:02x}")).collect();
+    let cache = bench_root().join("cache").join(format!("refcov_{kh}.tsv"));
+    if cache.exists() {
+        let mut m = HashMap::new();
+        for line in std::fs::read_to_string(&cache).unwrap_or_default().lines() {
+            if let Some((n, v)) = line.split_once('\t') {
+                if let Ok(c) = v.parse::<f64>() {
+                    m.insert(n.to_string(), c);
+                }
+            }
+        }
+        if !m.is_empty() {
+            return Some(m);
+        }
+    }
+    let mut cmd = std::process::Command::new(MINIMAP2);
+    cmd.args(["-x", "sr", "-t", "8"]).arg(reff);
+    for r in read_files {
+        cmd.arg(r);
+    }
+    let out = match cmd.output() {
+        Ok(o) if o.status.success() => o,
+        Ok(o) => {
+            eprintln!(
+                "[bench] 覆盖度 minimap2 sr 失败 ({}), 跳过 hc 口径: {}",
+                o.status,
+                String::from_utf8_lossy(&o.stderr)
+            );
+            return None;
+        }
+        Err(e) => {
+            eprintln!("[bench] 无法启动 minimap2 sr, 跳过 hc 口径: {e}");
+            return None;
+        }
+    };
+    // 每参照收集命中区间 -> 并集 / tlen
+    type IvMap<'a> = HashMap<&'a str, (usize, Vec<(usize, usize)>)>;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let mut ivs: IvMap = HashMap::new();
+    for line in stdout.lines() {
+        let f: Vec<&str> = line.split('\t').collect();
+        if f.len() < 12 || f[11].parse::<u32>().unwrap_or(0) < 5 {
+            continue;
+        }
+        let (Ok(tlen), Ok(ts), Ok(te)) = (
+            f[6].parse::<usize>(),
+            f[7].parse::<usize>(),
+            f[8].parse::<usize>(),
+        ) else {
+            continue;
+        };
+        ivs.entry(f[5]).or_insert_with(|| (tlen, Vec::new())).1.push((ts, te));
+    }
+    let mut m = HashMap::new();
+    for (name, (tlen, mut v)) in ivs {
+        v.sort_unstable();
+        let mut cov = 0usize;
+        let mut cur: Option<(usize, usize)> = None;
+        for (s, e) in v {
+            match cur {
+                None => cur = Some((s, e)),
+                Some((cs, ce)) if s <= ce => cur = Some((cs, ce.max(e))),
+                Some((cs, ce)) => {
+                    cov += ce - cs;
+                    cur = Some((s, e));
+                }
+            }
+        }
+        if let Some((cs, ce)) = cur {
+            cov += ce - cs;
+        }
+        m.insert(name.to_string(), cov as f64 / tlen.max(1) as f64);
+    }
+    let text: String = m
+        .iter()
+        .map(|(n, c)| format!("{n}\t{c:.4}\n"))
+        .collect();
+    let _ = std::fs::write(&cache, text);
+    Some(m)
 }
 
 pub fn run(argv: &[String]) -> i32 {
@@ -336,7 +470,8 @@ pub fn run(argv: &[String]) -> i32 {
     let paf = String::from_utf8_lossy(&paf.stdout).to_string();
     let ref_lens = read_fasta_lens(std::path::Path::new(&reff)).unwrap();
     let dn = read_fasta_lens(&final_fa).unwrap();
-    let m = compute_metrics(&paf, &ref_lens, &dn);
+    let covs = read_coverage(&reff, &read_files, &rcontents);
+    let m = compute_metrics(&paf, &ref_lens, &dn, covs.as_ref());
     // 蛋白级回收: DIAMOND blastx vs --prot-ref（缺省: --ref 最长 ORF 翻译, 缓存于 cache 目录）
     let (p_full, p70, prot_total) = {
         let pm_dir = dir.join("protein_metric");
@@ -419,12 +554,15 @@ pub fn run(argv: &[String]) -> i32 {
     std::fs::write(
         dir.join("metrics.json"),
         format!(
-            "{{\"tag\":\"{tag}\",\"date\":\"{}\",\"r_full\":{:.4},\"r70\":{:.4},\"r_full_p\":{:.4},\"r70_p\":{:.4},\"precision\":{:.4},\"f1\":{:.4},\"n50\":{},\"n\":{},\"p_full\":{:.4},\"p70\":{:.4},\"prot_total\":{},\"args\":\"{}\"{jfields}}}\n",
+            "{{\"tag\":\"{tag}\",\"date\":\"{}\",\"r_full\":{:.4},\"r70\":{:.4},\"r_full_p\":{:.4},\"r70_p\":{:.4},\"r_full_hc\":{:.4},\"r70_hc\":{:.4},\"refs_hc\":{},\"precision\":{:.4},\"f1\":{:.4},\"n50\":{},\"n\":{},\"p_full\":{:.4},\"p70\":{:.4},\"prot_total\":{},\"args\":\"{}\"{jfields}}}\n",
             chrono_free_date(),
             m.r_full,
             m.r70,
             m.r_full_p,
             m.r70_p,
+            m.r_full_hc,
+            m.r70_hc,
+            m.refs_hc,
             m.precision,
             m.f1,
             m.n50,
@@ -437,8 +575,8 @@ pub fn run(argv: &[String]) -> i32 {
     )
     .unwrap();
     // 报告 + 日志
-    println!("== bench[{tag}] {key} ==\n  转录本 {}/{} | R={:.1}% R70={:.1}% Rp={:.1}% R70p={:.1}% (principal {}/{}) | P={:.1}% F1={:.1}% | N50={} | P_full={:.1}% P70={:.1}%",
-        m.denovo_total, m.refs_total, 100.0*m.r_full, 100.0*m.r70, 100.0*m.r_full_p, 100.0*m.r70_p, m.refs_principal, m.refs_total, 100.0*m.precision, 100.0*m.f1, m.n50, 100.0 * p_full, 100.0 * p70);
+    println!("== bench[{tag}] {key} ==\n  转录本 {}/{} | R={:.1}% R70={:.1}% Rp={:.1}% R70p={:.1}% (principal {}/{}) | HC(n={}) R={:.1}% R70={:.1}% | P={:.1}% F1={:.1}% | N50={} | P_full={:.1}% P70={:.1}%",
+        m.denovo_total, m.refs_total, 100.0*m.r_full, 100.0*m.r70, 100.0*m.r_full_p, 100.0*m.r70_p, m.refs_principal, m.refs_total, m.refs_hc, 100.0*m.r_full_hc, 100.0*m.r70_hc, 100.0*m.precision, 100.0*m.f1, m.n50, 100.0 * p_full, 100.0 * p70);
     let log = concat!(env!("CARGO_MANIFEST_DIR"), "/../docs/opt-log.md");
     // 文件头并发注释（幂等: 已存在则不重复）
     {
@@ -817,10 +955,39 @@ mod tests {
         // d1 全长命中 STRG.1.2; d1 部分命中 STRG.1.1; STRG.2.1 无 hit
         let paf = "d1\t2000\t0\t1200\t+\tSTRG.1.2\t1200\t0\t1200\t1200\t1200\n\
                    d1\t2000\t0\t500\t+\tSTRG.1.1\t500\t0\t500\t500\t500\n";
-        let m = compute_metrics(paf, &refs, &dn);
+        let m = compute_metrics(paf, &refs, &dn, None);
         assert_eq!(m.refs_principal, 2);
         assert!((m.r_full_p - 0.5).abs() < 1e-9); // 仅 STRG.1.2 达标
         assert!((m.r70_p - 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn hc_recall_counts_high_cov_principal_only() {
+        // 两条 principal: STRG.1.2 高覆盖且 full, STRG.2.1 低覆盖（不入 hc 集）;
+        // STRG.3.1 高覆盖但无 hit（计入分母不计分子）。
+        let refs = hm(&[
+            ("STRG.1.1", 500),
+            ("STRG.1.2", 1200),
+            ("STRG.2.1", 800),
+            ("STRG.3.1", 900),
+        ]);
+        let dn = hm(&[("d1", 2000)]);
+        let paf = "d1\t2000\t0\t1200\t+\tSTRG.1.2\t1200\t0\t1200\t1200\t1200\n";
+        let covs: HashMap<String, f64> = [
+            ("STRG.1.2".to_string(), 0.99),
+            ("STRG.2.1".to_string(), 0.60), // 低覆盖 → 排除出 hc
+            ("STRG.3.1".to_string(), 0.97),
+        ]
+        .into_iter()
+        .collect();
+        let m = compute_metrics(paf, &refs, &dn, Some(&covs));
+        assert_eq!(m.refs_hc, 2); // STRG.1.2 + STRG.3.1
+        assert!((m.r_full_hc - 0.5).abs() < 1e-9);
+        assert!((m.r70_hc - 0.5).abs() < 1e-9);
+        // 无覆盖表时 hc 为空
+        let m0 = compute_metrics(paf, &refs, &dn, None);
+        assert_eq!(m0.refs_hc, 0);
+        assert!((m0.r_full_hc - 0.0).abs() < 1e-9);
     }
 
     #[test]
@@ -834,7 +1001,7 @@ mod tests {
                    d2\t400\t0\t400\t+\tr2\t500\t100\t500\t390\t400\n\
                    d3\t100\t0\t50\t+\tr1\t1000\t0\t50\t30\t50\n";
         // d3 id=30/50=0.6 <0.95 不计精确度; d1/d2 全量计入
-        let m = compute_metrics(paf, &ref_l, &dn_l);
+        let m = compute_metrics(paf, &ref_l, &dn_l, None);
         assert_eq!(m.refs_total, 2);
         assert!((m.r_full - 0.5).abs() < 1e-9); // r1 全长
         assert!((m.r70 - 1.0).abs() < 1e-9); // r1+r2
@@ -845,7 +1012,7 @@ mod tests {
     #[test]
     fn n50_case() {
         let dn_l = hm(&[("a", 100), ("b", 900), ("c", 400)]);
-        let m = compute_metrics("", &HashMap::new(), &dn_l);
+        let m = compute_metrics("", &HashMap::new(), &dn_l, None);
         assert_eq!(m.n50, 900); // total 1400, half 700, 900 先跨过
         assert!((m.precision - 0.0).abs() < 1e-9);
         assert_eq!(m.denovo_total, 3);
