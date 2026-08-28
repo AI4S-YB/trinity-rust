@@ -13,10 +13,31 @@ pub struct Metrics {
     pub refs_total: usize,
     pub r_full: f64,    // ≥95%cov & ≥95%id
     pub r70: f64,       // ≥70%cov & ≥90%id
+    /// 主口径（2026-08-28 起基线）: 每基因最长 isoform 子集上的召回。
+    /// 基因 = 参照名去最后一个 '.iso' 后缀（StringTie STRG.G.I 命名）。
+    pub r_full_p: f64,
+    pub r70_p: f64,
+    pub refs_principal: usize,
     pub precision: f64, // 碱基级
     pub f1: f64,
     pub n50: usize,
     pub denovo_total: usize,
+}
+
+/// 参照名集合 -> 每基因（最后 '.' 前缀）最长 isoform 子集。
+fn principal_set(ref_lens: &HashMap<String, usize>) -> HashMap<String, usize> {
+    let mut best: HashMap<&str, (&str, usize)> = HashMap::new();
+    for (name, len) in ref_lens {
+        let gene = name.rsplit_once('.').map(|(g, _)| g).unwrap_or(name);
+        let replace = match best.get(gene) {
+            Some((_, l)) => *l < *len,
+            None => true,
+        };
+        if replace {
+            best.insert(gene, (name.as_str(), *len));
+        }
+    }
+    best.into_values().map(|(n, l)| (n.to_string(), l)).collect()
 }
 
 /// PAF 行: q qlen qs qe strand t tlen ts te mch aln ...
@@ -63,14 +84,27 @@ pub fn compute_metrics(
         }
     }
     let refs_total = ref_lens.len();
+    let principal = principal_set(ref_lens);
     let mut r_full = 0usize;
     let mut r70 = 0usize;
-    for &(cov, ident) in best.values().flatten() {
+    let mut r_full_p = 0usize;
+    let mut r70_p = 0usize;
+    for (t, pv) in best.iter() {
+        let Some((cov, ident)) = pv else { continue };
+        let (cov, ident) = (*cov, *ident);
         if cov >= 0.95 && ident >= 0.95 {
             r_full += 1;
         }
         if cov >= 0.70 && ident >= 0.90 {
             r70 += 1;
+        }
+        if principal.contains_key(*t) {
+            if cov >= 0.95 && ident >= 0.95 {
+                r_full_p += 1;
+            }
+            if cov >= 0.70 && ident >= 0.90 {
+                r70_p += 1;
+            }
         }
     }
     let total_bases: usize = denovo_lens.values().sum();
@@ -110,6 +144,17 @@ pub fn compute_metrics(
         } else {
             0.0
         },
+        r_full_p: if !principal.is_empty() {
+            r_full_p as f64 / principal.len() as f64
+        } else {
+            0.0
+        },
+        r70_p: if !principal.is_empty() {
+            r70_p as f64 / principal.len() as f64
+        } else {
+            0.0
+        },
+        refs_principal: principal.len(),
         precision,
         f1,
         n50,
@@ -374,10 +419,12 @@ pub fn run(argv: &[String]) -> i32 {
     std::fs::write(
         dir.join("metrics.json"),
         format!(
-            "{{\"tag\":\"{tag}\",\"date\":\"{}\",\"r_full\":{:.4},\"r70\":{:.4},\"precision\":{:.4},\"f1\":{:.4},\"n50\":{},\"n\":{},\"p_full\":{:.4},\"p70\":{:.4},\"prot_total\":{},\"args\":\"{}\"{jfields}}}\n",
+            "{{\"tag\":\"{tag}\",\"date\":\"{}\",\"r_full\":{:.4},\"r70\":{:.4},\"r_full_p\":{:.4},\"r70_p\":{:.4},\"precision\":{:.4},\"f1\":{:.4},\"n50\":{},\"n\":{},\"p_full\":{:.4},\"p70\":{:.4},\"prot_total\":{},\"args\":\"{}\"{jfields}}}\n",
             chrono_free_date(),
             m.r_full,
             m.r70,
+            m.r_full_p,
+            m.r70_p,
             m.precision,
             m.f1,
             m.n50,
@@ -390,8 +437,8 @@ pub fn run(argv: &[String]) -> i32 {
     )
     .unwrap();
     // 报告 + 日志
-    println!("== bench[{tag}] {key} ==\n  转录本 {}/{} | R={:.1}% R70={:.1}% P={:.1}% F1={:.1}% | N50={} | P_full={:.1}% P70={:.1}%",
-        m.denovo_total, m.refs_total, 100.0*m.r_full, 100.0*m.r70, 100.0*m.precision, 100.0*m.f1, m.n50, 100.0 * p_full, 100.0 * p70);
+    println!("== bench[{tag}] {key} ==\n  转录本 {}/{} | R={:.1}% R70={:.1}% Rp={:.1}% R70p={:.1}% (principal {}/{}) | P={:.1}% F1={:.1}% | N50={} | P_full={:.1}% P70={:.1}%",
+        m.denovo_total, m.refs_total, 100.0*m.r_full, 100.0*m.r70, 100.0*m.r_full_p, 100.0*m.r70_p, m.refs_principal, m.refs_total, 100.0*m.precision, 100.0*m.f1, m.n50, 100.0 * p_full, 100.0 * p70);
     let log = concat!(env!("CARGO_MANIFEST_DIR"), "/../docs/opt-log.md");
     // 文件头并发注释（幂等: 已存在则不重复）
     {
@@ -750,6 +797,30 @@ mod tests {
 
     fn hm(pairs: &[(&str, usize)]) -> HashMap<String, usize> {
         pairs.iter().map(|(a, b)| (a.to_string(), *b)).collect()
+    }
+
+    #[test]
+    fn principal_set_picks_longest_per_gene() {
+        let refs = hm(&[("STRG.1.1", 900), ("STRG.1.2", 1500), ("STRG.2.1", 300), ("nodot", 42)]);
+        let p = principal_set(&refs);
+        assert_eq!(p.len(), 3);
+        assert_eq!(p["STRG.1.2"], 1500);
+        assert_eq!(p["STRG.2.1"], 300);
+        assert_eq!(p["nodot"], 42);
+    }
+
+    #[test]
+    fn principal_recall_counts_subset() {
+        // STRG.1.1(短) 与 STRG.1.2(长=principal); STRG.2.1(principal)
+        let refs = hm(&[("STRG.1.1", 500), ("STRG.1.2", 1200), ("STRG.2.1", 800)]);
+        let dn = hm(&[("d1", 2000)]);
+        // d1 全长命中 STRG.1.2; d1 部分命中 STRG.1.1; STRG.2.1 无 hit
+        let paf = "d1\t2000\t0\t1200\t+\tSTRG.1.2\t1200\t0\t1200\t1200\t1200\n\
+                   d1\t2000\t0\t500\t+\tSTRG.1.1\t500\t0\t500\t500\t500\n";
+        let m = compute_metrics(paf, &refs, &dn);
+        assert_eq!(m.refs_principal, 2);
+        assert!((m.r_full_p - 0.5).abs() < 1e-9); // 仅 STRG.1.2 达标
+        assert!((m.r70_p - 0.5).abs() < 1e-9);
     }
 
     #[test]

@@ -1318,4 +1318,22 @@ junction 用 SAM 输出（PAF 无 N gap, cg 全 M/I/D）, 坐标 (donor, accepto
   做软权重会被已饱和的分数通道吸收。
 - 裁定: 证伪收档。框架轴的剩余空间仍指向 read 长程绑定（唯一未搬进
   python 的组件）。
+
+## 评判基线变更: principal isoform 口径正式化（2026-08-28, bench.rs）
+
+用户裁定: 此后主评判指标 = **每基因最长 isoform 子集上的召回**
+（主力转录本口径, R_full_p/R70_p）; 原全参照口径保留作参考。
+
+- 依据: GT 原型 vs classic 的差距集中在次要 isoform（全口径 R_full
+  -1.8pp vs principal 口径 -0.7pp, R70 -3.5 vs -1.8pp）——主力转录本上
+  两者几乎打平, 且 GT 原型 precision/junction 精确率反超, "每基因一条
+  主力转录本"的生态位（功能注释/ORF 预测）性价比成立。
+- 实现: `bench.rs` Metrics 加 r_full_p/r70_p/refs_principal;
+  principal_set 按参照名最后 '.' 前缀分组取最长（StringTie STRG.G.I
+  命名）; stdout/metrics.json 同步输出; 2 个新单测, 17 测试全绿,
+  clippy 零警告。
+- dev1 验证: Rp=10.7% R70p=50.8% (5190 principal) 与手算一字不差。
+- 基线数字（principal 口径）: classic R_full_p 10.7% (557/5190) /
+  R70_p 50.8%; GT 原型 10.0% (520) / 49.0%。
 | 2026-08-27 | dev1 | R=14.0% P=81.4% **F1=23.9%** | N50=1836 n=7835 | --CPU 8 --max_memory 8G |
+| 2026-08-28 | dev1 | R=14.0% P=81.4% **F1=23.9%** | N50=1836 n=7835 | --CPU 8 --max_memory 8G |
