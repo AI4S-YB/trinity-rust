@@ -1145,4 +1145,39 @@ Oracle = 边分数直接用参照路径信息（参照滑窗相邻顶点对 = 68
   弱衍生特征≈图内覆盖度同源; 近缘种特征（M10, 无泄漏）是唯一尚存的
   特征增量, 但同样会被 walk 天花板压住——**先修框架再谈特征**。
 - GT 分数的正确归宿: 进 butterfly 内部（M5 形态, 强框架×强分数）。
+
+## Butterfly 源码审计: 解图"重点应用"什么（2026-08-28, paths.rs + oracle+triplet）
+
+用户裁定背答案也失败后审计 classic 引擎的路径选择核心
+（crates/trinity-butterfly/src/paths.rs, get_all_probable_paths L731）:
+
+1. **Read threading 路径绑定**（ReadHash: 顶点→PairPath→计数）——每条候选
+   路径动态绑定"跟随它的 reads 集合", 延伸门卫 path_has_enough_read_support
+   （L694）= look-back 2500bp 子路径的 read 包含判定（≥2 条 read 支持才延伸）。
+2. **Triplet 方向锁定**（L844-863）: 分叉处只允许 read 观察过的 w→v→u 连续组合。
+3. **路径族结构**: 每 comp 维护多路径（max_paths_per_node_extend=25）,
+   read 支持数排序竞争 + 裸边保底播种（未被任何路径用的边重启新路径,
+   保 isoform 多样性）+ S/T 哨兵全源全汇。
+4. **核心认知: butterfly 的选路单位是"路径×read 集合"的动态绑定**,
+   不是边分数。
+
+### oracle+triplet 验证（probe_oracle2, read 链 707 万 triplet）
+
+oracle 基础分 × triplet 支持数加成: **9.7%/43.8%**（vs oracle 9.6/43.4）——
+triplet 在 24-mer 图上无增量。机制: 图的边本就来自 reads 的 k-mer 相邻,
+**任何分叉支路都有 read 跨过**（triplet 种类 707 万 ≈ 边数 683 万）,
+单步 read 组合证据在 k-mer 图上无判别力; butterfly 的威力来自
+路径族×read 绑定的**全局**结构, 非单步锁定。
+
+### 终局图景
+
+| 分数 | walk 框架 | butterfly 框架 |
+|---|---|---|
+| 计数/GBM（0.94） | 8.7% | — |
+| GT（0.94, 软分数） | 10.4% | **未测（M5 形态, 唯一空白）** |
+| oracle（1.0 背答案） | 9.6% | — |
+| （butterfly 自身 read 证据） | — | 14.0% |
+
+walk 框架已三重证伪（分数质量无关）; butterfly 框架 × 外部分数
+（GT/近缘种先验）是唯一未测组合, 也是 M5/M10 当年的立项逻辑。
 | 2026-08-27 | dev1 | R=14.0% P=81.4% **F1=23.9%** | N50=1836 n=7835 | --CPU 8 --max_memory 8G |
