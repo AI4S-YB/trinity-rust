@@ -1236,4 +1236,38 @@ butterfly read 绑定的真实威力在**长程跨度**（read 的 PairPath 完�
   与 GT 分数先验加进 butterfly 本体（M5 终极形态, 与 read 绑定互补）;
   (b) GT×GTasm 解码原型作为"无 read-threading 管线场景的轻量路径"保留。
 - 脚本: gt_decode2.py, gt_scores.pkl（GT 分数缓存）。
+
+## 边支持失效根因与复活: 深度稀释（2026-08-28, calc_edge_support2 + probe_why_support）
+
+用户问"存储边为何无法生效"。定量诊断（probe_why_support, 1,243 个真假
+混合分叉组）:
+
+- **归一化版支持**（97K DS reads）: 组内真>假仅 27%（48% 打平）——
+  97K reads 摊 683 万边, 平均每边 ~1 条支持, 泊松噪声下决策边全落 0/1,
+  无统计量; 与计数相关性 r=0.026（非冗余, 是无信号）。
+- **原始版支持**（R1+R2 全量 11.6M reads, 5.51 亿对, 13 分钟）:
+  组内真>假 **94%**（GT 95%）, 真假支持比中位 165×; 与计数相关性
+  r=0.877（深度够后支持≈覆盖度聚合, 与 GT 特征信息重叠但仍含直测增量）。
+
+### 解码复测（gt_decode2 × 原始支持, 因子改连续 1+log1p(sup)）
+
+| 变体 | R_full | R70 | P |
+|---|---|---|---|
+| 基线 GT×GTasm | 11.8% | 48.6% | 87.3% |
+| A 贪心乘支持因子 | 11.9% | 48.6% | 87.4% |
+| **B 竞争=read 支持总量** | **12.2%** | 49.5% | 88.8% |
+| **C A+B** | **12.2%** | **49.7%** | **88.9%** |
+
+支持信号复活带来 +0.4pp R_full / +1.0pp R70, precision 同升。
+距 classic 剩 1.8pp——read **长程绑定**（butterfly 的路径级 read 包含
+语义, 边级 SUM 证据的极限已现）。
+
+### python 原型最终成绩与累计弧线
+
+GT 分数 × GTasm 解码 × 原始边支持 = **12.2% / 49.7% / 88.9%**
+（classic 14.0/53.2/82.1）; 从 GT 单向 walk 起点 10.4/46.0 累计
++1.8pp R_full, +3.7pp R70, P 高 6.8pp。
+教训: **read 证据必须用原始深度算**——归一化 saves the graph 但
+kills the evidence。
+- 新增资产: edge_support_raw.pkl（5.51 亿对）, calc_edge_support2.py。
 | 2026-08-27 | dev1 | R=14.0% P=81.4% **F1=23.9%** | N50=1836 n=7835 | --CPU 8 --max_memory 8G |
