@@ -1270,4 +1270,30 @@ GT 分数 × GTasm 解码 × 原始边支持 = **12.2% / 49.7% / 88.9%**
 教训: **read 证据必须用原始深度算**——归一化 saves the graph 但
 kills the evidence。
 - 新增资产: edge_support_raw.pkl（5.51 亿对）, calc_edge_support2.py。
+
+## GT 原型 vs classic 全面对比（2026-08-28, probe_fullcmp + junction）
+
+用户要求全面指标对打。蛋白口径复刻 bench.rs（最长 ORF 翻译 → DIAMOND
+blastx → HSP 并集 cov×pid, P_full=c>=0.95&p>=0.95, P70=c>=0.70&p>=0.90）;
+junction 用 SAM 输出（PAF 无 N gap, cg 全 M/I/D）, 坐标 (donor, acceptor+1)。
+
+| 维度 | GT 原型 | classic | 差 |
+|---|---|---|---|
+| n | 6,759 | 7,787 | -13% |
+| 总碱基 | 7.1M | 9.3M | -24% |
+| N50 | 1,672 | 1,838 | -9% |
+| R_full | 12.2% | 14.0% | -1.8pp |
+| R70 | 49.7% | 53.2% | -3.5pp |
+| **P** | **88.9%** | 82.1% | **+6.8pp** |
+| F1 | 21.5% | 23.9% | -2.4pp |
+| P_full | 51.9% | 56.3% | -4.4pp |
+| P70 | 68.3% | 71.6% | -3.3pp |
+| **junction 精确** | **90.3%** | 87.4% | **+2.9pp** |
+| junction 召回 | 19.7% | 20.2% | -0.5pp |
+
+格局: classic 赢全部召回/产出量轴（2-4pp, 产出多 24% 碱基）; GT 原型赢
+两个质量轴——precision +6.8pp、剪接精确率 +2.9pp。GT 原型 = 纯图内特征
+（无 read-threading 管线、无参照依赖、单卡分钟级）的轻量路径, 在
+"产出更少但更准"的定位上成立; classic 的召回优势本质仍是 read 长程绑定。
+- 脚本: probe_fullcmp.py; junction 简版（SAM+坐标偏移已校准）。
 | 2026-08-27 | dev1 | R=14.0% P=81.4% **F1=23.9%** | N50=1836 n=7835 | --CPU 8 --max_memory 8G |
