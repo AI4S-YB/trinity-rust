@@ -1371,3 +1371,29 @@ GRAPH 桶 kmer 级溯源（938,289 个图缺失 24-mer 查原始 reads, 免比�
 ③decode 微调(95 条, 已饱和边缘)。
 - 脚本: probe_principal_autopsy.py / probe_kmer_rescue.py / probe_norm_kmer.py;
   缓存 principal_autopsy.pkl, graph_missing_kmer_rescue.pkl。
+| 2026-08-28 | dev1 | R=14.1% P=82.1% **F1=24.1%** | N50=1811 n=7914 | --normalize_max_read_cov 10000 --CPU 8 --max_memory 8G |
+
+## 救援杠杆实测: 归一化放松证伪 + fragmented 搭桥天花板（2026-08-28, probe_frag_bridge + bench dev1 maxC10000）
+
+承接 principal 尸检, 三条候选救援杠杆逐一量化/实测:
+
+1. **归一化放松（maxC 200→10000, bench cache 59a909274df52986）: 证伪。**
+   丢失环节定位（深度≥5 的图缺失 kmer 抽样 300 个）: 归一化后 reads 存活
+   仅 ~12-24%（主丢失点）, inchworm contigs 剩 4%——inchworm 剪枝已极宽松
+   （min_count=1/无错误剪枝/仅熵过滤）, 杀手是归一化的 read 级降采样
+   （山谷 read 横跨高覆盖区被连带丢）。但实测放松后: Rp 10.7%→10.7%,
+   R 14.0→14.1%, P 82.1→82.1%, n 7787→7914; 85 条可操作目标集仅 2 条
+   救回 full（4 条覆盖提升>5pp）。**kmer 活着不等于能织进 contig**——
+   山谷 kmer 孤立低深度, 贪心延伸穿不过去; 也可能部分是参照自身
+   consensus 错误。杠杆①收档。
+2. **fragmented pair 搭桥（probe_frag_bridge）: 天花板 +0.7pp。**
+   199 条 fragmented 中 170 条有≥2 段; 段间缺口中位 15bp, 97%≤400bp;
+   桥接 pair≥5 的仅 58 条; 纯重叠可链接 21 条, 重叠或小缺口+≥3 pair
+   共 38 条可救 → R_full_p +0.7pp; 85 条零桥接死段。
+3. DECODE 95 条: +1.8pp 天花板, oracle 已证饱和边缘, 不投。
+
+**裁定: 算法侧可及总量实测封顶 ≈ +2.5pp（scaffold 0.7 + decode 1.8）;
+R_full_p 10.7% → ~13% 是 de novo 在 dev1 上的物理极限。**
+其余非 full 由 reads 铺设不完整决定（铺满率单变量决定 full 率:
+≥99%→51%, 80-99%→12%）。后续提指标的正路: 数据端（深度/读长/多样本）
+或评测换到高覆盖基因子集。
