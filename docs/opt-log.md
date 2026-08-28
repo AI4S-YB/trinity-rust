@@ -1337,3 +1337,37 @@ junction 用 SAM 输出（PAF 无 N gap, cg 全 M/I/D）, 坐标 (donor, accepto
   R70_p 50.8%; GT 原型 10.0% (520) / 49.0%。
 | 2026-08-27 | dev1 | R=14.0% P=81.4% **F1=23.9%** | N50=1836 n=7835 | --CPU 8 --max_memory 8G |
 | 2026-08-28 | dev1 | R=14.0% P=81.4% **F1=23.9%** | N50=1836 n=7835 | --CPU 8 --max_memory 8G |
+
+## principal 尸检: 没装出来 vs 装不全的死因分解（2026-08-28, probe_principal_autopsy + probe_kmer_rescue + probe_norm_kmer）
+
+用户问题: 都是最长转录本, 为什么有些没装出来、有些装不全?
+dev1 principal 5190 条, 四路证据（产出档/原始 reads 覆盖/图 kmer 在位+边走通/归一化后 reads）交叉。
+
+产出分档（classic）: full 557 (10.7%) / fragmented 199 (3.8%) /
+partial 2929 (56.4%) / weak 483 (9.3%) / absent 1022 (19.7%)。
+GT 原型剖面几乎相同（档级迁移主对角线压倒性）——两者被同一天花板压着。
+
+非 full (4633) 初判: DATA 34% / GRAPH 64% / DECODE 2.1% (95 条)。
+DECODE 画像: 短(中位 476bp vs full 1977bp)、中低深度(14.3x vs 32.6x)——
+与 oracle 饱和结论互洽, 解图端剩余空间 ≈ 这 95 条。
+
+**决定性规律: full 率被"reads 是否铺满转录本"单变量决定**——
+read 覆盖 <10%/10-50/50-80/80-99/≥99% 五档的 full 率 = 4/7/8/12/51%。
+
+GRAPH 桶 kmer 级溯源（938,289 个图缺失 24-mer 查原始 reads, 免比对）:
+- 44.9% 在原始 reads 中存在, 但深度中位仅 2（≥3 的 15.9%, ≥5 的 8.7%）;
+- 归一化裁决: 归一化后 reads 仍含 44.6% —— **归一化无罪**,
+  丢失发生在 inchworm 错误剪枝（min_ratio_non_error=0.005 等, 对深度 1-2
+  的 kmer 基本按噪声处理, 属预期行为）;
+  （注: raw∩norm 逐 kmer 对拍因两进程 set 迭代序导致 id 错位而不可靠,
+  仅两 run 各自聚合值可比——44.9%≈44.6% 已足够排除归一化选择性丢失。）
+- reads 视角重算可走性: 仅 135/2958 条变成 ≥99% 可走（其中挽救 kmer
+  深度≥3 的 85 条 = 真可操作集, 深度中位 3.0, 转录本深度中位 13.9x）。
+
+裁定: principal 口径的算法可及上限 ≈ full 557 + decode 95 + kmer 救援
+~85-135 ≈ **R_full_p 10.7% → 14-15% 理论顶**, 且 kmer 救援需容错建图,
+有 precision 代价; 其余 ~96% 非 full 由数据铺设不完整决定, 算法无解。
+杠杆排序: ①数据端(深度/读长/跨样本) ②容错 kmer 救援(85 条, 有风险)
+③decode 微调(95 条, 已饱和边缘)。
+- 脚本: probe_principal_autopsy.py / probe_kmer_rescue.py / probe_norm_kmer.py;
+  缓存 principal_autopsy.pkl, graph_missing_kmer_rescue.pkl。
