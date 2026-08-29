@@ -1504,3 +1504,30 @@ principal, 92 个正缺口任务: 锚 100bp + 局部 k=15 DBG + 有界 DFS +
   的断裂点系统性不满足此假设。构图阶段最后一刀（局部重组装）实测封顶,
   与全局结论一致: dev1 的算法可及空间 ≈ 已穷尽。
 - 脚本 probe_gapcloser.py; 缓存 gapcloser_probe.pkl。
+
+## rnaSPAdes 构图机制调研（2026-08-29, spades-main 源码）
+
+对照实测死局（山谷贪心穿不过 + 山谷区多路径歧义）调研 rnaSPAdes:
+
+- **多 k 迭代（K_MERS_RNA=[33,49], 按读长自适应）**: 每 k 全量重建图,
+  上一 k 的 simplified_contigs 以 TrustedContigs 身份并入下一 k 的
+  kmer 计数流（construction.cpp:233, 贡献序列不贡献覆盖）——山谷架桥
+  靠"上轮答案注入下轮构图", 不靠大 k 贪心硬穿。gap closer 只在最后一轮
+  或 K>=55 启用, repeat resolution 只在最后一轮。
+- **BayesHammer 纠错在 RNA 模式整体弃用**（options_parser.py:1012:
+  rna → only_assembler, 无 error_correction stage）——uneven depth 下
+  簇心质量判据不可靠, 纠错职责全部移给图清理。与我们"纠错会抹平真实
+  低表达差异"的顾虑互相印证, 杠杆③（纠错前置）行业侧证伪。
+- **图清理全相对覆盖**: rctc（tip_cov < X×竞争边最大覆盖）/rcec（≤邻域
+  均值）/rcc（低覆盖组件须被 ≥20x 高覆盖四面包围才删）; RNA 模式 icb
+  固定 200 弃用自动谷底; tip 加 mmm 3 限制只剪近重复错误 tip。
+- **歧义处理 = 放弃**: MultiExtender 仅在简单 2-way bulge 分叉产
+  isoform, 其余歧义直接断（宁可断不可错连）——我们 GapCloser 探针的
+  多路径墙, 行业答案相同。路径解析靠 PE pair + 覆盖一致性
+  （exSPAnder）, 与 butterfly 同族。
+- gap closer = tip 对 tip overlap 缝合 + PE 证据, 比 SOAP 局部重组装
+  保守（不假装能装山谷）。
+- **可吸收的唯一真机制: 多 k + trusted contig 注入**。注意旧单 k 扫描
+  k19/23 灾难性更差（毛球）, 小 k 轮产物质量是问号; 收益上限仍被
+  85 条集合封住（~+1.6pp R_full_p）。待用户裁定是否做最小可行实验
+  （k=21 → 注入 k=25）。
