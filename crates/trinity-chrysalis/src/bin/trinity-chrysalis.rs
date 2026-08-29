@@ -297,6 +297,7 @@ fn cmd_chrysalis_all(cli: &mut Cli) -> Result<(), CliError> {
             max_reads: max_reads.max(0) as u64,
             threads: threads as usize,
             skip_quantify: false,
+            graph_clean_rnaspades: false, // 子命令工具不暴露清理开关（默认关）
         },
     )?;
     Ok(())

@@ -149,6 +149,29 @@ fn merge_counts(mut a: CountMap, b: CountMap) -> CountMap {
     a
 }
 
+/// trusted contig 注入（rnaSPAdes construction.cpp:233 的 Trinity 移植——
+/// 上一轮组装的简化 contig 并入本轮 k-mer 计数流: **贡献序列、不贡献覆盖**）。
+/// 表中已存在的键**不动其计数**; 缺席的键以 count=1 插入（presence-only:
+/// 能被 min_count=1 的剪枝保留, 且在 inchworm 贪心延伸中优先级最低——
+/// 恰是"只补序列不扰覆盖"）。注入 k-mer 不获任何豁免: 后续熵过滤等剪枝
+/// 对它们与 reads k-mer 同等处理（忠实接受低复杂度注入 kmer 被剪掉）。
+/// 调用方须保证 `k`/`ds` 与计数表的构建参数一致（注入发生在
+/// prune_some_kmers 之前的最终表上）。返回新插入的键数（日志用）。
+pub fn inject_trusted_kmers(counts: &mut CountMap, trusted_fasta: &[u8], k: usize, ds: bool) -> usize {
+    let mut inserted = 0usize;
+    for rec in split_fasta_sequences(trusted_fasta) {
+        for_each_kmer(&rec, k, ds, |key| {
+            // entry().or_insert(1): 已存在（reads 已覆盖或上轮已注入）→ 不动;
+            // 缺席 → count=1 占位（presence-only）。
+            if let std::collections::hash_map::Entry::Vacant(e) = counts.entry(key) {
+                e.insert(1);
+                inserted += 1;
+            }
+        });
+    }
+    inserted
+}
+
 /// mer_counts 二进制记录布局: `u64 key, u32 count`（小端）, 头部魔数
 /// `TRMC` + u32 k + u8 ds（读回时校验）。M7 消 dump 直桥的落盘格式,
 /// 管线（orchestrate）与离线工具（xtask export-edges）共用。
@@ -382,5 +405,77 @@ mod capacity_tests {
         let b = KmerCountTable::count_fasta_data_with_capacity(fa, 25, false, 1 << 20);
         assert_eq!(a.len(), b.len());
         assert!(a.iter().all(|(k, v)| b.get(k) == Some(v)));
+    }
+}
+
+#[cfg(test)]
+mod trusted_inject_tests {
+    use super::*;
+    use trinity_common::kmer::kmer_to_intval;
+
+    fn key(s: &str) -> KmerId {
+        kmer_to_intval(s.as_bytes()).unwrap()
+    }
+
+    /// 核心语义: 已存在的键不动计数, 缺席的键以 count=1 插入。
+    #[test]
+    fn existing_untouched_absent_inserted_one() {
+        // reads 表: ACG=7; trusted 携带 ACG/CGT/GTA/TAC（k=3, SS）
+        let mut m: CountMap = FxHashMap::default();
+        m.insert(key("ACG"), 7);
+        let n = inject_trusted_kmers(&mut m, b">c1\nACGTAC\n", 3, false);
+        assert_eq!(n, 3); // CGT/GTA/TAC 新插入
+        assert_eq!(m[&key("ACG")], 7); // 已存在 → 不动（不累加、不覆盖）
+        assert_eq!(m[&key("CGT")], 1);
+        assert_eq!(m[&key("GTA")], 1);
+        assert_eq!(m[&key("TAC")], 1);
+        assert_eq!(m.len(), 4);
+    }
+
+    /// 幂等: 重复注入（resume 两条构建路径汇合后）不改变表。
+    #[test]
+    fn injection_is_idempotent() {
+        let mut m: CountMap = FxHashMap::default();
+        let fa = b">c1\nACGTAC\n";
+        assert_eq!(inject_trusted_kmers(&mut m, fa, 3, false), 4);
+        // 第二次注入: 全部已存在（含上轮注入的 count=1）→ 一个都不动
+        assert_eq!(inject_trusted_kmers(&mut m, fa, 3, false), 0);
+        assert_eq!(m.len(), 4);
+        assert!(m.values().all(|&c| c == 1));
+    }
+
+    /// DS canonical 折叠与计数路径同键: reads 里的 CTT 与 trusted 里的 AAG
+    /// 折叠为同一 DS 键 → 已存在不动。
+    #[test]
+    fn ds_canonical_folding_matches_reads_table() {
+        let mut m: CountMap = FxHashMap::default();
+        for_each_kmer(b"CTT", 3, true, |kk| *m.entry(kk).or_insert(0) += 5);
+        assert_eq!(m.len(), 1);
+        let n = inject_trusted_kmers(&mut m, b">c1\nAAG\n", 3, true);
+        assert_eq!(n, 0); // AAG 的 DS canonical == CTT 的 canonical → 已存在
+        assert_eq!(m.values().copied().collect::<Vec<_>>(), vec![5]);
+    }
+
+    /// 注入按**本轮** k 枚举（trusted 由上一轮较小 k 产出）;
+    /// 记录短于 k → 无 k-mer 可注入。
+    #[test]
+    fn inject_uses_current_k_not_contig_build_k() {
+        let mut m: CountMap = FxHashMap::default();
+        assert_eq!(inject_trusted_kmers(&mut m, b">c1\nACGT\n", 5, false), 0);
+        assert!(m.is_empty());
+        assert_eq!(inject_trusted_kmers(&mut m, b">c1\nACGT\n", 3, false), 2);
+    }
+
+    /// 多记录 + N 断窗语义与计数路径一致（同一 for_each_kmer）。
+    #[test]
+    fn multi_record_and_n_breaks() {
+        let mut m: CountMap = FxHashMap::default();
+        let fa = b">c1\nACG\n>c2 desc\nTTNAC\n";
+        let n = inject_trusted_kmers(&mut m, fa, 2, false);
+        // c1: AC CG; c2 "TTNAC": TT 有效, TN/NA 含 N 失效, N 后窗口恢复 → AC 有效
+        assert_eq!(n, 3);
+        assert_eq!(m[&key("AC")], 1);
+        assert_eq!(m[&key("CG")], 1);
+        assert_eq!(m[&key("TT")], 1);
     }
 }

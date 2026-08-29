@@ -10,8 +10,9 @@ pub mod butterfly_pool;
 pub mod checkpoint;
 pub mod gt_support;
 pub mod harvest;
+pub mod multik;
 pub mod orchestrate;
 pub mod prep;
 pub mod recursive;
 
-pub use args::{parse_args, PathEngine, SeqType, TrinityArgs};
+pub use args::{parse_args, MultiK, PathEngine, SeqType, TrinityArgs};

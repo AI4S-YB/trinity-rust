@@ -13,6 +13,7 @@
 pub mod bubble_up;
 pub mod bundle;
 pub mod dna_vector;
+pub mod graph_clean;
 pub mod graph_from_fasta;
 pub mod kmer_align;
 pub mod nonred_table;

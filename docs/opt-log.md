@@ -1574,3 +1574,47 @@ bench dev1q30（cache 9cf44d917ab8dc76）: R=13.7% Rp=10.5% hcR=34.6%
 P=80.3%（对照未过滤 14.0/10.7/34.4/81.4）——**全轴微负**。
 裁定: 过滤无收益。山谷是真实覆盖缺口而非错误 kmer（此前 kmer 溯源已证）,
 删 reads 只会连带删掉山谷里本就稀薄的覆盖。脚本保留备用, 不进管线。
+
+## rnaSPAdes 相对覆盖图清理落地（--graph-clean-rnaspades, 2026-08-29）
+
+rnaSPAdes simp 段（configs/rna_mode.info + tip_clipper/erroneous_connection_
+remover/relative_coverage_remover.hpp 判定结构）移植到 chrysalis 图。新模块
+`trinity-chrysalis/src/graph_clean.rs`, 在 QuantifyGraph 之后逐组件清理
+graph.out（pack 内文本, 写库前）, 默认关 = 代码路径不动。
+
+- **映射**: count 列 = (frm 首碱基+to 的 24-mer) 25-mer 计数 = SPAdes 边覆盖;
+  SPAdes 的"边" ≈ 本未压缩图的死端/junction 间**链**; tc_lb 4/2 → 链长 ≤4/≤2
+  节点; ec_lb 30bp → junction 间内部节点 ≤2; icb 200 → 链覆盖 ≤200; rctc 复刻
+  `le(cov, 0.5×(竞争max+1))`（含 +1 怪癖）; rcec_cb 复刻邻域均值（两端竞争边
+  数和/边数）; mmm 3 → 链序列 vs 竞争链（按覆盖贪心延伸, 要求严格更长）汉明
+  ≤3（汇向 5' 对齐/源向 3' 对齐）; rcc: 种子 20×cov<邻域max → flood-fill
+  （邻点无 >20×内边基线的高覆盖外边则并入内部, 有则留边界）, 内部顶点 ≤10
+  （SPAdes 默认 30, 按任务书收紧）+ 边界非空（整连通块低覆盖不删, 保真实低
+  表达基因）+ 各边界有 ≥20× 内部基线的外边 → 删触及内部顶点的行。
+- **安全**: 各 pass 同步语义（判定基于轮初图）; 悬空修复（被存活边引用但
+  定义行全灭的节点 → 最高 count 死行改根行 `v\t-1\t0\t...` 复活, 与
+  QuantifyGraph 根行惯例一致）; 组件清空兜底回滚（蝴蝶池不容忍空图）。
+- **走线**: `--graph-clean-rnaspades` → ChrysalisParams → run_quantify_packed;
+  汇总统计行打印 + `graph_clean` 行落 .stage_timings（并行 CPU 时间累计）。
+  --recursive 下不生效（迷你管线未接线, 启动 WARNING）。
+- **测试**: 17 个手算图单测（tip 两组正反/mmm/rctc 边界、EC 正反/icb 上界/
+  链长、rcc 正反/尺寸/边界/均匀低覆盖保护、悬空修复）; cargo test
+  --workspace 610 全绿, clippy --workspace --all-targets 零警告。
+- **bench dev1（cache 6b4e4f7d3097fb4f）**: R=13.7% R70=53.0% Rp=10.4%
+  hcR=33.7% **P=81.6%** F1=23.5% N50=1824 n=7850 —— 对照基线 ee22（14.0/
+  53.4/10.8/34.4/81.0/23.9/1843/7869）: **精度 +0.6pp, 召回各轴 -0.3~-0.7pp,
+  F1 -0.4pp**。净效果略负: 本管线图经 butterfly 自带 prune 已较干净, 再按
+  rnaSPAdes 相对覆盖削低覆盖链主要削掉真实低表达信号（与 Q30 节同构）。
+  flag 默认关, 保留备用。
+- **classic 回归**: 基线二进制无 flag bench 命中 ee22d353bcae2d67 缓存 ✓。
+  另发现: 同一基线二进制两次全新跑 dev1sub 的 inchworm.DS.fa 即不同
+  （7370 vs 7403 条转录本）——管线存在**先于本改动**的 inchworm 段运行间
+  不确定性（归一化产物逐字节相同, 分叉在 inchworm; 此前"复跑逐字节一致"
+  实为默认 scratch /tmp/trinity-rust-<hash> 的 checkpoint 续跑, bench 换
+  key 重跑只清 out/ 不清 scratch）。我的二进制无 flag 全新跑 dev1 n=7834
+  落在基线自身波动带内, 非本改动引入。注: 上述带 flag 数值取自改名前
+  二进制（仅字段改名, 逻辑相同）。
+
+| 2026-08-29 | dev1 | R=13.7% P=81.6% **F1=23.5%** | N50=1824 n=7850 | --graph-clean-rnaspades --CPU 8 --max_memory 8G |
+| 2026-08-29 | dev1 | R=14.0% P=81.0% **F1=23.9%** | N50=1843 n=7869 | --CPU 8 --max_memory 8G（基线缓存 ee22d353bcae2d67） |
+| 2026-08-29 | dev1 | R=14.0% P=81.5% **F1=23.9%** | N50=1833 n=7834 | --CPU 8 --max_memory 8G（新二进制无 flag 全新跑, 波动带内） |

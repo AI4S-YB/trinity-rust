@@ -25,6 +25,18 @@ pub enum PathEngine {
     Gtasm,
 }
 
+/// `--multi-k`（**Rust 版扩展**, rnaSPAdes 式多 k 迭代 + trusted contig 注入）。
+/// 缺省 = None（单 k classic, 行为逐字节不变）。
+///
+/// - `Auto`: 按 reads 读长（前 1000 条抽样）走 rnaSPAdes `rna_k_values` 公式
+///   （multik::rna_k_values）, 再钳入支持域 [15, 32];
+/// - `List`: 显式递升 k 列表（逗号分隔, 每个 k ∈ [15, 32]）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MultiK {
+    Auto,
+    List(Vec<usize>),
+}
+
 /// 主线参数集（原版 17 个同名 flag + Rust 版扩展 `--bfly_stack_mb`）。
 ///
 /// 继续性: workdir 既有 outdir 恢复（`.ok` 断点）天然支持，无 `--resume`
@@ -76,6 +88,14 @@ pub struct TrinityArgs {
     pub path_engine: PathEngine,
     /// **Rust 版扩展**: GTasm 引擎的 GTW1 权重路径（gtasm 必填）。
     pub gt_weights: Option<PathBuf>,
+    /// **Rust 版扩展**: rnaSPAdes 式多 k 迭代（`--multi-k auto|k1,k2,...`）。
+    /// None = 关闭（单 k classic, 现有行为逐字节不变）。与 --KMER_SIZE /
+    /// --recursive 互斥（防歧义, 沿 gtasm×recursive 先例）。
+    pub multi_k: Option<MultiK>,
+    /// **Rust 版扩展**: rnaSPAdes 式相对覆盖图清理（chrysalis QuantifyGraph
+    /// 后对 c*.graph.out 做 tip/EC/rcc 删除, 见 trinity-chrysalis::graph_clean）。
+    /// 默认关 = 现有行为逐字节不变。--recursive 下暂不生效（迷你管线未接线）。
+    pub graph_clean_rnaspades: bool,
 }
 
 /// `--max_memory 10G` → 字节。镜像原版 L1156 `^(\d+)G`（大小写不敏感）;
@@ -93,6 +113,34 @@ fn parse_max_memory(v: &str) -> Result<u64, CliError> {
 /// 逗号列表 → PathBuf（原版 split(",", ...)）。
 fn path_list(v: &str) -> Vec<PathBuf> {
     v.split(',').map(PathBuf::from).collect()
+}
+
+/// `--multi-k k1,k2,...` 显式列表解析: 逗号分隔整数, 每个 k ∈
+/// [multik::MULTI_K_MIN, multik::MULTI_K_MAX]（15..=32, KmerId 位宽上限）,
+/// 严格递升。空段/非数字/越界/乱序/重复一律 usage 报错。
+fn parse_multi_k_list(v: &str) -> Result<Vec<usize>, CliError> {
+    use crate::multik::{MULTI_K_MAX, MULTI_K_MIN};
+    let mut ks = Vec::new();
+    for tok in v.split(',') {
+        let k: usize = tok
+            .parse()
+            .map_err(|_| CliError::usage(format!("invalid --multi-k value: {v}")))?;
+        if !(MULTI_K_MIN..=MULTI_K_MAX).contains(&k) {
+            return Err(CliError::usage(format!(
+                "invalid --multi-k value: {k} (must be {MULTI_K_MIN}..={MULTI_K_MAX})"
+            )));
+        }
+        ks.push(k);
+    }
+    if ks.is_empty() {
+        return Err(CliError::usage("invalid --multi-k value: empty list"));
+    }
+    if !ks.windows(2).all(|w| w[0] < w[1]) {
+        return Err(CliError::usage(format!(
+            "invalid --multi-k value: {v} (k 列表须严格递升)"
+        )));
+    }
+    Ok(ks)
 }
 
 /// 双名旗标（主名/别名）取整数值; 均未给出 → default。重复名后取先生效者。
@@ -167,6 +215,14 @@ pub fn parse_args(argv: &[String]) -> Result<TrinityArgs, CliError> {
         }
     };
     let gt_weights = cli.value_flag("--gt-weights")?.map(PathBuf::from);
+    // --multi-k auto | k1,k2,...（Rust 版扩展, rnaSPAdes 式多 k 迭代）
+    let multi_k = match cli.value_flag("--multi-k")?.as_deref() {
+        None => None,
+        Some("auto") => Some(MultiK::Auto),
+        Some(v) => Some(MultiK::List(parse_multi_k_list(v)?)),
+    };
+    // --graph-clean-rnaspades（Rust 版扩展, 默认关）
+    let graph_clean_rnaspades = cli.bool_flag("--graph-clean-rnaspades");
 
     cli.finish()?;
 
@@ -232,6 +288,24 @@ pub fn parse_args(argv: &[String]) -> Result<TrinityArgs, CliError> {
             "Error, --path-engine gtasm 与 --recursive 暂不支持同时使用",
         ));
     }
+    // multi-k 互斥校验（防歧义）: 多 k 轮次自带 k 序列, 与 --KMER_SIZE 同给
+    // 语义冲突（哪个生效?）; 与 --recursive 的组合未实现（沿 gtasm 先例）。
+    if multi_k.is_some() {
+        if cli.was_given("--KMER_SIZE") || cli.was_given("__KMER_SIZE") {
+            return Err(CliError::usage(
+                "Error, --multi-k 与 --KMER_SIZE 互斥: 多 k 迭代的 k 序列由 --multi-k 给定, 请勿再指定 --KMER_SIZE",
+            ));
+        }
+        if recursive {
+            return Err(CliError::usage(
+                "Error, --multi-k 与 --recursive 暂不支持同时使用",
+            ));
+        }
+    }
+    // --graph-clean-rnaspades 在 --recursive 下未接线（迷你管线走默认参数）→ 明告
+    if graph_clean_rnaspades && recursive {
+        eprintln!("WARNING: --graph-clean-rnaspades 在 --recursive 下暂不生效, 忽略");
+    }
 
     Ok(TrinityArgs {
         seq_type,
@@ -256,6 +330,8 @@ pub fn parse_args(argv: &[String]) -> Result<TrinityArgs, CliError> {
         recursive,
         path_engine,
         gt_weights,
+        multi_k,
+        graph_clean_rnaspades,
     })
 }
 
@@ -321,5 +397,50 @@ mod tests {
         // classic + 权重 → 通过（忽略并警告）
         let a = parse_args(&argv(&["--gt-weights", "/tmp/m.gtw"])).unwrap();
         assert_eq!(a.path_engine, PathEngine::Classic);
+    }
+
+    #[test]
+    fn multi_k_defaults_off() {
+        // 缺省 = None（单 k classic 路径, 行为不变）
+        let a = parse_args(&argv(&[])).unwrap();
+        assert_eq!(a.multi_k, None);
+    }
+
+    #[test]
+    fn multi_k_auto_and_list_parse() {
+        let a = parse_args(&argv(&["--multi-k", "auto"])).unwrap();
+        assert_eq!(a.multi_k, Some(MultiK::Auto));
+        let a = parse_args(&argv(&["--multi-k", "21,25,29"])).unwrap();
+        assert_eq!(a.multi_k, Some(MultiK::List(vec![21, 25, 29])));
+        // 单元素列表合法（退化为该 k 的单轮）
+        let a = parse_args(&argv(&["--multi-k", "29"])).unwrap();
+        assert_eq!(a.multi_k, Some(MultiK::List(vec![29])));
+    }
+
+    #[test]
+    fn multi_k_list_validation() {
+        // 越界: <15 或 >32 报错
+        assert!(parse_args(&argv(&["--multi-k", "14,25"])).is_err());
+        assert!(parse_args(&argv(&["--multi-k", "25,33"])).is_err());
+        assert!(parse_args(&argv(&["--multi-k", "15,32"])).is_ok());
+        // 非数字 / 空段
+        assert!(parse_args(&argv(&["--multi-k", "x"])).is_err());
+        assert!(parse_args(&argv(&["--multi-k", "21,,25"])).is_err());
+        // 非递升 / 重复
+        assert!(parse_args(&argv(&["--multi-k", "25,21"])).is_err());
+        assert!(parse_args(&argv(&["--multi-k", "25,25"])).is_err());
+    }
+
+    #[test]
+    fn multi_k_mutex_with_kmer_size_and_recursive() {
+        // 与 --KMER_SIZE（含原版别名 __KMER_SIZE）同给 → 报错
+        assert!(parse_args(&argv(&["--multi-k", "auto", "--KMER_SIZE", "25"])).is_err());
+        assert!(parse_args(&argv(&["--multi-k", "21,25", "__KMER_SIZE", "25"])).is_err());
+        // 与 --recursive 同给 → 报错（auto / list 同规则）
+        assert!(parse_args(&argv(&["--multi-k", "auto", "--recursive"])).is_err());
+        assert!(parse_args(&argv(&["--multi-k", "21,25", "--recursive"])).is_err());
+        // 单独 --recursive / 单独 --multi-k 均不受影响
+        assert!(parse_args(&argv(&["--recursive"])).is_ok());
+        assert!(parse_args(&argv(&["--multi-k", "21,25"])).is_ok());
     }
 }

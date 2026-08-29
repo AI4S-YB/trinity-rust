@@ -48,6 +48,9 @@ pub struct ChrysalisParams {
     /// 跳过 QuantifyGraph（phase-2 分割点）：止于分区，保留 c*.graph.tmp /
     /// c*.reads.tmp 供递归模式逐分区消费（默认 false，行为不变）。
     pub skip_quantify: bool,
+    /// `--graph-clean-rnaspades`：QuantifyGraph 之后对 graph.out 做 rnaSPAdes
+    /// 式相对覆盖清理（tip/EC/rcc, 见 graph_clean 模块）。默认 false = 逐字节不变。
+    pub graph_clean_rnaspades: bool,
 }
 
 impl Default for ChrysalisParams {
@@ -60,6 +63,7 @@ impl Default for ChrysalisParams {
             max_reads: 200_000,
             threads: 1,
             skip_quantify: false,
+            graph_clean_rnaspades: false,
         }
     }
 }
@@ -179,6 +183,9 @@ pub fn run_chrysalis_pipeline(
             max_reads: p.max_reads as i64,
             ..Default::default()
         };
+        // rnaSPAdes 图清理的跨组件统计与耗时累计（各组件并行, 锁合并）
+        let clean_stats: Mutex<crate::graph_clean::CleanStats> = Mutex::new(Default::default());
+        let clean_nanos = std::sync::atomic::AtomicU64::new(0);
         let mut writers: HashMap<PathBuf, Mutex<PackWriter>> = HashMap::new();
         let mut tmp_indexes: HashMap<PathBuf, PackIndex> = HashMap::new();
         for (_, base) in &listing {
@@ -209,7 +216,16 @@ pub fn run_chrysalis_pipeline(
                             let dir = base.parent().map(|d| d.to_path_buf()).unwrap_or_default();
                             let w = writers.get(&dir).expect("writer per Cbin pre-created");
                             let idx = tmp_indexes.get(&dir).expect("tmp index per Cbin loaded");
-                            match run_quantify_packed(*id, &dir, idx, w, &qg) {
+                            match run_quantify_packed(
+                                *id,
+                                &dir,
+                                idx,
+                                w,
+                                &qg,
+                                p.graph_clean_rnaspades,
+                                &clean_stats,
+                                &clean_nanos,
+                            ) {
                                 Ok(()) => None,
                                 Err(e) => Some(format!("{}: {e}", base.display())),
                             }
@@ -220,6 +236,35 @@ pub fn run_chrysalis_pipeline(
         )?;
         for w in writers.values() {
             w.lock().unwrap().finish()?;
+        }
+        // 清理统计行 + 落 .stage_timings（CPU 时间累计: 各组件并行清理的耗时和）
+        if p.graph_clean_rnaspades {
+            let st = clean_stats.lock().unwrap();
+            println!(
+                "-graph-clean-rnaspades: {} components, tip chains {} (g1 {} + g2 {}, {} nodes), ec chains {} ({} nodes), rcc components {} ({} nodes), lines removed {}, dangling repaired {}, reverted {}",
+                st.components,
+                st.tip_g1_chains + st.tip_g2_chains,
+                st.tip_g1_chains,
+                st.tip_g2_chains,
+                st.tip_nodes,
+                st.ec_chains,
+                st.ec_nodes,
+                st.rcc_components,
+                st.rcc_nodes,
+                st.lines_removed,
+                st.repaired_dangling,
+                st.reverted_components,
+            );
+            drop(st);
+            let secs = clean_nanos.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e9;
+            if let Ok(mut fh) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(out_dir.join(".stage_timings"))
+            {
+                use std::io::Write;
+                let _ = writeln!(fh, "graph_clean\t{secs:.3}");
+            }
         }
         if !failures.is_empty() {
             return Err(CommonError::Parse(format!(
@@ -269,17 +314,33 @@ fn read_tmp_record(dir: &Path, idx: &PackIndex, id: u64, kind: u64) -> Result<Ve
 
 /// 逐组件 QuantifyGraph: 从 Cbin 的 tmp 包读 graph.tmp/reads.tmp 记录,
 /// 产物追加进 graphs 包。输入的删除由调用方在整阶段成功后整包完成。
+/// `graph_clean`：开启时对 graph.out 文本做 rnaSPAdes 式清理（tip→EC→rcc,
+/// 见 graph_clean 模块）; 统计/耗时并入 `clean_stats`/`clean_nanos`。
+#[allow(clippy::too_many_arguments)]
 fn run_quantify_packed(
     id: u64,
     dir: &Path,
     tmp_idx: &PackIndex,
     writer: &Mutex<PackWriter>,
     p: &QgParams,
+    graph_clean: bool,
+    clean_stats: &Mutex<crate::graph_clean::CleanStats>,
+    clean_nanos: &std::sync::atomic::AtomicU64,
 ) -> Result<(), String> {
     let graph = read_tmp_record(dir, tmp_idx, id, KIND_GRAPH_TMP)?;
     let reads = read_tmp_record(dir, tmp_idx, id, KIND_READS_TMP)?;
     let graph = String::from_utf8(graph).map_err(|e| e.to_string())?;
     let (gout, rout) = quantify_graph_mem(&graph, &reads, p).map_err(|e| e.to_string())?;
+    let gout = if graph_clean {
+        let t0 = std::time::Instant::now();
+        let (cleaned, st) = crate::graph_clean::clean_graph_rnaspades(&gout);
+        clean_nanos
+            .fetch_add(t0.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+        clean_stats.lock().unwrap().add_assign(&st);
+        cleaned
+    } else {
+        gout
+    };
     {
         let mut w = writer.lock().unwrap();
         w.append(id, KIND_GRAPH_OUT, gout.as_bytes())
