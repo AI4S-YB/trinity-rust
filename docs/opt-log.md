@@ -1531,3 +1531,46 @@ principal, 92 个正缺口任务: 锚 100bp + 局部 k=15 DBG + 有界 DFS +
   k19/23 灾难性更差（毛球）, 小 k 轮产物质量是问号; 收益上限仍被
   85 条集合封住（~+1.6pp R_full_p）。待用户裁定是否做最小可行实验
   （k=21 → 注入 k=25）。
+| 2026-08-29 | dev1 | R=14.0% P=81.0% **F1=23.9%** | N50=1843 n=7869 | --CPU 8 --max_memory 8G |
+| 2026-08-29 | dev1 | R=14.0% P=81.0% **F1=23.9%** | N50=1843 n=7869 | --CPU 8 --max_memory 8G |
+| 2026-08-29 | dev1 | R=14.5% P=81.4% **F1=24.6%** | N50=1918 n=7925 | --multi-k auto --CPU 8 --max_memory 8G |
+
+## 多 k 迭代 + trusted contig 注入落地（--multi-k, 2026-08-29）
+
+上节调研中"唯一可吸收机制"的最小可行实现（rnaSPAdes construction.cpp:233
+语义移植）:
+
+- **CLI**: `--multi-k auto|k1,k2,...`; 与 --KMER_SIZE/--recursive 互斥;
+  显式列表 k∈[15,32] 严格递升。auto = rna_k_values 公式（lower=clamp
+  (RL/3,29,55), upper=RL/2-1, 均取奇, upper<=lower 单 k）+ RL 抽样（各
+  文件前 1000 条取 max, 跨文件取 min）+ 支持域钳制 [15,32]（KmerId 位宽
+  上限 32; dev1 RL=76 → 公式 [29,37] → 钳制 [29,32]）。
+- **迭代结构**: 归一化/prep 只做一次（共享 both.fa）; 中间轮在
+  `iter_k<k>/` 只跑 计数+inchworm（跳过 chrysalis/butterfly）, 产物
+  inchworm.DS.fa 为 trusted 源; 最终轮在 `iter_k<k_last>/` 跑完整管线,
+  Trinity.fasta 落点不变。计数表两条构建路径（counts_bin 装载/重算）
+  汇合后统一注入: 已存在键不动计数, 缺席以 count=1 插入（presence-only,
+  先于 prune, 无熵过滤豁免）; counts_bin 落盘保持 reads-only（注入幂等,
+  resume 装载路径重注结果不变）。链式注入（第 i 轮注第 i-1 轮, >2 k 时
+  中间轮不空转）。.stage_timings 按轮次目录区分。
+- **dev1 验收**（cache b9b42bd94332bc08, k=29→32, 各轮 ~22s 计数 + ~27s
+  inchworm）: **R=14.5% R70=55.0% Rp=10.9% R70p=51.8% hcR=34.6%
+  hcR70=74.3% P=81.4% F1=24.6% N50=1918 n=7925 P_full=65.8%**;
+  同日新二进制 classic 复跑（ee22d353bcae2d67）: R=14.0% R70=53.4%
+  Rp=10.8% hcR=34.4% P=81.0% F1=23.9% n=7869（与 08-28 基线 14.04/81.38
+  逐点吻合 → 默认路径逐字节不变, classic 回归通过; 二次运行命中新缓存）。
+- **裁定: 全面小幅正收益（R +0.5pp / R70 +1.6pp / F1 +0.7pp /
+  P_full +2.1pp, 无精度代价）**, 单轴幅度仍在 run 间噪声（≤0.6pp）边缘,
+  但七轴同向 + 蛋白级 P_full 涨幅最大, 方向可信。与调研预期一致:
+  山谷架桥收益上限受 85 条集合封顶（~+1.6pp Rp 为理论顶）, 实测
+  Rp +0.1pp——大头仍被封住。593 测试全绿, clippy 零警告。
+| 2026-08-29 | dev1q30 | R=13.7% P=80.3% **F1=23.4%** | N50=1854 n=7848 | --CPU 8 --max_memory 8G |
+
+## Q30 reads 过滤基线（2026-08-29, filter_q30.py）
+
+用户指令第一步: 只做过滤不做纠错。口径: read 平均 Phred>=30, pair 同留同弃。
+dev1/2/3 保留率 97.2/97.2/97.1%（原数据 meanQ 37, 本就很干净）。
+bench dev1q30（cache 9cf44d917ab8dc76）: R=13.7% Rp=10.5% hcR=34.6%
+P=80.3%（对照未过滤 14.0/10.7/34.4/81.4）——**全轴微负**。
+裁定: 过滤无收益。山谷是真实覆盖缺口而非错误 kmer（此前 kmer 溯源已证）,
+删 reads 只会连带删掉山谷里本就稀薄的覆盖。脚本保留备用, 不进管线。
