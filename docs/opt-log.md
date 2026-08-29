@@ -1451,3 +1451,36 @@ butterfly look-back 语义的 python 复刻: reads 线程化（kmer→节点路�
 上均实测封顶, 解图通道关闭。hc 口径基线: GT 原型 33.6-33.8%/71.5%
 vs classic 34.6%/73.5%。
 - 脚本 gt_decode3.py; 缓存 read_paths_cand.pkl（762K 路径, 161MB）。
+| 2026-08-28 | dev3 | R=12.5% P=82.4% **F1=21.7%** | N50=1811 n=6486 | --CPU 8 --max_memory 8G |
+| 2026-08-28 | dev2 | R=13.1% P=79.8% **F1=22.4%** | N50=1789 n=9126 | --CPU 8 --max_memory 8G |
+| 2026-08-28 | dev1 | R=12.3% P=88.8% **F1=21.6%** | N50=1671 n=6761 | --path-engine gtasm --gt-weights /storage/home/senior007/test/athal/bench/export/gtnet_dev1.gtw --CPU 8 --max_memory 8G |
+| 2026-08-28 | dev1 | R=13.9% P=81.7% **F1=23.8%** | N50=1836 n=7798 | --CPU 8 --max_memory 8G |
+| 2026-08-28 | dev2 | R=11.5% P=87.7% **F1=20.4%** | N50=1601 n=7900 | --path-engine gtasm --gt-weights /storage/home/senior007/test/athal/bench/export/gtnet_dev1.gtw --CPU 8 --max_memory 8G |
+
+## 铺满率定律三数据集复核 + GT 原型 Rust 化落地（2026-08-28/29）
+
+**dev2/dev3 复核（hc 口径 bench + 分层分析）**: 铺满率定律普适——
+三数据集 full 率分层几乎重合: ≥99% 覆盖档 50.8/55.6/47.3%（dev1/2/3）,
+95-99 档 30.7/27.0/32.3%, 90-95 档 3.3/3.4/2.9%（断崖）, <90% 个位数。
+hc 子集规模占比 17-19%。dev1 尸检结论跨数据集成立。
+（教训: refcov 缓存文件名与数据集的对应须按内容校验, mtime 排序会
+被并行任务完成顺序骗过——首版分析曾因此得出错误的平坦分布。）
+
+**GT 原型 Rust 化（--path-engine gtasm）**: python 原型（GT 边分数 ×
+GTasm 解码 × 原始 reads 边支持）完整落进主线。
+- 新增: butterfly/gtmodel.rs（GTW1 权重加载 + 纯 f32 前向, 零新依赖;
+  修正主代理 spec 一处——注意力权重按 head_dim=8 逐头求和而非全 64 维）,
+  butterfly/gtdecode.rs（C 变体逐语义: 平局取大 vid/eid、无名节点跳过、
+  sup_sum 竞争、固定 xorshift 采样 50 起点）, cli/gt_support.rs（原始
+  reads 边支持 pass, GTS1 二进制, dev1: 2.76 亿转移 / 649 万边）,
+  两个对拍 bin + scripts/gt_score_compare.py。
+- 接线: `--path-engine classic|gtasm` + `--gt-weights`; 支持 pass 带
+  checkpoint 落 workdir; gtasm 组件产出进既有 harvest 通道。
+- 数值对齐: Rust vs torch 重载逐边最大差 1.2e-07。
+- 验收 bench（dev1, cache 775cb33c9c3eb808）: **R=12.3% R70=49.7%
+  P=88.8% Rp=9.9% R70p=49.1% hcR=33.4%** —— 对 python 原型全面 ±0.5pp
+  内复现; classic 回归 13.9%/81.7% 在 run 间噪声内。
+- dev2 泛化（权重仅 dev1 训练）: R=11.5% R70=46.4% P=87.7% Rp=9.3%
+  hcR=31.1%（vs classic 13.1/79.8）——"召回略低、精度大涨"格局跨数据集
+  成立, 模型未过拟合单一数据。
+- 577 测试全绿, clippy 零警告。

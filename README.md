@@ -26,6 +26,8 @@ target/release/trinity-cli \
 | `--min_kmer_cov`（别名 `--min_kmer_count`） | k-mer 计数下限 |
 | `--normalize_max_read_cov` / `--no_normalize_reads` | 归一化上限 / 跳过归一化 |
 | `--bfly_stack_mb` | Butterfly 线程栈（本实现扩展，默认对齐原版 JVM 栈行为） |
+| `--path-engine classic\|gtasm`（扩展，默认 classic） | butterfly 组件的路径引擎；`gtasm` = GT 边打分（GTW1 权重）× GTasm 式解码 × 原始 reads 边支持 |
+| `--gt-weights <path>`（扩展） | gtasm 引擎的 GTW1 模型权重（`--path-engine gtasm` 时必填） |
 | `--no_cleanup` | 保留中间产物（both.fa / left.fa / right.fa、归一化 norm.fq 等；位置在 scratch 目录） |
 | `--scratch <dir>` | 中间产物写到 `<scratch>/<output 目录名>/`（显式指定时不做空间检查） |
 
@@ -65,7 +67,7 @@ target/release/trinity-cli \
 
 **参数别名**：`__KMER_SIZE` → `--KMER_SIZE`、`--min_kmer_cov` → `--min_kmer_count`（两个名字都收，与原版主程序名兼容）。
 
-**扩展**：`--bfly_stack_mb` 显式控制 butterfly 工作线程栈上限（原版由 JVM `-Xss` 隐式决定）。
+**扩展**：`--bfly_stack_mb` 显式控制 butterfly 工作线程栈上限（原版由 JVM `-Xss` 隐式决定）。`--path-engine gtasm` + `--gt-weights` 启用 GT 打分解图引擎（python GTasm 原型产品化；chrysalis 之后多一个原始 reads 边支持 pass，产物 `gtasm_edge_support.bin` 随 scratch 落盘并受 `.gtasm_support.ok` checkpoint 保护；gtasm 与 `--recursive` 互斥）。
 
 **中间产物布局（性能优化，既定差异）**：`chrysalis/Component_bins/Cbin*/` 下不再逐组件写 `cN.graph.out` / `cN.graph.reads` / `cN.graph.allProbPaths.fasta` 小文件（2.8 万组件 ≈ 8.5 万个文件，NFS 上元数据往返极贵），改为每个 Cbin 两个打包文件 `graphs.pack`/`graphs.idx`（QuantifyGraph 产物）与 `butterfly.pack`/`butterfly.idx`（Butterfly 产物）；`.idx` 为定长 32B 记录（component id / kind / offset / len，小端）。归一化的 `left.norm.*` 便捷名是长名文件的硬链接（原版为符号链接），不再物理双写。
 

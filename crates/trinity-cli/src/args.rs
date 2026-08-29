@@ -13,6 +13,18 @@ pub enum SeqType {
     Fa,
 }
 
+/// `--path-engine classic|gtasm`（**Rust 版扩展**, 原版无）。
+///
+/// - `classic`（默认）: butterfly allProbPaths 全链, 行为与现状逐字节一致;
+/// - `gtasm`: GT 边打分（GTW1 权重, `--gt-weights`）× GTasm 式解码 × 原始
+///   reads 边支持（python 原型 gt_decode2.py C 变体的产品化, 详见
+///   trinity-butterfly `gtmodel`/`gtdecode` 模块）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PathEngine {
+    Classic,
+    Gtasm,
+}
+
 /// 主线参数集（原版 17 个同名 flag + Rust 版扩展 `--bfly_stack_mb`）。
 ///
 /// 继续性: workdir 既有 outdir 恢复（`.ok` 断点）天然支持，无 `--resume`
@@ -60,6 +72,10 @@ pub struct TrinityArgs {
     /// （skip_quantify）, 逐分区进程内迷你 Trinity, 产物落
     /// `read_partitions/c<id>.mini.fa`（存在即跳过 = 断点）。
     pub recursive: bool,
+    /// **Rust 版扩展**: butterfly 组件的路径引擎（默认 classic）。
+    pub path_engine: PathEngine,
+    /// **Rust 版扩展**: GTasm 引擎的 GTW1 权重路径（gtasm 必填）。
+    pub gt_weights: Option<PathBuf>,
 }
 
 /// `--max_memory 10G` → 字节。镜像原版 L1156 `^(\d+)G`（大小写不敏感）;
@@ -141,6 +157,16 @@ pub fn parse_args(argv: &[String]) -> Result<TrinityArgs, CliError> {
     let no_cleanup = cli.bool_flag("--no_cleanup");
     let recursive = cli.bool_flag("--recursive");
     let scratch = cli.value_flag("--scratch")?.map(PathBuf::from);
+    let path_engine = match cli.value_flag("--path-engine")?.as_deref() {
+        None | Some("classic") => PathEngine::Classic,
+        Some("gtasm") => PathEngine::Gtasm,
+        Some(other) => {
+            return Err(CliError::usage(format!(
+                "invalid --path-engine value: {other} (must be classic|gtasm)"
+            )))
+        }
+    };
+    let gt_weights = cli.value_flag("--gt-weights")?.map(PathBuf::from);
 
     cli.finish()?;
 
@@ -191,6 +217,22 @@ pub fn parse_args(argv: &[String]) -> Result<TrinityArgs, CliError> {
     // 原版: inchworm_cpu 默认 6，但 CPU 更小时收敛到 CPU（L1233 语义）。
     let inchworm_cpu = inchworm_cpu_in.unwrap_or(6).min(cpu.max(1));
 
+    // gtasm 必须给权重; classic 给了权重也只警告（不误判为 gtasm）。
+    if path_engine == PathEngine::Gtasm && gt_weights.is_none() {
+        return Err(CliError::usage(
+            "Error, --path-engine gtasm requires --gt-weights <GTW1 权重文件路径>",
+        ));
+    }
+    if path_engine == PathEngine::Classic && gt_weights.is_some() {
+        eprintln!("WARNING: --gt-weights 在 --path-engine classic 下不生效, 忽略");
+    }
+    // gtasm × recursive 未实现（递归模式的分区池不走 butterfly 组件池）
+    if path_engine == PathEngine::Gtasm && recursive {
+        return Err(CliError::usage(
+            "Error, --path-engine gtasm 与 --recursive 暂不支持同时使用",
+        ));
+    }
+
     Ok(TrinityArgs {
         seq_type,
         left,
@@ -212,6 +254,8 @@ pub fn parse_args(argv: &[String]) -> Result<TrinityArgs, CliError> {
         no_cleanup,
         scratch,
         recursive,
+        path_engine,
+        gt_weights,
     })
 }
 
@@ -249,5 +293,33 @@ mod tests {
     fn scratch_parses_dir() {
         let a = parse_args(&argv(&["--scratch", "/tmp/scratch"])).unwrap();
         assert_eq!(a.scratch, Some(PathBuf::from("/tmp/scratch")));
+    }
+
+    #[test]
+    fn path_engine_defaults_classic() {
+        let a = parse_args(&argv(&[])).unwrap();
+        assert_eq!(a.path_engine, PathEngine::Classic);
+        assert_eq!(a.gt_weights, None);
+    }
+
+    #[test]
+    fn path_engine_gtasm_requires_weights() {
+        // gtasm 无 --gt-weights → 报错
+        assert!(parse_args(&argv(&["--path-engine", "gtasm"])).is_err());
+        // 带上权重 → 通过
+        let a = parse_args(&argv(&[
+            "--path-engine",
+            "gtasm",
+            "--gt-weights",
+            "/tmp/m.gtw",
+        ]))
+        .unwrap();
+        assert_eq!(a.path_engine, PathEngine::Gtasm);
+        assert_eq!(a.gt_weights, Some(PathBuf::from("/tmp/m.gtw")));
+        // 非法值 → 报错
+        assert!(parse_args(&argv(&["--path-engine", "xgb"])).is_err());
+        // classic + 权重 → 通过（忽略并警告）
+        let a = parse_args(&argv(&["--gt-weights", "/tmp/m.gtw"])).unwrap();
+        assert_eq!(a.path_engine, PathEngine::Classic);
     }
 }

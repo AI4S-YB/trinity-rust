@@ -10,6 +10,8 @@ pub mod context;
 pub mod dfs;
 pub mod graph;
 pub mod graph_io;
+pub mod gtdecode;
+pub mod gtmodel;
 pub mod pair_paths;
 pub mod paths;
 pub mod pog;
@@ -25,6 +27,11 @@ pub use graph_io::{
     build_new_graph_use_kmers, parse_graph_reads, pre_process_graph_file, write_dot_file,
     write_dot_string, BuildResult, RawRead, ReadParseError,
 };
+pub use gtdecode::{
+    build_gt_features, decode_component, pack_uv, parse_component_graph, run_component_gtasm,
+    EdgeSupport, GtGraph, GtasmParams, GTASM_DEFAULT_SEED, NB_STARTS,
+};
+pub use gtmodel::{GtModel, GT_HEADS};
 pub use pair_paths::{
     get_suff_stats_w_pairs, individual_paths_are_compatible, trim_sink_nodes, PairPath, SuffStats,
 };
@@ -64,6 +71,8 @@ pub use threading::{
 pub enum BflyError {
     #[error("graph 文件格式错误: {0}")]
     GraphFileFormat(String),
+    #[error("GT 权重错误: {0}")]
+    GtWeights(String),
 }
 
 pub type Result<T> = std::result::Result<T, BflyError>;

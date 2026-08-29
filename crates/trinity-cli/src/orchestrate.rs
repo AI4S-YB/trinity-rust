@@ -23,8 +23,8 @@ use trinity_inchworm::irke::{
 use trinity_kmer::counter::{estimate_hash_size, KmerCountTable};
 use trinity_kmer::diginorm::{self, DigiNormParams, ReadsInput};
 
-use crate::args::{SeqType, TrinityArgs};
-use crate::butterfly_pool::{run_butterfly_pool, ButterflyPoolParams};
+use crate::args::{PathEngine, SeqType, TrinityArgs};
+use crate::butterfly_pool::{run_butterfly_pool, ButterflyPoolParams, GtasmShared};
 use crate::checkpoint::{checkpoint_exists, run_with_checkpoint};
 use crate::harvest::harvest;
 use crate::prep::prep_reads;
@@ -535,6 +535,52 @@ pub fn run_trinity(args: &TrinityArgs) -> Result<PathBuf, CommonError> {
         ));
     }
 
+    // ---- 5.5 gtasm 边支持 pass（仅 --path-engine gtasm; 读 Component_bins
+    // 建 k2v, 扫**原始** reads（归一化前）, 产物 gtasm_edge_support.bin;
+    // checkpoint .gtasm_support.ok 保护, 重跑直接加载不重扫）----
+    let gtasm_shared: Option<std::sync::Arc<GtasmShared>> = if args.path_engine
+        == PathEngine::Gtasm
+    {
+        let weights = args.gt_weights.as_ref().ok_or_else(|| {
+            CommonError::Parse("--path-engine gtasm 需要 --gt-weights".to_string())
+        })?;
+        // 模型先加载（廉价）——坏权重在昂贵的 reads 扫描之前报错
+        let model = trinity_butterfly::GtModel::load(weights)
+            .map_err(|e| CommonError::Parse(format!("GT 权重加载失败: {e}")))?;
+        eprintln!(
+            "-gtasm: 模型 {} 加载完成（hidden={}, {} 层）",
+            weights.display(),
+            model.hidden,
+            model.n_layers()
+        );
+        let sup_bin = workdir.join("gtasm_edge_support.bin");
+        let sup_ok = workdir.join(".gtasm_support.ok");
+        trinity_common::timer::timed(&workdir, "gtasm_support", || {
+            run_with_checkpoint(&sup_ok, "GTasm edge support (raw reads)", || {
+                let raw_reads: Vec<PathBuf> = if paired {
+                    args.left.iter().chain(args.right.iter()).cloned().collect()
+                } else {
+                    args.single.clone()
+                };
+                let st = crate::gt_support::run_support_pass(
+                    &listing,
+                    &raw_reads,
+                    args.seq_type,
+                    &sup_bin,
+                )?;
+                eprintln!(
+                    "-gtasm support: reads {}, 有支持转移 {}, 有支持边 {}",
+                    st.reads, st.pairs, st.edges_with_support
+                );
+                Ok(())
+            })
+        })?;
+        let support = trinity_butterfly::EdgeSupport::load(&sup_bin)?;
+        Some(std::sync::Arc::new(GtasmShared { model, support }))
+    } else {
+        None
+    };
+
     // ---- 6. butterfly 组件池（checkpoint .butterfly.ok; L1934-1936）----
     warn_memory(args.max_memory, file_len(&iworm_fa), "Butterfly");
     trinity_common::timer::timed(&workdir, "butterfly", || {
@@ -550,6 +596,8 @@ pub fn run_trinity(args: &TrinityArgs) -> Result<PathBuf, CommonError> {
                         min_contig_length: args.min_contig_length,
                         group_pairs_distance: args.group_pairs_distance,
                         stack_size_mb: args.bfly_stack_mb,
+                        path_engine: args.path_engine,
+                        gtasm: gtasm_shared.clone(),
                     },
                 )
             },

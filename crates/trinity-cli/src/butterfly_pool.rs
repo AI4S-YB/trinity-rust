@@ -17,15 +17,24 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use rayon::prelude::*;
-use trinity_butterfly::{run_component, ComponentParams};
+use trinity_butterfly::{run_component, run_component_gtasm, ComponentParams, EdgeSupport, GtModel};
 use trinity_chrysalis::pack::{
     read_at, PackIndex, PackWriter, BUTTERFLY_PACK, GRAPHS_PACK, KIND_ALL_PROB_PATHS,
     KIND_GRAPH_OUT, KIND_GRAPH_READS,
 };
 use trinity_common::error::CommonError;
+
+use crate::args::PathEngine;
+
+/// gtasm 引擎的池级共享上下文（模型 + 原始 reads 边支持表; 逐 comp 只读）。
+#[derive(Debug)]
+pub struct GtasmShared {
+    pub model: GtModel,
+    pub support: EdgeSupport,
+}
 
 /// 组件池参数（从 TrinityArgs 收敛）。
 #[derive(Debug, Clone)]
@@ -38,6 +47,10 @@ pub struct ButterflyPoolParams {
     pub group_pairs_distance: usize,
     /// 专用组件线程栈（--bfly_stack_mb）。
     pub stack_size_mb: usize,
+    /// 路径引擎（classic 默认 = 现状逐字节; gtasm = GT 打分 + GTasm 解码）。
+    pub path_engine: PathEngine,
+    /// gtasm 共享上下文（path_engine == Gtasm 时必有）。
+    pub gtasm: Option<Arc<GtasmShared>>,
 }
 
 /// 原版 butterfly 命令实参（L2363-2388）:
@@ -169,13 +182,36 @@ fn run_one(
         String::from_utf8(bytes)
             .map_err(|e| CommonError::Parse(format!("non-UTF8 record in {}: {e}", pack.display())))
     };
-    let g = read_rec(KIND_GRAPH_OUT)?;
-    let r = read_rec(KIND_GRAPH_READS)?;
-    let result = run_component(&g, &r, &component_params(base, params))?;
-    writer.lock().unwrap().append(
-        id,
-        KIND_ALL_PROB_PATHS,
-        result.all_prob_paths_fasta.as_bytes(),
-    )?;
+    let fasta = match params.path_engine {
+        PathEngine::Classic => {
+            let g = read_rec(KIND_GRAPH_OUT)?;
+            let r = read_rec(KIND_GRAPH_READS)?;
+            run_component(&g, &r, &component_params(base, params))?.all_prob_paths_fasta
+        }
+        PathEngine::Gtasm => {
+            // gtasm 只需 graph.out（支持来自原始 reads 支持表, 不读 graph.reads）
+            let g = read_rec(KIND_GRAPH_OUT)?;
+            let shared = params.gtasm.as_ref().ok_or_else(|| {
+                CommonError::Parse("gtasm 模式缺少共享上下文（模型/支持表）".to_string())
+            })?;
+            let name = base
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "component".to_string());
+            run_component_gtasm(
+                &g,
+                id,
+                &name,
+                params.min_contig_length,
+                &shared.model,
+                &shared.support,
+            )
+            .map_err(|e| CommonError::Parse(format!("gtasm 组件 {id} 失败: {e}")))?
+        }
+    };
+    writer
+        .lock()
+        .unwrap()
+        .append(id, KIND_ALL_PROB_PATHS, fasta.as_bytes())?;
     Ok(())
 }

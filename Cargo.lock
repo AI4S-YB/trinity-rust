@@ -364,6 +364,7 @@ dependencies = [
  "libc",
  "mimalloc",
  "rayon",
+ "rustc-hash",
  "trinity-butterfly",
  "trinity-chrysalis",
  "trinity-common",
