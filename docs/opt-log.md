@@ -1942,3 +1942,23 @@ sr map 逐条算深度+宽度, 阈值网格 B∈[0.5,0.9]×D∈[1,5]x）:
 裁定: 放弃深度/宽度过滤路线。P 的 1pp 尾巴就是低表达生物学的本体,
 不是可滤的噪声; 之前"442 条疑似噪声"的表述被本探针修正为
 "低支持真实序列与噪声的混合体, 无低成本可分性"。
+| 2026-08-30 | dev1 | R=13.9% P=82.0% **F1=23.8%** | N50=1768 n=8027 | --path-engine gtasm --gt-weights /storage/home/senior007/test/athal/bench/export/gtnet_dev1.gtw --multi-k auto --CPU 8 --max_memory 8G |
+
+## 引擎差距追踪 v2: 残余 = 分支点碎片化（2026-08-30, probe_gaptrace）
+
+visited 穿越后重解剖（dev1, classic@mk full 603 vs gtasm@mk+穿越 full 559,
+差距 49 条 principal）:
+
+- 图内严格可走 24 条 + 近可走（参照含变异位点）25 条——**离图断点型
+  （butterfly read-threading 专属领地）只剩 ~1 条**, read-threading 不再是
+  主要差距来源（原 40 条不可走假设被推翻: 25 条"不可走"实为参照序列
+  变异导致的假不可走, classic contig 本身在图内）。
+- 失败形态: gtasm 最佳覆盖 0.85-0.94 的近失误 30 条中 **27 条是中间
+  碎片化**（≥2 段在参照坐标上重叠/紧邻, 仅 3 条末端缺失, 末端缺失中位
+  仅 16/31bp）——完整路径在图里, walk 在**分支点选错臂**, 正解被拆成
+  两个 contig。visited 穿越无法挽回"起点后第一次选择就错"的情形。
+- 裁定: 残余引擎差距 = **分支点保真度**。候选刀法: (a) read PAIR 证据
+  进分支决策（butterfly pair_paths 语义, 单 read look-back 已证无效,
+  pair 是 76bp 读长下唯一够得着 300-400bp 分支间距的证据, 未测）;
+  (b) 简单 bulge 双臂都产出（rnaspades 规则嫁接, 精度换召回）;
+  (c) 同 comp 碎片 pair-guided 合并（此前 OLC 系列证伪过, 谨慎）。
