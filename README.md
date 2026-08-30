@@ -22,11 +22,13 @@ target/release/trinity-cli \
 | `--left/--right` | PE reads（逗号分隔多文件）；`--single` 为 SE |
 | `--SS_lib_type F\|R\|RF\|FR` | 链特异性库（RF/FR = PE） |
 | `--CPU/--max_memory` | 线程数 / 内存上限护栏 |
-| `--KMER_SIZE`（别名 `__KMER_SIZE`，默认 25） | inchworm k-mer 大小 |
+| `--KMER_SIZE`（别名 `__KMER_SIZE`，默认 25） | inchworm k-mer 大小；单独给出（无 `--multi-k`/`--no-multi-k`）= 隐式单 k 模式并打印提示警告 |
+| `--multi-k auto\|k1,k2,...`（扩展，**默认 auto**） | rnaSPAdes 式多 k 迭代 + trusted contig 注入；`auto` 按读长公式选 k（RL=76 → [29,37]），显式列表须严格递升且 k∈[15,63] |
+| `--no-multi-k`（扩展） | 回退 classic 单 k（k = `--KMER_SIZE` 值）；与显式 `--multi-k` 互斥 |
 | `--min_kmer_cov`（别名 `--min_kmer_count`） | k-mer 计数下限 |
 | `--normalize_max_read_cov` / `--no_normalize_reads` | 归一化上限 / 跳过归一化 |
 | `--bfly_stack_mb` | Butterfly 线程栈（本实现扩展，默认对齐原版 JVM 栈行为） |
-| `--path-engine classic\|gtasm`（扩展，默认 classic） | butterfly 组件的路径引擎；`gtasm` = GT 边打分（GTW1 权重）× GTasm 式解码 × 原始 reads 边支持 |
+| `--path-engine classic\|gtasm\|rnaspades`（扩展，默认 classic） | butterfly 组件的路径引擎；`gtasm` = GT 边打分（GTW1 权重）× GTasm 式解码 × 原始 reads 边支持（只在 k=25 图上验证过：未显式 `--multi-k` 时强制单 k 并警告，显式 `--multi-k` 可强制组合） |
 | `--gt-weights <path>`（扩展） | gtasm 引擎的 GTW1 模型权重（`--path-engine gtasm` 时必填） |
 | `--no_cleanup` | 保留中间产物（both.fa / left.fa / right.fa、归一化 norm.fq 等；位置在 scratch 目录） |
 | `--scratch <dir>` | 中间产物写到 `<scratch>/<output 目录名>/`（显式指定时不做空间检查） |
@@ -67,7 +69,7 @@ target/release/trinity-cli \
 
 **参数别名**：`__KMER_SIZE` → `--KMER_SIZE`、`--min_kmer_cov` → `--min_kmer_count`（两个名字都收，与原版主程序名兼容）。
 
-**扩展**：`--bfly_stack_mb` 显式控制 butterfly 工作线程栈上限（原版由 JVM `-Xss` 隐式决定）。`--path-engine gtasm` + `--gt-weights` 启用 GT 打分解图引擎（python GTasm 原型产品化；chrysalis 之后多一个原始 reads 边支持 pass，产物 `gtasm_edge_support.bin` 随 scratch 落盘并受 `.gtasm_support.ok` checkpoint 保护；gtasm 与 `--recursive` 互斥）。
+**扩展**：`--bfly_stack_mb` 显式控制 butterfly 工作线程栈上限（原版由 JVM `-Xss` 隐式决定）。`--path-engine gtasm` + `--gt-weights` 启用 GT 打分解图引擎（python GTasm 原型产品化；chrysalis 之后多一个原始 reads 边支持 pass，产物 `gtasm_edge_support.bin` 随 scratch 落盘并受 `.gtasm_support.ok` checkpoint 保护；gtasm 与 `--recursive` 互斥）。`--multi-k auto|k1,k2,...` 启用 rnaSPAdes 式多 k 迭代 + trusted contig 注入（中间轮 `iter_k<k>/` 只构图、最终轮完整管线，三数据集交叉验证为净增益）——**自 2026-08-30 起为默认行为（缺省 = `auto`）**；`--no-multi-k` 回退 classic 单 k；单独 `--KMER_SIZE` = 隐式单 k + 提示警告；显式 `--multi-k` 与 `--KMER_SIZE`/`--no-multi-k`/`--recursive` 互斥。**gtasm 特例**：`--path-engine gtasm` 未显式给 `--multi-k` 时强制单 k 并警告（gtasm 只在 k=25 图上验证过），显式给则放行并警告组合未验证；`--path-engine rnaspades` 为 rnaSPAdes MultiExtender 规则复刻引擎（高精度低召回，默认多 k 下可正常组合）。管线启动时打印生效 k 序列（`multi-k: auto → [29, 37]` / `single-k: 25`）便于确认模式。
 
 **中间产物布局（性能优化，既定差异）**：`chrysalis/Component_bins/Cbin*/` 下不再逐组件写 `cN.graph.out` / `cN.graph.reads` / `cN.graph.allProbPaths.fasta` 小文件（2.8 万组件 ≈ 8.5 万个文件，NFS 上元数据往返极贵），改为每个 Cbin 两个打包文件 `graphs.pack`/`graphs.idx`（QuantifyGraph 产物）与 `butterfly.pack`/`butterfly.idx`（Butterfly 产物）；`.idx` 为定长 32B 记录（component id / kind / offset / len，小端）。归一化的 `left.norm.*` 便捷名是长名文件的硬链接（原版为符号链接），不再物理双写。
 

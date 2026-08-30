@@ -51,6 +51,9 @@ fn write_synthetic_reads(dir: &Path) -> PathBuf {
 }
 
 fn synth_args(fa: &Path, outdir: &Path) -> trinity_cli::TrinityArgs {
+    // --no-multi-k: 钉住 classic 单 k（k=25）——本文件的断点名/清理断言均是
+    // k=25 产物（.jellyfish_count.25...）; 默认 multi-k auto 的 e2e 覆盖见
+    // multi_k_default_auto_e2e。
     let argv: Vec<String> = [
         "--seqType",
         "fa",
@@ -61,6 +64,7 @@ fn synth_args(fa: &Path, outdir: &Path) -> trinity_cli::TrinityArgs {
         "--output",
         outdir.to_str().unwrap(),
         "--no_normalize_reads",
+        "--no-multi-k",
         "--CPU",
         "2",
         "--min_contig_length",
@@ -329,4 +333,28 @@ fn multi_k_end_to_end_iter_dirs() {
     assert!(!iter15.join("mer_counts.15.asm.rs.bin").exists());
     assert!(!iter17.join("mer_counts.17.asm.rs.bin").exists());
     assert!(final_fa.exists());
+}
+
+/// 默认（无任何 k 相关 flag）= --multi-k auto（2026-08-30 转正）: 合成 100bp
+/// reads → RL=100 → rnaSPAdes 公式 [33,49] → iter_k33 中间轮 + iter_k49
+/// 完整轮, 最终 Trinity.fasta 照常产出。
+#[test]
+fn multi_k_default_auto_e2e() {
+    let dir = tmpdir("multik-default");
+    let fa = write_synthetic_reads(&dir);
+    let outdir = dir.join("trinity_out");
+    // synth_args 带 --no-multi-k（钉 classic）, 这里去掉以走默认路径
+    let mut a = synth_args(&fa, &outdir);
+    a.multi_k = Some(trinity_cli::MultiK::Auto);
+    let final_fa = run_trinity(&a).unwrap();
+    assert!(fa_record_count(&final_fa) >= 1, "no transcripts in final fasta");
+    let work = trinity_cli::orchestrate::default_scratch_dir(&outdir);
+    // 中间轮 k=33: 只构图; 最终轮 k=49: 完整管线
+    let iter33 = work.join("iter_k33");
+    assert!(iter33.join(".iworm.33.asm.ok").exists());
+    assert!(!iter33.join(".quantify_graph.ok").exists());
+    let iter49 = work.join("iter_k49");
+    assert!(iter49.join(".iworm.49.asm.ok").exists());
+    assert!(iter49.join(".quantify_graph.ok").exists());
+    assert!(iter49.join(".butterfly.ok").exists());
 }

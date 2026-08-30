@@ -1822,3 +1822,6 @@ counts_bin 体积翻倍——dev1 规模无感, 更大数据集需留意内存�
 reads 深度>=5x（候选真实/未注释, StringTie 参照本身不全）; 疑似噪声
 仅 ~442 条（深度中位 2.0x）。**P 的 1pp 代价里约六成是真转录本**——
 评估口径（StringTie 参照不完整）放大表观代价, 生物学净收益为正。
+| 2026-08-30 | dev1 | R=15.4% P=79.9% **F1=25.9%** | N50=1896 n=8548 | --CPU 8 --max_memory 8G |
+| 2026-08-30 | nomultik-dev1 | R=14.0% P=82.2% **F1=23.9%** | N50=1822 n=7828 | --no-multi-k --CPU 8 --max_memory 8G |
+| 2026-08-30 | gtasm-singlek-dev1 | R=12.2% P=89.1% **F1=21.5%** | N50=1672 n=6768 | --path-engine gtasm --gt-weights /storage/home/senior007/test/athal/bench/export/gtnet_dev1.gtw --CPU 8 --max_memory 8G |

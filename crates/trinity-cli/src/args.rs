@@ -18,7 +18,8 @@ pub enum SeqType {
 /// - `classic`（默认）: butterfly allProbPaths 全链, 行为与现状逐字节一致;
 /// - `gtasm`: GT 边打分（GTW1 权重, `--gt-weights`）× GTasm 式解码 × 原始
 ///   reads 边支持（python 原型 gt_decode2.py C 变体的产品化, 详见
-///   trinity-butterfly `gtmodel`/`gtdecode` 模块）;
+///   trinity-butterfly `gtmodel`/`gtdecode` 模块）; 只在 k=25 图上验证过——
+///   未显式 `--multi-k` 时强制单 k（[`resolve_multi_k`] 特例）;
 /// - `rnaspades`: rnaSPAdes PathExtend MultiExtender 核心规则复刻（覆盖
 ///   一致性贪心延伸 + 简单 bulge 双 isoform 分叉 + 其余歧义停止 +
 ///   path_cleaning 110bp/cov≥2, 详见 trinity-butterfly `rnaspades` 模块）。
@@ -30,7 +31,10 @@ pub enum PathEngine {
 }
 
 /// `--multi-k`（**Rust 版扩展**, rnaSPAdes 式多 k 迭代 + trusted contig 注入）。
-/// 缺省 = None（单 k classic, 行为逐字节不变）。
+/// **缺省（无任何相关 flag）= Auto**（2026-08-30 转正为默认: 三数据集交叉验证
+/// 为净增益, 见 docs/opt-log.md「multi-k 转正为默认」）; `--no-multi-k` /
+/// 单独 `--KMER_SIZE` / gtasm·recursive 特例回退为 None（单 k, 见
+/// [`resolve_multi_k`]）。
 ///
 /// - `Auto`: 按 reads 读长（前 1000 条抽样）走 rnaSPAdes `rna_k_values` 公式
 ///   （multik::rna_k_values）, 再钳入支持域 [15, 63]（KmerId=u128 扩容后,
@@ -94,9 +98,11 @@ pub struct TrinityArgs {
     pub path_engine: PathEngine,
     /// **Rust 版扩展**: GTasm 引擎的 GTW1 权重路径（gtasm 必填）。
     pub gt_weights: Option<PathBuf>,
-    /// **Rust 版扩展**: rnaSPAdes 式多 k 迭代（`--multi-k auto|k1,k2,...`）。
-    /// None = 关闭（单 k classic, 现有行为逐字节不变）。与 --KMER_SIZE /
-    /// --recursive 互斥（防歧义, 沿 gtasm×recursive 先例）。
+    /// **Rust 版扩展**: rnaSPAdes 式多 k 迭代的生效值（`--multi-k auto|k1,...` /
+    /// `--no-multi-k` 经 [`resolve_multi_k`] 解析后的结果）。None = 单 k classic
+    /// （k = --KMER_SIZE）; 缺省（无任何相关 flag）= Some(Auto)（2026-08-30 转正）。
+    /// 显式 --multi-k 与 --KMER_SIZE / --no-multi-k / --recursive 互斥（防歧义,
+    /// 沿 gtasm×recursive 先例）。
     pub multi_k: Option<MultiK>,
     /// **Rust 版扩展**: rnaSPAdes 式相对覆盖图清理（chrysalis QuantifyGraph
     /// 后对 c*.graph.out 做 tip/EC/rcc 删除, 见 trinity-chrysalis::graph_clean）。
@@ -170,6 +176,75 @@ fn aliased_uint<T: std::str::FromStr>(
     }
 }
 
+/// multi-k 生效值解析（2026-08-30 转正为默认, 三数据集净增益见
+/// docs/opt-log.md「多 k 增益三数据集交叉验证」）。返回（生效值, 警告列表）——
+/// 纯函数不打印, 警告由 parse_args 统一 eprintln（便于测试断言文案）。
+///
+/// 优先级（explicit = 显式 --multi-k 值, 已解析）:
+/// 1. 显式 `--multi-k auto|list` → 照用; gtasm 引擎下附「组合未验证」警告
+///    （显式指定 = 用户强制, 放行）。
+/// 2. `--no-multi-k` → 单 k（与显式 --multi-k 同给 = 矛盾, usage 报错）。
+/// 3. 单独 `--KMER_SIZE`（无 --multi-k/--no-multi-k）→ 隐式单 k + 提示警告。
+/// 4. 缺省: gtasm 引擎 → 强制单 k + 回退警告（多 k 组合仅在 k=25 图上验证过）;
+///    --recursive → 回退单 k + 警告（迷你管线未接线; 显式组合仍是报错）;
+///    其余 → Some(Auto)。
+fn resolve_multi_k(
+    explicit: Option<MultiK>,
+    no_multi_k: bool,
+    kmer_given: bool,
+    kmer_size: usize,
+    engine: PathEngine,
+    recursive: bool,
+) -> Result<(Option<MultiK>, Vec<String>), CliError> {
+    if no_multi_k && explicit.is_some() {
+        return Err(CliError::usage(
+            "Error, --no-multi-k 与 --multi-k 互斥: 前者关闭多 k 迭代, 后者显式开启, 语义矛盾",
+        ));
+    }
+    match explicit {
+        Some(mk) => {
+            let warns = if engine == PathEngine::Gtasm {
+                vec![
+                    "WARNING: gtasm 引擎的多 k 组合未验证（gtasm 只在 k=25 图上验证过）——按显式 --multi-k 强制执行".to_string(),
+                ]
+            } else {
+                Vec::new()
+            };
+            Ok((Some(mk), warns))
+        }
+        None => {
+            if no_multi_k {
+                return Ok((None, Vec::new()));
+            }
+            if kmer_given {
+                return Ok((
+                    None,
+                    vec![format!(
+                        "WARNING: 已给出 --KMER_SIZE {kmer_size} 但未给 --multi-k——按隐式单 k 模式运行（多 k 已是默认行为）; 如需多 k 请显式 --multi-k auto|k1,k2,..."
+                    )],
+                ));
+            }
+            if engine == PathEngine::Gtasm {
+                return Ok((
+                    None,
+                    vec![
+                        "WARNING: gtasm 引擎的多 k 组合未验证, 已回退单 k; 显式 --multi-k 可强制组合".to_string(),
+                    ],
+                ));
+            }
+            if recursive {
+                return Ok((
+                    None,
+                    vec![
+                        "WARNING: --multi-k 与 --recursive 暂不支持组合（迷你管线未接线）, 已回退单 k（--KMER_SIZE 可选定 k 值）".to_string(),
+                    ],
+                ));
+            }
+            Ok((Some(MultiK::Auto), Vec::new()))
+        }
+    }
+}
+
 pub fn parse_args(argv: &[String]) -> Result<TrinityArgs, CliError> {
     let mut cli = Cli::new(argv);
 
@@ -228,12 +303,15 @@ pub fn parse_args(argv: &[String]) -> Result<TrinityArgs, CliError> {
         }
     };
     let gt_weights = cli.value_flag("--gt-weights")?.map(PathBuf::from);
-    // --multi-k auto | k1,k2,...（Rust 版扩展, rnaSPAdes 式多 k 迭代）
-    let multi_k = match cli.value_flag("--multi-k")?.as_deref() {
+    // --multi-k auto | k1,k2,...（Rust 版扩展, rnaSPAdes 式多 k 迭代; 显式值）
+    let multi_k_explicit = match cli.value_flag("--multi-k")?.as_deref() {
         None => None,
         Some("auto") => Some(MultiK::Auto),
         Some(v) => Some(MultiK::List(parse_multi_k_list(v)?)),
     };
+    // --no-multi-k（沿 --no_normalize_reads 命名先例）: 回退 classic 单 k
+    let no_multi_k = cli.bool_flag("--no-multi-k");
+    let kmer_given = cli.was_given("--KMER_SIZE") || cli.was_given("__KMER_SIZE");
     // --graph-clean-rnaspades（Rust 版扩展, 默认关）
     let graph_clean_rnaspades = cli.bool_flag("--graph-clean-rnaspades");
     // --gap-close-spades（Rust 版扩展, 默认关）
@@ -311,10 +389,27 @@ pub fn parse_args(argv: &[String]) -> Result<TrinityArgs, CliError> {
             }
         )));
     }
+    // multi-k 生效值解析（默认化, 2026-08-30 转正）: 缺省 = auto; --no-multi-k /
+    // 单独 --KMER_SIZE / gtasm·recursive 特例 → 单 k（回退均带 WARNING,
+    // 让用户对生效模式无歧义）。警告文案由 resolve_multi_k 以返回值给出,
+    // 此处统一打印（纯函数便于测试断言文案）。
+    let (multi_k, mk_warns) = resolve_multi_k(
+        multi_k_explicit,
+        no_multi_k,
+        kmer_given,
+        kmer_size,
+        path_engine,
+        recursive,
+    )?;
+    for w in &mk_warns {
+        eprintln!("{w}");
+    }
     // multi-k 互斥校验（防歧义）: 多 k 轮次自带 k 序列, 与 --KMER_SIZE 同给
     // 语义冲突（哪个生效?）; 与 --recursive 的组合未实现（沿 gtasm 先例）。
+    // 解析后 multi_k 仍 Some ⇒ 用户显式给了 --multi-k（缺省 auto 在 recursive
+    // 下已被 resolve 回退为单 k, 不误伤纯 --recursive 用法）。
     if multi_k.is_some() {
-        if cli.was_given("--KMER_SIZE") || cli.was_given("__KMER_SIZE") {
+        if kmer_given {
             return Err(CliError::usage(
                 "Error, --multi-k 与 --KMER_SIZE 互斥: 多 k 迭代的 k 序列由 --multi-k 给定, 请勿再指定 --KMER_SIZE",
             ));
@@ -474,10 +569,98 @@ mod tests {
     }
 
     #[test]
-    fn multi_k_defaults_off() {
-        // 缺省 = None（单 k classic 路径, 行为不变）
+    fn multi_k_defaults_to_auto() {
+        // 缺省（无任何相关 flag）= --multi-k auto（2026-08-30 转正）
         let a = parse_args(&argv(&[])).unwrap();
+        assert_eq!(a.multi_k, Some(MultiK::Auto));
+    }
+
+    #[test]
+    fn no_multi_k_forces_single_k() {
+        // --no-multi-k → 单 k classic（k = --KMER_SIZE 值, 默认 25）
+        let a = parse_args(&argv(&["--no-multi-k"])).unwrap();
         assert_eq!(a.multi_k, None);
+        assert_eq!(a.kmer_size, 25);
+        // --no-multi-k + --KMER_SIZE → 单 k 取给定值, 无警告
+        let a = parse_args(&argv(&["--no-multi-k", "--KMER_SIZE", "31"])).unwrap();
+        assert_eq!(a.multi_k, None);
+        assert_eq!(a.kmer_size, 31);
+        // 与显式 --multi-k 同给 = 矛盾 → usage 报错
+        assert!(parse_args(&argv(&["--no-multi-k", "--multi-k", "auto"])).is_err());
+        assert!(parse_args(&argv(&["--no-multi-k", "--multi-k", "21,25"])).is_err());
+    }
+
+    #[test]
+    fn kmer_size_alone_implicit_single_k_with_warning() {
+        // 单独 --KMER_SIZE → 隐式单 k（既有互斥只挡显式 --multi-k 组合）
+        let a = parse_args(&argv(&["--KMER_SIZE", "31"])).unwrap();
+        assert_eq!(a.multi_k, None);
+        assert_eq!(a.kmer_size, 31);
+        assert!(parse_args(&argv(&["__KMER_SIZE", "31"])).unwrap().multi_k.is_none());
+        // 警告文案（resolve_multi_k 纯函数断言）: 提示可用 --multi-k
+        let (mk, warns) =
+            resolve_multi_k(None, false, true, 31, PathEngine::Classic, false).unwrap();
+        assert_eq!(mk, None);
+        assert_eq!(warns.len(), 1);
+        assert!(
+            warns[0].starts_with("WARNING") && warns[0].contains("--multi-k"),
+            "{}",
+            warns[0]
+        );
+    }
+
+    #[test]
+    fn gtasm_engine_special_case() {
+        // gtasm + 未显式 --multi-k → 强制单 k + 回退警告
+        let a = parse_args(&argv(&["--path-engine", "gtasm", "--gt-weights", "/tmp/m.gtw"]))
+            .unwrap();
+        assert_eq!(a.multi_k, None);
+        let (mk, warns) =
+            resolve_multi_k(None, false, false, 25, PathEngine::Gtasm, false).unwrap();
+        assert_eq!(mk, None);
+        assert!(
+            warns.iter().any(|w| w.contains("gtasm") && w.contains("回退")),
+            "{warns:?}"
+        );
+        // 显式 --multi-k + gtasm → 允许 + 未验证警告
+        let a = parse_args(&argv(&[
+            "--path-engine",
+            "gtasm",
+            "--gt-weights",
+            "/tmp/m.gtw",
+            "--multi-k",
+            "29,37",
+        ]))
+        .unwrap();
+        assert_eq!(a.multi_k, Some(MultiK::List(vec![29, 37])));
+        let (mk, warns) =
+            resolve_multi_k(Some(MultiK::Auto), false, false, 25, PathEngine::Gtasm, false)
+                .unwrap();
+        assert_eq!(mk, Some(MultiK::Auto));
+        assert!(
+            warns.iter().any(|w| w.contains("gtasm") && w.contains("未验证")),
+            "{warns:?}"
+        );
+        // classic / rnaspades 引擎不受此限: 缺省仍 auto
+        let a = parse_args(&argv(&["--path-engine", "rnaspades"])).unwrap();
+        assert_eq!(a.multi_k, Some(MultiK::Auto));
+        // gtasm + --no-multi-k → 单 k 无警告（用户显式选择, 非回退）
+        let (mk, warns) =
+            resolve_multi_k(None, true, false, 25, PathEngine::Gtasm, false).unwrap();
+        assert_eq!(mk, None);
+        assert!(warns.is_empty());
+    }
+
+    #[test]
+    fn recursive_default_downgrades_to_single_k() {
+        // --recursive 未显式 --multi-k → 回退单 k（不报错, 保既有用法）;
+        // 显式组合仍是报错（见 multi_k_mutex_with_kmer_size_and_recursive）
+        let a = parse_args(&argv(&["--recursive"])).unwrap();
+        assert_eq!(a.multi_k, None);
+        let (_, warns) =
+            resolve_multi_k(None, false, false, 25, PathEngine::Classic, true).unwrap();
+        assert_eq!(warns.len(), 1);
+        assert!(warns[0].contains("--recursive"), "{}", warns[0]);
     }
 
     #[test]

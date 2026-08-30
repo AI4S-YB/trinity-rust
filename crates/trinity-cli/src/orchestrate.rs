@@ -283,18 +283,26 @@ pub fn run_trinity(args: &TrinityArgs) -> Result<PathBuf, CommonError> {
 
     // ---- multi-k 轮次解析（rnaSPAdes 式多 k 迭代 + trusted contig 注入,
     // 机制调研见 docs/opt-log.md「rnaSPAdes 构图机制调研」）:
-    // 缺省 None → 单 k classic（k = --KMER_SIZE, 行为逐字节不变）;
+    // None → 单 k classic（k = --KMER_SIZE; --no-multi-k / 单独 --KMER_SIZE /
+    // gtasm·recursive 特例回退, 见 args::resolve_multi_k）;
     // auto → 读长抽样 + rna_k_values 公式 + 支持域钳制（multik.rs）。
-    // k = 最后一轮的 k（单 k 时即唯一轮）。----
+    // 启动即打印生效 k 序列（"multi-k: auto → [..]" / "single-k: N"）,
+    // 让用户一眼确认模式。k = 最后一轮的 k（单 k 时即唯一轮）。----
     let k_list: Vec<usize> = match &args.multi_k {
-        None => vec![args.kmer_size],
-        Some(MultiK::List(ks)) => ks.clone(),
+        None => {
+            eprintln!("single-k: {}", args.kmer_size);
+            vec![args.kmer_size]
+        }
+        Some(MultiK::List(ks)) => {
+            eprintln!("multi-k: 显式列表 → {ks:?}");
+            ks.clone()
+        }
         Some(MultiK::Auto) => {
             let rl = crate::multik::detect_read_length(args)?;
             let raw = crate::multik::rna_k_values(rl);
             let ks = crate::multik::clamp_k_list(raw.clone());
             eprintln!(
-                "--multi-k auto: 读长 RL={rl}（各文件前 1000 条抽样取 max, 跨文件取 min）→ rnaSPAdes 公式 {raw:?} → 钳制后 {ks:?}"
+                "multi-k: auto → {ks:?}（读长 RL={rl}, 各文件前 1000 条抽样取 max 跨文件取 min; rnaSPAdes 公式 {raw:?} 经支持域钳制）"
             );
             ks
         }

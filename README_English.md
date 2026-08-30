@@ -22,7 +22,9 @@ Common options (same names as the upstream `Trinity` script):
 | `--left/--right` | PE reads (comma-separated for multiple files); `--single` for SE |
 | `--SS_lib_type F\|R\|RF\|FR` | Strand-specific library (RF/FR = PE) |
 | `--CPU/--max_memory` | Thread count / memory guardrail |
-| `--KMER_SIZE` (alias `__KMER_SIZE`, default 25) | inchworm k-mer size |
+| `--KMER_SIZE` (alias `__KMER_SIZE`, default 25) | inchworm k-mer size; given alone (without `--multi-k`/`--no-multi-k`) implies single-k mode with a warning |
+| `--multi-k auto\|k1,k2,...` (extension, **default `auto`**) | rnaSPAdes-style multi-k iteration + trusted contig injection; `auto` picks k from read length (RL=76 → [29,37]); explicit lists must be strictly increasing, k∈[15,63] |
+| `--no-multi-k` (extension) | Fall back to classic single-k (k = `--KMER_SIZE`); mutually exclusive with explicit `--multi-k` |
 | `--min_kmer_cov` (alias `--min_kmer_count`) | k-mer count cutoff |
 | `--normalize_max_read_cov` / `--no_normalize_reads` | Normalization cap / skip normalization |
 | `--bfly_stack_mb` | Butterfly thread stack (extension of this port; defaults to match upstream JVM stack behavior) |
@@ -70,7 +72,7 @@ Five crates plus an orchestrating CLI; the data flow mirrors the upstream pipeli
 
 **Option aliases**: `__KMER_SIZE` → `--KMER_SIZE`, `--min_kmer_cov` → `--min_kmer_count` (both spellings accepted, compatible with the upstream main program).
 
-**Extension**: `--bfly_stack_mb` explicitly controls the Butterfly worker thread stack limit (upstream derives this implicitly from the JVM `-Xss` setting).
+**Extension**: `--bfly_stack_mb` explicitly controls the Butterfly worker thread stack limit (upstream derives this implicitly from the JVM `-Xss` setting). `--multi-k` (rnaSPAdes-style multi-k iteration + trusted contig injection) **is the default since 2026-08-30** (absent any flag it resolves to `auto`); `--no-multi-k` falls back to classic single-k. Special case: with `--path-engine gtasm` and no explicit `--multi-k`, the run is forced to single-k with a warning (gtasm has only been validated on k=25 graphs; an explicit `--multi-k` overrides, also with a warning). The pipeline logs the effective k sequence at startup (`multi-k: auto → [29, 37]` / `single-k: 25`).
 
 **Intermediate layout (performance, accepted difference)**: `chrysalis/Component_bins/Cbin*/` no longer holds per-component `cN.graph.out` / `cN.graph.reads` / `cN.graph.allProbPaths.fasta` files (28k components ≈ 85k small files — prohibitive metadata round-trips on NFS). Instead each Cbin has two packed stores: `graphs.pack`/`graphs.idx` (QuantifyGraph output) and `butterfly.pack`/`butterfly.idx` (Butterfly output); the `.idx` is a fixed-size 32-byte record stream (component id / kind / offset / len, little-endian). The normalization `left.norm.*` convenience names are hard links to the long-named files (upstream uses symlinks) instead of physical duplicate writes.
 
