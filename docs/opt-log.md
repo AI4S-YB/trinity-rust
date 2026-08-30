@@ -1843,3 +1843,102 @@ reads 深度>=5x（候选真实/未注释, StringTie 参照本身不全）; 疑�
 - 但同图对比 classic 仍 -2.7pp R: 引擎差距（butterfly read-threading 的
   提取能力）大于图改进（+0.4pp）, gtasm 仍未吃干榨尽图里的路径。
 - 建议: 解除 gtasm 缺省强制单 k 的限制（组合已验证为正）, 警告可降级。
+| 2026-08-30 | dev1 | R=13.9% P=82.0% **F1=23.8%** | N50=1768 n=8026 | --path-engine gtasm --gt-weights /storage/home/senior007/test/athal/bench/export/gtnet_dev1.gtw --multi-k auto --CPU 8 --max_memory 8G |
+| 2026-08-30 | dev1-novwalk | R=12.6% P=89.2% **F1=22.1%** | N50=1709 n=6449 | --path-engine gtasm --gt-weights /storage/home/senior007/test/athal/bench/export/gtnet_dev1.gtw --multi-k auto --no-gtasm-visited-walk --CPU 8 --max_memory 8G |
+| 2026-08-30 | dev1 | R=15.4% P=79.8% **F1=25.9%** | N50=1896 n=8566 | --CPU 8 --max_memory 8G |
+
+## gtasm 解码 visited 穿越修复（2026-08-30, cache 44bc70316e3b7a32 / b958fd1e7bcb1aa8）
+
+**机制**: 原型 gt_decode2 把 visited 节点硬排除（`w not in visited`）——强势
+isoform 的 walk 先把共享外显子标 visited, 弱势 isoform 的 walk 到边界即截断,
+完整路径被拆散吞没（差距集 68 条 principal 中 28 条图内完整可走, 其中 16 条
+≥95% 路径节点已被其他 gtasm 产出覆盖）。修复（`GtasmParams::allow_visited_walk`,
+CLI 默认开, `--no-gtasm-visited-walk` 回退原型语义）:
+
+- **两级候选过滤**: 优先 `not in seen/frozen 且未 visited`（原型语义）; 一级
+  为空再取 `not in seen/frozen` 的已 visited 候选（同 (gsc, vid, eid) 取 max）;
+  walk 内 seen/frozen 防环不变;
+- **重复产出防护**: 组件内已产出序列 64 位指纹集, 完全相同才丢弃（穿越重新
+  发现的同一 walk）; 共享部分节点的不同 isoform 照常产出;
+- **终止不变**: 每轮胜出 walk 必含起点边两端 → 该边必退出 alive; visited 只增
+  不减, 至多 ne 轮。NB_STARTS 采样/双向延伸/sup_sum 竞争/200bp 下限不动。
+
+**单测**: 泡形双 isoform 强弱两臂均完整产出（关 flag 对照复现截断残段）;
+无名平行入口重新发现同一 walk 不重复产出; 环图不挂死（≤2 条, seen 防环）;
+greedy_extend 两级过滤/起点 visited 处置; flag-off 路径的全部既有位精确断言
+不变。workspace 全绿 + clippy 零警告。
+
+**dev1 三方对照**（同一新二进制; A/B 仅差 decode flag, 共享同一上游图）:
+
+| 配置 | R | R70 | Rp | hcR | P | F1 | n | N50 |
+|---|---|---|---|---|---|---|---|---|
+| gtasm 修复前基线（08-30） | 12.6% | 50.8% | 10.3% | 33.6% | 89.2% | 22.1% | 6445 | 1709 |
+| B: gtasm `--no-gtasm-visited-walk` | 12.6% | 51.0% | 10.3% | 33.6% | 89.2% | 22.1% | 6449 | 1709 |
+| **A: gtasm visited 穿越开** | **13.9%** | **54.3%** | **10.7%** | 34.3% | 82.0% | **23.8%** | 8026 | 1768 |
+| C: classic 回归（无 flag） | 15.4% | 56.8% | 11.6% | 35.9% | 79.8% | 25.9% | 8566 | 1896 |
+
+- **A−B = 纯解码效应**: R **+1.3pp**, R70 **+3.3pp**, Rp +0.4pp, hcR +0.7pp,
+  F1 +1.7pp; 代价 P **-7.2pp**（89.2→82.0, 多出 1577 条 contig）。
+- **R 收敛**: gtasm↔classic 引擎差距 R 2.7pp 中拿回 ~48%, R70 差距 5.9pp 中
+  拿回 ~57%, Rp 差距 1.1pp 中拿回 ~36%——机制假设（visited 阻塞）坐实为
+  引擎差距的主成分之一, 但非全部（剩余 R -1.5pp 差距待查）。
+- **B−基线 = 上游漂移**（非本改动）: R/Rp/hcR/P/F1/N50 全同, 仅 R70 +0.2pp /
+  n +4; 两 cache 的 FASTA 头对比显示组件编号重排（c1 基线 len=8979 vs 新
+  len=617）——图在上游（inchworm/chrysalis）已不同, 而本改动只在 butterfly
+  池内消费 graph.out, 物理上不可能引起组件重排; 归因于基线测量二进制与
+  当前 HEAD 之间的提交漂移（4027446 multi-k 转正）。
+- **classic 回归 C**: 全轴命中既有波动带（对照 08-30 行 R=15.4 P=79.9
+  F1=25.9 N50=1896 n=8548）。
+- **P 代价解读**: 修复后 gtasm P=82.0% 仍高于 classic（79.8-80.4%）~2pp;
+  参照 multi-k P 让步归因先例（六成新增为真转录本, StringTie 参照不全放大
+  表观代价）, 新增 1577 条的构成值得同款 probe 复核后再定论。
+
+**裁定建议**: visited 穿越转正为 gtasm 默认（已落地为实验默认,
+`--no-gtasm-visited-walk` 可回退）——R/R70/Rp/F1 全轴显著向 classic 收敛且
+P 仍优于 classic; 遗留: (1) 新增 contig 的 probe 归因（真转录本占比）;
+(2) 剩余 R -1.5pp 引擎差距解剖（read-threading 提取能力）; (3) dev2/dev3
+交叉验证后再考虑移除回退旗标。
+| 2026-08-30 | dev3 | R=12.8% P=84.3% **F1=22.2%** | N50=1753 n=6679 | --path-engine gtasm --gt-weights /storage/home/senior007/test/athal/bench/export/gtnet_dev1.gtw --multi-k auto --CPU 8 --max_memory 8G |
+| 2026-08-30 | dev2 | R=13.5% P=80.4% **F1=23.1%** | N50=1733 n=9216 | --path-engine gtasm --gt-weights /storage/home/senior007/test/athal/bench/export/gtnet_dev1.gtw --multi-k auto --CPU 8 --max_memory 8G |
+
+## visited 穿越修复: 三数据集交叉验证 + 新增归因（2026-08-30）
+
+**交叉验证（gtasm@multi-k + 穿越默认开）vs classic@multi-k / gtasm@单k:**
+
+| 数据集 | 引擎 | R | R70 | Rp | hcR | P | F1 |
+|---|---|---|---|---|---|---|---|
+| dev1 | gtasm 穿越 | 13.9% | 54.3% | 10.7% | 34.3% | 82.0% | 23.8% |
+| dev2 | gtasm 穿越 | 13.5% | 52.4% | 10.3% | 33.7% | 80.4% | 23.1% |
+| dev3 | gtasm 穿越 | 12.8% | 53.5% | 9.5% | 34.5% | 84.3% | 22.2% |
+
+对 gtasm@单k: R 分别 +1.7/+2.0/+1.3pp（多 k 图 + 穿越叠加效应）;
+对 classic@multi-k: R 差距收敛到 -1.5/-1.6/-1.0pp（修复前 -2.7pp）,
+且 P 三个数据集全部保持不低于 classic（82.0/80.4/84.3 vs 79.8/79.7/80.2）。
+**裁定: 穿越修复跨数据集稳健。**
+
+**新增 1323 条归因（穿越开 vs 关, dev1）**: 62%（816）命中 ref;
+未命中 507 条中 448 条 reads 深度>=5x（深度中位 28x!）; 疑似噪声仅
+~59 条。**~96% 为真实序列**——被吞的确实是真 isoform, P 的表观代价
+基本全是参照不全的评测伪影。
+
+**运维记录**: /tmp 被 248 个 scratch 目录填满至 100%（bench 连环失败）,
+已清理并永久改道——所有 bench 以 TMPDIR=/storage/.../bench/scratch 运行
+（Rust temp_dir 语义, 覆盖管线 scratch 与评测临时文件）。
+
+## P 尾巴低成本过滤: 判别力证伪（2026-08-30, probe_ptail.py）
+
+假设: multi-k P 代价的 ~442 条"疑似噪声"可用 reads 深度/覆盖宽度低成本滤除。
+实测（classic@multi-k 8501 条, good=id>=0.95 命中 7239 条 / bad=1262 条,
+sr map 逐条算深度+宽度, 阈值网格 B∈[0.5,0.9]×D∈[1,5]x）:
+
+- 最松阈值 B<0.5&D<1: 删 bad 33% 但**误伤 good 12%**（好碱基损 19.6%）;
+- 最紧 B<0.9&D<5: 删 bad 49%, 误伤 good 25%（好碱基损 34.7%）;
+- **全程无干净切割线**——坏条与好条在深度/宽度上同分布。
+
+机理: P 尾巴的主体不是噪声, 是(a)低表达真转录本（参照内）与
+(b)参照外但 reads 强支持的真实序列（穿越归因: 深度中位 28x）——
+二者与真噪声在覆盖信号上不可分; mapq>=5 过滤还系统性低估了
+共享外显子家族的 read 支持（多映射）, 进一步混淆。
+裁定: 放弃深度/宽度过滤路线。P 的 1pp 尾巴就是低表达生物学的本体,
+不是可滤的噪声; 之前"442 条疑似噪声"的表述被本探针修正为
+"低支持真实序列与噪声的混合体, 无低成本可分性"。
