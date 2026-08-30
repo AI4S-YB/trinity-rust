@@ -30,6 +30,7 @@ target/release/trinity-cli \
 | `--bfly_stack_mb` | Butterfly 线程栈（本实现扩展，默认对齐原版 JVM 栈行为） |
 | `--path-engine classic\|gtasm\|rnaspades`（扩展，默认 classic） | butterfly 组件的路径引擎；`gtasm` = GT 边打分（GTW1 权重）× GTasm 式解码 × 原始 reads 边支持（只在 k=25 图上验证过：未显式 `--multi-k` 时强制单 k 并警告，显式 `--multi-k` 可强制组合） |
 | `--gt-weights <path>`（扩展） | gtasm 引擎的 GTW1 模型权重（`--path-engine gtasm` 时必填） |
+| `--no-gtasm-visited-walk`（扩展） | 关闭 gtasm 解码的 visited 穿越（默认开：walk 可穿越已 visited 节点救回共享外显子的弱势 isoform，完全重复产出自动丢弃）；给此旗标回退 python 原型语义 |
 | `--no_cleanup` | 保留中间产物（both.fa / left.fa / right.fa、归一化 norm.fq 等；位置在 scratch 目录） |
 | `--scratch <dir>` | 中间产物写到 `<scratch>/<output 目录名>/`（显式指定时不做空间检查） |
 

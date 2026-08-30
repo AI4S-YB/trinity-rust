@@ -55,6 +55,9 @@ pub struct ButterflyPoolParams {
     pub path_engine: PathEngine,
     /// gtasm 共享上下文（path_engine == Gtasm 时必有）。
     pub gtasm: Option<Arc<GtasmShared>>,
+    /// gtasm 解码的 visited 穿越（--no-gtasm-visited-walk 关闭; 默认开,
+    /// 机制见 trinity-butterfly gtdecode 模块文档）。仅 gtasm 引擎消费。
+    pub gtasm_visited_walk: bool,
 }
 
 /// 原版 butterfly 命令实参（L2363-2388）:
@@ -209,6 +212,7 @@ fn run_one(
                 params.min_contig_length,
                 &shared.model,
                 &shared.support,
+                params.gtasm_visited_walk,
             )
             .map_err(|e| CommonError::Parse(format!("gtasm 组件 {id} 失败: {e}")))?
         }

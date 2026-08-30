@@ -20,6 +20,19 @@
 //!   长度 ≥ min_len 才输出;
 //! - visited |= walk 节点; alive = 至少一端未 visited 的边。
 //!
+//! **visited 穿越（Rust 版扩展, [`GtasmParams::allow_visited_walk`]; CLI 默认开,
+//! `--no-gtasm-visited-walk` 关）**: 原型把 visited 节点硬排除——强势 isoform 的
+//! walk 先把共享外显子标 visited, 弱势 isoform 的 walk 到边界即截断, 完整路径被
+//! 拆散吞没（dev1 实测 68 条引擎差距 principal 中 16 条 ≥95% 路径节点已被其他
+//! gtasm 产出覆盖）。开启后:
+//! - 候选两级过滤: 优先 `not in seen/frozen 且未 visited`（原型语义）; 一级为
+//!   空再取 `not in seen/frozen` 的已 visited 候选（同 (gsc, vid, eid) 元组
+//!   取 max）; walk 内 seen/frozen 防环逻辑不变;
+//! - 重复产出防护: 组件内已产出序列的 64 位指纹集, 完全相同才丢弃（穿越可能
+//!   重新发现与已产出完全相同的 walk; 共享部分节点的不同 isoform 照常产出）;
+//! - 终止语义不变: 每轮胜出 walk 必含其起点边两端 → 该边必退出 alive; visited
+//!   只增不减, 至多 ne 轮, 穿越 walk 不会使 alive 复活。
+//!
 //! 与 python 的已知差异（验收允许）: RNG 不复刻 numpy; sup 累计用 u64 精确整数
 //! （python 是 float32 值的 float64 累加, 计数 << 2^24 时序等价）。
 
@@ -307,6 +320,10 @@ pub struct GtasmParams {
     pub min_len: usize,
     /// 采样种子（逐 comp 再混 cid）。
     pub seed: u64,
+    /// visited 穿越（Rust 版扩展, 机制见模块文档）: true = walk 可穿越已
+    /// visited 节点（两级候选过滤 + 完全重复产出丢弃）; false = 原型语义
+    /// （visited 硬排除, 逐字节复刻 python）。
+    pub allow_visited_walk: bool,
 }
 
 /// xorshift64* PRNG（采样用; 确定性, 与线程调度无关）。
@@ -353,36 +370,51 @@ fn better_cand(cand: (f32, i32, usize), best: Option<(f32, i32, usize)>) -> bool
 ///
 /// `frozen` = 另一向已走过的节点（反向延伸时排除前向 walk, python 的
 /// `cur not in seen` 交叉检查）; 前向调用传空集。
+///
+/// `allow_visited` = visited 穿越（[`GtasmParams::allow_visited_walk`]）:
+/// 开时 visited 不再截断 walk——入列检查跳过 visited, 候选分两级, 优先未
+/// visited（原型语义）, 一级为空再取已 visited 候选（同元组序取 max）;
+/// seen/frozen 两级一致排除（walk 内防环不变）。关时逐字节 = 原型。
 fn greedy_extend(
     adj: &FxHashMap<i32, Vec<(f32, i32, usize)>>,
     start: i32,
     visited: &FxHashSet<i32>,
     frozen: &FxHashSet<i32>,
     sup: &[u32],
+    allow_visited: bool,
 ) -> (Vec<i32>, u64) {
     let mut walk = Vec::new();
     let mut seen: FxHashSet<i32> = FxHashSet::default();
     let mut sup_sum = 0u64;
     let mut cur = start;
     loop {
-        if visited.contains(&cur) || frozen.contains(&cur) || seen.contains(&cur) {
+        if frozen.contains(&cur) || seen.contains(&cur) {
             break;
+        }
+        if !allow_visited && visited.contains(&cur) {
+            break; // 原型语义: visited 硬截断（python `cur not in visited`）
         }
         seen.insert(cur);
         walk.push(cur);
+        // 两级候选过滤: best = 未 visited 最优（原型）; best_cross = 已 visited
+        // 最优（穿越开才收集）; 一级非空时一级优先。
         let mut best: Option<(f32, i32, usize)> = None;
+        let mut best_cross: Option<(f32, i32, usize)> = None;
         if let Some(cands) = adj.get(&cur) {
             for &cand in cands {
-                if visited.contains(&cand.1) || frozen.contains(&cand.1) || seen.contains(&cand.1)
-                {
+                if frozen.contains(&cand.1) || seen.contains(&cand.1) {
                     continue;
                 }
-                if better_cand(cand, best) {
+                if visited.contains(&cand.1) {
+                    if allow_visited && better_cand(cand, best_cross) {
+                        best_cross = Some(cand);
+                    }
+                } else if better_cand(cand, best) {
                     best = Some(cand);
                 }
             }
         }
-        match best {
+        match best.or(best_cross) {
             None => break,
             Some((_, w, e)) => {
                 sup_sum += sup[e] as u64;
@@ -391,6 +423,15 @@ fn greedy_extend(
         }
     }
     (walk, sup_sum)
+}
+
+/// 已产出序列指纹（重复产出防护; FxHasher 64 位——组件内 contig 至多数千条,
+/// 碰撞概率 ~n²/2⁶⁵, 可忽略）。
+fn seq_fingerprint(seq: &str) -> u64 {
+    use std::hash::Hasher;
+    let mut h = rustc_hash::FxHasher::default();
+    h.write(seq.as_bytes());
+    h.finish()
 }
 
 /// 按 ∝(gsc[e]+1e-9) 无放回采 k 个（f64 累计, 与 python probs 的 float64 一致）。
@@ -456,6 +497,8 @@ pub fn decode_component(
     let mut alive: Vec<usize> = (0..ne).collect();
     let mut visited: FxHashSet<i32> = FxHashSet::default();
     let mut contigs: Vec<String> = Vec::new();
+    // 重复产出防护（visited 穿越开才启用）: 本组件已产出序列的指纹集。
+    let mut emitted: FxHashSet<u64> = FxHashSet::default();
 
     while !alive.is_empty() {
         let k = NB_STARTS.min(alive.len());
@@ -468,10 +511,17 @@ pub fn decode_component(
             let d0 = g.vids[g.dst[e0]];
 
             // 前向: 从 d0 沿出边贪心; 反向: 从 s0 沿入边贪心（排除前向已走过节点）
-            let (walk_f, sup_f) =
-                greedy_extend(&succ, d0, &visited, &FxHashSet::default(), &sup);
+            let (walk_f, sup_f) = greedy_extend(
+                &succ,
+                d0,
+                &visited,
+                &FxHashSet::default(),
+                &sup,
+                params.allow_visited_walk,
+            );
             let seen_f: FxHashSet<i32> = walk_f.iter().copied().collect();
-            let (mut walk_b, sup_b) = greedy_extend(&pred, s0, &visited, &seen_f, &sup);
+            let (mut walk_b, sup_b) =
+                greedy_extend(&pred, s0, &visited, &seen_f, &sup, params.allow_visited_walk);
 
             walk_b.reverse();
             walk_b.extend_from_slice(&walk_f);
@@ -502,7 +552,13 @@ pub fn decode_component(
             }
         }
         if seq.len() >= params.min_len {
-            contigs.push(seq);
+            // 重复产出防护: 穿越重新发现的完全相同序列才丢弃（visited 照常并入,
+            // 终止语义不受影响）; 不同 isoform 照常产出。关 flag 时永不丢弃
+            // （原型语义, 短路不求指纹）。
+            let dup = params.allow_visited_walk && !emitted.insert(seq_fingerprint(&seq));
+            if !dup {
+                contigs.push(seq);
+            }
         }
         for x in &walk {
             visited.insert(*x);
@@ -526,6 +582,7 @@ pub fn run_component_gtasm(
     min_len: usize,
     model: &GtModel,
     support: &EdgeSupport,
+    allow_visited_walk: bool,
 ) -> Result<String> {
     let g = parse_component_graph(graph_text)?;
     if g.n_edges() == 0 {
@@ -541,6 +598,7 @@ pub fn run_component_gtasm(
         &GtasmParams {
             min_len,
             seed: GTASM_DEFAULT_SEED,
+            allow_visited_walk,
         },
     );
     let mut out = String::new();
@@ -687,6 +745,7 @@ mod tests {
             &GtasmParams {
                 min_len: 20,
                 seed: 42,
+                allow_visited_walk: false,
             },
         );
         assert_eq!(contigs.len(), 1);
@@ -707,6 +766,7 @@ mod tests {
             &GtasmParams {
                 min_len: 200, // 26bp < 200 → 无输出
                 seed: 42,
+                allow_visited_walk: false,
             },
         );
         assert!(contigs.is_empty());
@@ -718,7 +778,7 @@ mod tests {
         let mut succ: FxHashMap<i32, Vec<(f32, i32, usize)>> = FxHashMap::default();
         succ.insert(10, vec![(0.5, 11, 0), (0.5, 12, 1)]);
         let sup = [0u32; 4];
-        let (walk, _) = greedy_extend(&succ, 10, &FxHashSet::default(), &FxHashSet::default(), &sup);
+        let (walk, _) = greedy_extend(&succ, 10, &FxHashSet::default(), &FxHashSet::default(), &sup, false);
         assert_eq!(walk, vec![10, 12]);
 
         // eid 级平局（平行边）: (0.5, 11, 0) vs (0.5, 11, 3) → eid 大者 3 胜,
@@ -727,14 +787,39 @@ mod tests {
         succ2.insert(10, vec![(0.5, 11, 0), (0.5, 11, 3)]);
         let sup2 = [7u32, 0, 0, 9];
         let (walk2, sup_sum2) =
-            greedy_extend(&succ2, 10, &FxHashSet::default(), &FxHashSet::default(), &sup2);
+            greedy_extend(&succ2, 10, &FxHashSet::default(), &FxHashSet::default(), &sup2, false);
         assert_eq!(walk2, vec![10, 11]);
         assert_eq!(sup_sum2, 9);
 
         // frozen（前向已走）节点不可复走
         let frozen: FxHashSet<i32> = [12].into_iter().collect();
-        let (walk3, _) = greedy_extend(&succ, 10, &FxHashSet::default(), &frozen, &sup);
+        let (walk3, _) = greedy_extend(&succ, 10, &FxHashSet::default(), &frozen, &sup, false);
         assert_eq!(walk3, vec![10, 11]);
+    }
+
+    #[test]
+    fn greedy_extend_visited_crossing_two_levels() {
+        // 两级过滤: 有未 visited 候选时优先之（一级）; 一级为空才穿越（二级）。
+        let mut succ: FxHashMap<i32, Vec<(f32, i32, usize)>> = FxHashMap::default();
+        succ.insert(10, vec![(0.9, 11, 0), (0.1, 12, 1)]);
+        let sup = [0u32; 4];
+        let visited: FxHashSet<i32> = [11].into_iter().collect();
+        // 11 visited 但 gsc 更高: 一级（12 未 visited）优先 → 走 12
+        let (walk, _) = greedy_extend(&succ, 10, &visited, &FxHashSet::default(), &sup, true);
+        assert_eq!(walk, vec![10, 12]);
+        // 唯一候选已 visited: 穿越开 → 走 11; 关 → 迈出前截断（walk 止于起点）
+        let mut succ2: FxHashMap<i32, Vec<(f32, i32, usize)>> = FxHashMap::default();
+        succ2.insert(10, vec![(0.5, 11, 0)]);
+        let (walk2, _) = greedy_extend(&succ2, 10, &visited, &FxHashSet::default(), &sup, true);
+        assert_eq!(walk2, vec![10, 11]);
+        let (walk3, _) = greedy_extend(&succ2, 10, &visited, &FxHashSet::default(), &sup, false);
+        assert_eq!(walk3, vec![10]);
+        // 起点自身 visited: 穿越开 → 照常入列延伸; 关 → 立即截断
+        let visited2: FxHashSet<i32> = [10].into_iter().collect();
+        let (walk4, _) = greedy_extend(&succ2, 10, &visited2, &FxHashSet::default(), &sup, true);
+        assert_eq!(walk4, vec![10, 11]);
+        let (walk5, _) = greedy_extend(&succ2, 10, &visited2, &FxHashSet::default(), &sup, false);
+        assert!(walk5.is_empty());
     }
 
     #[test]
@@ -769,6 +854,7 @@ mod tests {
             &GtasmParams {
                 min_len: 20,
                 seed: 7,
+                allow_visited_walk: false,
             },
         );
         // 两条臂无共享节点 → visited 不交叉, 两轮各出一条
@@ -777,6 +863,146 @@ mod tests {
         // + 21 末字符 A + 22 末字符 G
         assert_eq!(contigs[0], "AAAAAAAAAAAAAAAAAAAAAAAAC");
         assert_eq!(contigs[1], "CCCCCCCCCCCCCCCCCCCCCCCCAG");
+    }
+
+    // -----------------------------------------------------------------------
+    // visited 穿越（--gtasm-visited-walk）
+    // -----------------------------------------------------------------------
+
+    /// 泡形双 isoform 图: 共享入口 S=10 / 汇 E=30 / 尾 T=50, 两臂 20-21（强,
+    /// sup=5）与 40-41（弱, sup=1）。强臂 A = [-1,10,20,21,30,50], 弱臂
+    /// B = [-1,10,40,41,30,50]——两条 walk 共享 {-1,10,30,50}。
+    fn bubble_graph() -> (GtGraph, EdgeSupport) {
+        let text = format!(
+            "Component 0\n{}{}{}{}{}{}{}{}",
+            row(10, -1, 3, "AAAAAAAAAAAAAAAAAAAAAAAA"),
+            row(20, 10, 5, "AAAAAAAAAAAAAAAAAAAAAAAC"),
+            row(21, 20, 5, "AAAAAAAAAAAAAAAAAAAAAAAG"),
+            row(30, 21, 5, "AAAAAAAAAAAAAAAAAAAAAAAT"),
+            row(50, 30, 3, "CCCCCCCCCCCCCCCCCCCCCCCG"),
+            row(40, 10, 1, "CCCCCCCCCCCCCCCCCCCCCCCC"),
+            row(41, 40, 1, "CCCCCCCCCCCCCCCCCCCCCCCA"),
+            row(30, 41, 1, "AAAAAAAAAAAAAAAAAAAAAAAT"), // 汇的弱臂入口
+        );
+        let g = parse_component_graph(&text).unwrap();
+        let mut sup = EdgeSupport::new();
+        for _ in 0..5 {
+            sup.add(0, 10, 20);
+            sup.add(0, 20, 21);
+            sup.add(0, 21, 30);
+        }
+        sup.add(0, 10, 40);
+        sup.add(0, 40, 41);
+        sup.add(0, 41, 30);
+        (g, sup)
+    }
+
+    /// 强/弱臂的期望序列（手算: -1 无名跳过, 首名节点全 24-mer + 后续末字符）。
+    const ISO_A: &str = "AAAAAAAAAAAAAAAAAAAAAAAACGTG"; // [-1,10,20,21,30,50]
+    const ISO_B: &str = "AAAAAAAAAAAAAAAAAAAAAAAACATG"; // [-1,10,40,41,30,50]
+
+    #[test]
+    fn decode_shared_exon_both_isoforms() {
+        // (a) 共享节点的两 isoform: 穿越开 → 强弱两臂都完整产出。
+        // 竞争手算（prob 全 0.5）: 强臂延伸 sup=5×3, 弱臂 sup=1×3——
+        // 轮 1 全采（8 边 ≤ NB_STARTS）,  sup_sum 最大 15 = 强臂全程, A 先出;
+        // 轮 2 alive = 弱臂三边, walk 从 40/41 起穿越 visited 的 30/50/10/-1,
+        // 完整 B 产出（序列 ≠ A, 去重不误伤）。
+        let (g, sup) = bubble_graph();
+        let prob = vec![0.5f32; g.n_edges()];
+        let contigs = decode_component(
+            &g,
+            &prob,
+            &sup,
+            0,
+            &GtasmParams {
+                min_len: 20,
+                seed: 42,
+                allow_visited_walk: true,
+            },
+        );
+        assert_eq!(contigs, vec![ISO_A.to_string(), ISO_B.to_string()]);
+
+        // 对照（原型语义）: 轮 2 walk 在 visited 边界截断, 弱臂只剩 [40,41]
+        // 的 25bp 残段（40 全 24-mer + 41 末字符）——复现"完整路径被拆散吞没"
+        // 的缺陷。
+        let contigs_off = decode_component(
+            &g,
+            &prob,
+            &sup,
+            0,
+            &GtasmParams {
+                min_len: 20,
+                seed: 42,
+                allow_visited_walk: false,
+            },
+        );
+        assert_eq!(contigs_off.len(), 2);
+        assert_eq!(contigs_off[0], ISO_A);
+        assert_eq!(contigs_off[1], "CCCCCCCCCCCCCCCCCCCCCCCCA"); // 截断残段 ≠ ISO_B
+    }
+
+    #[test]
+    fn decode_visited_walk_dedups_identical() {
+        // (b) 去重: 同一 walk 经穿越重复发现不重复产出。
+        // 链 -1→10→11→12 加一条无名平行入口 99→10（99 仅作 from, 无 kmer 名）。
+        // 轮 1 从任一入口边走出全程 walk（[-1,...] 或 [99,...], 序列相同 =
+        // K1+C+G）; 轮 2 alive 只剩另一条入口边, 穿越 visited 重新发现同一
+        // 序列 → 完全相同, 丢弃。最终恰 1 条（与轮 1 采样序无关, 两种镜像
+        // 殊途同归）。
+        let text = format!(
+            "Component 0\n{}{}{}{}",
+            row(10, -1, 3, "AAAAAAAAAAAAAAAAAAAAAAAA"),
+            row(11, 10, 3, "AAAAAAAAAAAAAAAAAAAAAAAC"),
+            row(12, 11, 3, "AAAAAAAAAAAAAAAAAAAAAAAG"),
+            row(10, 99, 3, "AAAAAAAAAAAAAAAAAAAAAAAA"), // 99→10 平行入口
+        );
+        let g = parse_component_graph(&text).unwrap();
+        let prob = vec![0.5f32; g.n_edges()];
+        let contigs = decode_component(
+            &g,
+            &prob,
+            &EdgeSupport::new(),
+            0,
+            &GtasmParams {
+                min_len: 20,
+                seed: 42,
+                allow_visited_walk: true,
+            },
+        );
+        assert_eq!(contigs, vec!["AAAAAAAAAAAAAAAAAAAAAAAACG".to_string()]);
+    }
+
+    #[test]
+    fn decode_visited_walk_terminates_on_cycle() {
+        // (c) 终止: 环图（10→11→12→10 + 入口 -1→10）不挂死。
+        // walk 内 seen 防环 → 单条 walk 有限; 每轮 visited 只增不减且胜出
+        // walk 必含起点边两端 → 至多 ne 轮。
+        let text = format!(
+            "Component 0\n{}{}{}{}",
+            row(10, -1, 3, "AAAAAAAAAAAAAAAAAAAAAAAA"),
+            row(11, 10, 3, "AAAAAAAAAAAAAAAAAAAAAAAC"),
+            row(12, 11, 3, "AAAAAAAAAAAAAAAAAAAAAAAG"),
+            row(10, 12, 3, "AAAAAAAAAAAAAAAAAAAAAAAA"), // 12→10 闭环
+        );
+        let g = parse_component_graph(&text).unwrap();
+        let prob = vec![0.5f32; g.n_edges()];
+        let contigs = decode_component(
+            &g,
+            &prob,
+            &EdgeSupport::new(),
+            0,
+            &GtasmParams {
+                min_len: 20,
+                seed: 42,
+                allow_visited_walk: true,
+            },
+        );
+        // 终止且产出有限: 轮 1 胜出 walk 取决于采样序（三种旋转之一, 序列
+        // 均为 26bp）; 若 -1 未覆盖, 轮 2 穿越再出一条（序列不同则保留,
+        // 相同则去重）→ 1~2 条, 绝不挂死。
+        assert!(!contigs.is_empty() && contigs.len() <= 2, "{contigs:?}");
+        assert!(contigs.iter().all(|s| s.len() == 26), "{contigs:?}");
     }
 
     #[test]
@@ -791,6 +1017,7 @@ mod tests {
             &GtasmParams {
                 min_len: 200,
                 seed: 1,
+                allow_visited_walk: false,
             },
         );
         assert!(contigs.is_empty());
@@ -824,7 +1051,8 @@ mod tests {
         for i in 0..220i32 {
             text.push_str(&row(100 + i, 99 + i, 5, &kmers[i as usize]));
         }
-        let fasta = run_component_gtasm(&text, 0, "c0", 200, &m, &EdgeSupport::new()).unwrap();
+        let fasta =
+            run_component_gtasm(&text, 0, "c0", 200, &m, &EdgeSupport::new(), true).unwrap();
         assert!(fasta.starts_with(">c0_g1_i1 len="), "{fasta}");
         assert!(fasta.contains(" path=[gtasm]\n"));
         let seq: String = fasta.lines().filter(|l| !l.starts_with('>')).collect();

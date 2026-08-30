@@ -207,6 +207,7 @@ fn butterfly_pool_isolates_failures() {
             stack_size_mb: 16,
             path_engine: trinity_cli::PathEngine::Classic,
             gtasm: None,
+            gtasm_visited_walk: true,
         },
     )
     .unwrap_err();

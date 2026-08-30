@@ -580,6 +580,7 @@ pub fn run_trinity(args: &TrinityArgs) -> Result<PathBuf, CommonError> {
                         stack_size_mb: args.bfly_stack_mb,
                         path_engine: args.path_engine,
                         gtasm: gtasm_shared.clone(),
+                        gtasm_visited_walk: args.gtasm_visited_walk,
                     },
                 )
             },

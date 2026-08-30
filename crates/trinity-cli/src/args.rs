@@ -98,6 +98,12 @@ pub struct TrinityArgs {
     pub path_engine: PathEngine,
     /// **Rust 版扩展**: GTasm 引擎的 GTW1 权重路径（gtasm 必填）。
     pub gt_weights: Option<PathBuf>,
+    /// **Rust 版扩展**: gtasm 解码的 visited 穿越（walk 可穿越已 visited 节点,
+    /// 两级候选过滤 + 完全重复产出丢弃, 机制见 trinity-butterfly `gtdecode`
+    /// 模块文档）。**默认开**（实验默认, 修复共享外显子被强势 isoform 先占
+    /// 导致弱势 isoform 截断的缺口）; `--no-gtasm-visited-walk` 回退原型语义
+    /// （沿 --no-multi-k 命名先例）。仅 gtasm 引擎生效。
+    pub gtasm_visited_walk: bool,
     /// **Rust 版扩展**: rnaSPAdes 式多 k 迭代的生效值（`--multi-k auto|k1,...` /
     /// `--no-multi-k` 经 [`resolve_multi_k`] 解析后的结果）。None = 单 k classic
     /// （k = --KMER_SIZE）; 缺省（无任何相关 flag）= Some(Auto)（2026-08-30 转正）。
@@ -303,6 +309,8 @@ pub fn parse_args(argv: &[String]) -> Result<TrinityArgs, CliError> {
         }
     };
     let gt_weights = cli.value_flag("--gt-weights")?.map(PathBuf::from);
+    // --no-gtasm-visited-walk（沿 --no-multi-k 命名先例）: 回退原型 visited 硬排除
+    let no_gtasm_visited_walk = cli.bool_flag("--no-gtasm-visited-walk");
     // --multi-k auto | k1,k2,...（Rust 版扩展, rnaSPAdes 式多 k 迭代; 显式值）
     let multi_k_explicit = match cli.value_flag("--multi-k")?.as_deref() {
         None => None,
@@ -378,6 +386,12 @@ pub fn parse_args(argv: &[String]) -> Result<TrinityArgs, CliError> {
     if path_engine != PathEngine::Gtasm && gt_weights.is_some() {
         eprintln!("WARNING: --gt-weights 仅在 --path-engine gtasm 下生效, 忽略");
     }
+    // visited 穿越默认开（实验默认）; 显式 --no-gtasm-visited-walk 回退原型语义。
+    // 非 gtasm 引擎给了关闭旗标也只警告（沿 --gt-weights 先例）。
+    if path_engine != PathEngine::Gtasm && no_gtasm_visited_walk {
+        eprintln!("WARNING: --no-gtasm-visited-walk 仅在 --path-engine gtasm 下生效, 忽略");
+    }
+    let gtasm_visited_walk = !no_gtasm_visited_walk;
     // gtasm/rnaspades × recursive 未实现（递归模式的分区池不走 butterfly 组件池）
     if path_engine != PathEngine::Classic && recursive {
         return Err(CliError::usage(format!(
@@ -460,6 +474,7 @@ pub fn parse_args(argv: &[String]) -> Result<TrinityArgs, CliError> {
         recursive,
         path_engine,
         gt_weights,
+        gtasm_visited_walk,
         multi_k,
         graph_clean_rnaspades,
         gap_close_spades,
@@ -548,6 +563,32 @@ mod tests {
         // classic + 权重 → 通过（忽略并警告）
         let a = parse_args(&argv(&["--gt-weights", "/tmp/m.gtw"])).unwrap();
         assert_eq!(a.path_engine, PathEngine::Classic);
+    }
+
+    #[test]
+    fn gtasm_visited_walk_defaults_on() {
+        // 默认开（gtasm 与 classic 皆然——字段恒有值, 仅 gtasm 引擎消费）
+        let a = parse_args(&argv(&[
+            "--path-engine",
+            "gtasm",
+            "--gt-weights",
+            "/tmp/m.gtw",
+        ]))
+        .unwrap();
+        assert!(a.gtasm_visited_walk);
+        // --no-gtasm-visited-walk → 回退原型语义
+        let a = parse_args(&argv(&[
+            "--path-engine",
+            "gtasm",
+            "--gt-weights",
+            "/tmp/m.gtw",
+            "--no-gtasm-visited-walk",
+        ]))
+        .unwrap();
+        assert!(!a.gtasm_visited_walk);
+        // classic + 关闭旗标 → 通过（忽略并警告, 沿 --gt-weights 先例）
+        let a = parse_args(&argv(&["--no-gtasm-visited-walk"])).unwrap();
+        assert!(!a.gtasm_visited_walk);
     }
 
     #[test]
