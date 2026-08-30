@@ -20,7 +20,10 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use rayon::prelude::*;
-use trinity_butterfly::{run_component, run_component_gtasm, ComponentParams, EdgeSupport, GtModel};
+use trinity_butterfly::{
+    run_component, run_component_gtasm, run_component_rnaspades, ComponentParams, EdgeSupport,
+    GtModel,
+};
 use trinity_chrysalis::pack::{
     read_at, PackIndex, PackWriter, BUTTERFLY_PACK, GRAPHS_PACK, KIND_ALL_PROB_PATHS,
     KIND_GRAPH_OUT, KIND_GRAPH_READS,
@@ -47,7 +50,8 @@ pub struct ButterflyPoolParams {
     pub group_pairs_distance: usize,
     /// 专用组件线程栈（--bfly_stack_mb）。
     pub stack_size_mb: usize,
-    /// 路径引擎（classic 默认 = 现状逐字节; gtasm = GT 打分 + GTasm 解码）。
+    /// 路径引擎（classic 默认 = 现状逐字节; gtasm = GT 打分 + GTasm 解码;
+    /// rnaspades = rnaSPAdes MultiExtender 核心规则复刻）。
     pub path_engine: PathEngine,
     /// gtasm 共享上下文（path_engine == Gtasm 时必有）。
     pub gtasm: Option<Arc<GtasmShared>>,
@@ -207,6 +211,18 @@ fn run_one(
                 &shared.support,
             )
             .map_err(|e| CommonError::Parse(format!("gtasm 组件 {id} 失败: {e}")))?
+        }
+        PathEngine::RnaSpades => {
+            // rnaspades 只需 graph.out（简化点: 不做 PE 权重, 不读 graph.reads;
+            // 长度过滤走自身 path_cleaning 110bp/cov≥2, harvest 再按
+            // --min_contig_length 收口）
+            let g = read_rec(KIND_GRAPH_OUT)?;
+            let name = base
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "component".to_string());
+            run_component_rnaspades(&g, &name)
+                .map_err(|e| CommonError::Parse(format!("rnaspades 组件 {id} 失败: {e}")))?
         }
     };
     writer

@@ -17,6 +17,7 @@ pub mod paths;
 pub mod pog;
 pub mod postprocess;
 pub mod prune;
+pub mod rnaspades;
 pub mod threading;
 
 pub use component::{run_component, ComponentParams, ComponentResult};
@@ -56,6 +57,7 @@ pub use postprocess::{
     reduce_cdhit_like, run_em_reduce, run_path_expression_em, two_paths_are_too_similar,
     ContainedReads, PostProcessParams,
 };
+pub use rnaspades::{grow_paths, run_component_rnaspades, run_component_rnaspades_with, RnaSpadesParams};
 pub use prune::{
     calc_sub_components_stats, compact_linear_paths, fix_extremely_high_single_edges,
     remove_light_edges, remove_light_flow_edges, remove_light_in_edges, remove_light_out_edges,

@@ -106,23 +106,25 @@ impl CleanStats {
 }
 
 /// 单行数据（`to frm count kmer flag...`）。`alive=false` 即被某轮删除。
-struct NodeLine {
-    to: i64,
-    frm: i64, // <0 = 根行（源点挂接, 无真实前驱）
-    count: i64,
-    alive: bool,
+/// pub(crate)：gap_close 模块复用同一套行/块解析（缝合新增行借 `rewrite`
+/// 字段携带文本）。
+pub(crate) struct NodeLine {
+    pub(crate) to: i64,
+    pub(crate) frm: i64, // <0 = 根行（源点挂接, 无真实前驱）
+    pub(crate) count: i64,
+    pub(crate) alive: bool,
     /// 悬空修复时改写为根行的替代文本；None = 输出原文。
-    rewrite: Option<String>,
+    pub(crate) rewrite: Option<String>,
 }
 
 /// 一个组件块：头部行（`Component N` 等 token<4 的行，原样透传）+ 数据行。
-struct Block<'a> {
-    head: Vec<&'a str>,
-    lines: Vec<(NodeLine, &'a str)>,
+pub(crate) struct Block<'a> {
+    pub(crate) head: Vec<&'a str>,
+    pub(crate) lines: Vec<(NodeLine, &'a str)>,
 }
 
 /// 把 graph.out 文本切成组件块（数据行 = ≥4 列且前三列可解析）。
-fn split_blocks(text: &str) -> Vec<Block<'_>> {
+pub(crate) fn split_blocks(text: &str) -> Vec<Block<'_>> {
     let mut blocks: Vec<Block> = Vec::new();
     let mut cur = Block {
         head: Vec::new(),
@@ -171,17 +173,17 @@ fn split_blocks(text: &str) -> Vec<Block<'_>> {
     blocks
 }
 
-/// 单组件邻接索引（只看 alive 行）。
-struct Adj {
+/// 单组件邻接索引（只看 alive 行）。pub(crate)：gap_close 复用。
+pub(crate) struct Adj {
     /// frm(≥0) → 行号列表（出边）。
-    out_idx: HashMap<i64, Vec<usize>>,
+    pub(crate) out_idx: HashMap<i64, Vec<usize>>,
     /// to → 行号列表（真实入边, 仅 frm≥0）。
-    in_idx: HashMap<i64, Vec<usize>>,
+    pub(crate) in_idx: HashMap<i64, Vec<usize>>,
     /// to → 该节点首个 alive 行号（取 kmer/自有行用; 同节点各行 kmer 相同）。
-    first_line: HashMap<i64, usize>,
+    pub(crate) first_line: HashMap<i64, usize>,
 }
 
-fn build_adj(lines: &[(NodeLine, &str)]) -> Adj {
+pub(crate) fn build_adj(lines: &[(NodeLine, &str)]) -> Adj {
     let mut adj = Adj {
         out_idx: HashMap::new(),
         in_idx: HashMap::new(),
@@ -201,14 +203,14 @@ fn build_adj(lines: &[(NodeLine, &str)]) -> Adj {
 }
 
 impl Adj {
-    fn outdeg(&self, v: i64) -> usize {
+    pub(crate) fn outdeg(&self, v: i64) -> usize {
         self.out_idx.get(&v).map_or(0, |v| v.len())
     }
-    fn indeg(&self, v: i64) -> usize {
+    pub(crate) fn indeg(&self, v: i64) -> usize {
         self.in_idx.get(&v).map_or(0, |v| v.len())
     }
     /// 节点 kmer 字节串（取自其首个 alive 行的第 4 列）。
-    fn kmer<'a>(&self, lines: &'a [(NodeLine, &'a str)], v: i64) -> Option<&'a [u8]> {
+    pub(crate) fn kmer<'a>(&self, lines: &'a [(NodeLine, &'a str)], v: i64) -> Option<&'a [u8]> {
         self.first_line.get(&v).map(|&i| {
             lines[i]
                 .1
@@ -221,7 +223,8 @@ impl Adj {
 }
 
 /// 链序列 = 首节点 kmer + 后续每节点 kmer 的末字符（漂移 1bp 的 de Bruijn 链）。
-fn chain_seq(adj: &Adj, lines: &[(NodeLine, &str)], nodes: &[i64]) -> Vec<u8> {
+/// pub(crate)：gap_close 复用。
+pub(crate) fn chain_seq(adj: &Adj, lines: &[(NodeLine, &str)], nodes: &[i64]) -> Vec<u8> {
     let mut seq = Vec::new();
     for (i, &v) in nodes.iter().enumerate() {
         let k = adj.kmer(lines, v).unwrap_or(b"");

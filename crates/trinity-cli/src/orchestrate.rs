@@ -485,6 +485,7 @@ pub fn run_trinity(args: &TrinityArgs) -> Result<PathBuf, CommonError> {
                         max_reads: args.max_reads_per_graph,
                         threads: args.cpu.max(1),
                         graph_clean_rnaspades: args.graph_clean_rnaspades,
+                        gap_close_spades: args.gap_close_spades,
                         ..Default::default()
                     },
                 )?;
@@ -816,6 +817,7 @@ fn run_recursive(
                     threads: args.cpu.max(1),
                     graphs_per_partition: 1000,
                     graph_clean_rnaspades: false, // 递归 phase-1 跳过 quantify, 清理不生效
+                    gap_close_spades: false,      // 递归 phase-1 跳过 quantify, 缝合不生效
                 },
             )?;
             listing_opt = Some(listing);

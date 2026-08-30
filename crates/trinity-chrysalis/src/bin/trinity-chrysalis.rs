@@ -298,6 +298,7 @@ fn cmd_chrysalis_all(cli: &mut Cli) -> Result<(), CliError> {
             threads: threads as usize,
             skip_quantify: false,
             graph_clean_rnaspades: false, // 子命令工具不暴露清理开关（默认关）
+            gap_close_spades: false,      // 子命令工具不暴露缝合开关（默认关）
         },
     )?;
     Ok(())

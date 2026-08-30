@@ -13,16 +13,20 @@ pub enum SeqType {
     Fa,
 }
 
-/// `--path-engine classic|gtasm`（**Rust 版扩展**, 原版无）。
+/// `--path-engine classic|gtasm|rnaspades`（**Rust 版扩展**, 原版无）。
 ///
 /// - `classic`（默认）: butterfly allProbPaths 全链, 行为与现状逐字节一致;
 /// - `gtasm`: GT 边打分（GTW1 权重, `--gt-weights`）× GTasm 式解码 × 原始
 ///   reads 边支持（python 原型 gt_decode2.py C 变体的产品化, 详见
-///   trinity-butterfly `gtmodel`/`gtdecode` 模块）。
+///   trinity-butterfly `gtmodel`/`gtdecode` 模块）;
+/// - `rnaspades`: rnaSPAdes PathExtend MultiExtender 核心规则复刻（覆盖
+///   一致性贪心延伸 + 简单 bulge 双 isoform 分叉 + 其余歧义停止 +
+///   path_cleaning 110bp/cov≥2, 详见 trinity-butterfly `rnaspades` 模块）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PathEngine {
     Classic,
     Gtasm,
+    RnaSpades,
 }
 
 /// `--multi-k`（**Rust 版扩展**, rnaSPAdes 式多 k 迭代 + trusted contig 注入）。
@@ -96,6 +100,12 @@ pub struct TrinityArgs {
     /// 后对 c*.graph.out 做 tip/EC/rcc 删除, 见 trinity-chrysalis::graph_clean）。
     /// 默认关 = 现有行为逐字节不变。--recursive 下暂不生效（迷你管线未接线）。
     pub graph_clean_rnaspades: bool,
+    /// **Rust 版扩展**: SPAdes 式 gap closer（chrysalis QuantifyGraph/清理后
+    /// 对 c*.graph.out 做 tip 对 tip overlap 缝合, PE 证据排序候选, 见
+    /// trinity-chrysalis::gap_close）。默认关 = 现有行为逐字节不变。
+    /// 仅 PE 数据生效（单端 = SPAdes "no paired-end libraries" 跳过语义）;
+    /// --recursive 下暂不生效（迷你管线未接线）。
+    pub gap_close_spades: bool,
 }
 
 /// `--max_memory 10G` → 字节。镜像原版 L1156 `^(\d+)G`（大小写不敏感）;
@@ -208,9 +218,10 @@ pub fn parse_args(argv: &[String]) -> Result<TrinityArgs, CliError> {
     let path_engine = match cli.value_flag("--path-engine")?.as_deref() {
         None | Some("classic") => PathEngine::Classic,
         Some("gtasm") => PathEngine::Gtasm,
+        Some("rnaspades") => PathEngine::RnaSpades,
         Some(other) => {
             return Err(CliError::usage(format!(
-                "invalid --path-engine value: {other} (must be classic|gtasm)"
+                "invalid --path-engine value: {other} (must be classic|gtasm|rnaspades)"
             )))
         }
     };
@@ -223,6 +234,8 @@ pub fn parse_args(argv: &[String]) -> Result<TrinityArgs, CliError> {
     };
     // --graph-clean-rnaspades（Rust 版扩展, 默认关）
     let graph_clean_rnaspades = cli.bool_flag("--graph-clean-rnaspades");
+    // --gap-close-spades（Rust 版扩展, 默认关）
+    let gap_close_spades = cli.bool_flag("--gap-close-spades");
 
     cli.finish()?;
 
@@ -273,20 +286,25 @@ pub fn parse_args(argv: &[String]) -> Result<TrinityArgs, CliError> {
     // 原版: inchworm_cpu 默认 6，但 CPU 更小时收敛到 CPU（L1233 语义）。
     let inchworm_cpu = inchworm_cpu_in.unwrap_or(6).min(cpu.max(1));
 
-    // gtasm 必须给权重; classic 给了权重也只警告（不误判为 gtasm）。
+    // gtasm 必须给权重; 非 gtasm 给了权重也只警告（不误判为 gtasm）。
     if path_engine == PathEngine::Gtasm && gt_weights.is_none() {
         return Err(CliError::usage(
             "Error, --path-engine gtasm requires --gt-weights <GTW1 权重文件路径>",
         ));
     }
-    if path_engine == PathEngine::Classic && gt_weights.is_some() {
-        eprintln!("WARNING: --gt-weights 在 --path-engine classic 下不生效, 忽略");
+    if path_engine != PathEngine::Gtasm && gt_weights.is_some() {
+        eprintln!("WARNING: --gt-weights 仅在 --path-engine gtasm 下生效, 忽略");
     }
-    // gtasm × recursive 未实现（递归模式的分区池不走 butterfly 组件池）
-    if path_engine == PathEngine::Gtasm && recursive {
-        return Err(CliError::usage(
-            "Error, --path-engine gtasm 与 --recursive 暂不支持同时使用",
-        ));
+    // gtasm/rnaspades × recursive 未实现（递归模式的分区池不走 butterfly 组件池）
+    if path_engine != PathEngine::Classic && recursive {
+        return Err(CliError::usage(format!(
+            "Error, --path-engine {} 与 --recursive 暂不支持同时使用",
+            match path_engine {
+                PathEngine::Gtasm => "gtasm",
+                PathEngine::RnaSpades => "rnaspades",
+                PathEngine::Classic => unreachable!(),
+            }
+        )));
     }
     // multi-k 互斥校验（防歧义）: 多 k 轮次自带 k 序列, 与 --KMER_SIZE 同给
     // 语义冲突（哪个生效?）; 与 --recursive 的组合未实现（沿 gtasm 先例）。
@@ -306,6 +324,18 @@ pub fn parse_args(argv: &[String]) -> Result<TrinityArgs, CliError> {
     if graph_clean_rnaspades && recursive {
         eprintln!("WARNING: --graph-clean-rnaspades 在 --recursive 下暂不生效, 忽略");
     }
+    // --gap-close-spades: 同清理的 recursive 处置; 单端数据无 PE 证据,
+    // 对应 SPAdes "No paired-end libraries exist, skipping gap closer"
+    // （gap_closer.cpp execute 开头）→ 明告并置关。
+    if gap_close_spades && recursive {
+        eprintln!("WARNING: --gap-close-spades 在 --recursive 下暂不生效, 忽略");
+    }
+    let gap_close_spades = if gap_close_spades && left.is_empty() {
+        eprintln!("WARNING: --gap-close-spades 需要 paired-end reads（--left/--right）, 单端数据下忽略");
+        false
+    } else {
+        gap_close_spades
+    };
 
     Ok(TrinityArgs {
         seq_type,
@@ -332,6 +362,7 @@ pub fn parse_args(argv: &[String]) -> Result<TrinityArgs, CliError> {
         gt_weights,
         multi_k,
         graph_clean_rnaspades,
+        gap_close_spades,
     })
 }
 
@@ -366,6 +397,26 @@ mod tests {
     }
 
     #[test]
+    fn gap_close_spades_flag_and_se_downgrade() {
+        // 默认关
+        let a = parse_args(&argv(&[])).unwrap();
+        assert!(!a.gap_close_spades);
+        // PE + flag → 开
+        let a = parse_args(&argv(&["--gap-close-spades"])).unwrap();
+        assert!(a.gap_close_spades);
+        // 单端 + flag → 警告并置关（SPAdes "no paired-end libraries" 语义）
+        let se: Vec<String> = [
+            "--seqType", "fq", "--single", "s.fq", "--max_memory", "2G", "--output", "out",
+            "--gap-close-spades",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let a = parse_args(&se).unwrap();
+        assert!(!a.gap_close_spades);
+    }
+
+    #[test]
     fn scratch_parses_dir() {
         let a = parse_args(&argv(&["--scratch", "/tmp/scratch"])).unwrap();
         assert_eq!(a.scratch, Some(PathBuf::from("/tmp/scratch")));
@@ -397,6 +448,24 @@ mod tests {
         // classic + 权重 → 通过（忽略并警告）
         let a = parse_args(&argv(&["--gt-weights", "/tmp/m.gtw"])).unwrap();
         assert_eq!(a.path_engine, PathEngine::Classic);
+    }
+
+    #[test]
+    fn path_engine_rnaspades_parse() {
+        // rnaspades 无需额外 flag
+        let a = parse_args(&argv(&["--path-engine", "rnaspades"])).unwrap();
+        assert_eq!(a.path_engine, PathEngine::RnaSpades);
+        // 与 --recursive 互斥（沿 gtasm 先例）
+        assert!(parse_args(&argv(&["--path-engine", "rnaspades", "--recursive"])).is_err());
+        // rnaspades + 权重 → 通过（忽略并警告）
+        let a = parse_args(&argv(&[
+            "--path-engine",
+            "rnaspades",
+            "--gt-weights",
+            "/tmp/m.gtw",
+        ]))
+        .unwrap();
+        assert_eq!(a.path_engine, PathEngine::RnaSpades);
     }
 
     #[test]

@@ -51,6 +51,9 @@ pub struct ChrysalisParams {
     /// `--graph-clean-rnaspades`：QuantifyGraph 之后对 graph.out 做 rnaSPAdes
     /// 式相对覆盖清理（tip/EC/rcc, 见 graph_clean 模块）。默认 false = 逐字节不变。
     pub graph_clean_rnaspades: bool,
+    /// `--gap-close-spades`：清理之后对 graph.out 做 SPAdes 式 tip 对 tip
+    /// overlap 缝合（PE 证据排序候选, 见 gap_close 模块）。默认 false = 逐字节不变。
+    pub gap_close_spades: bool,
 }
 
 impl Default for ChrysalisParams {
@@ -64,6 +67,7 @@ impl Default for ChrysalisParams {
             threads: 1,
             skip_quantify: false,
             graph_clean_rnaspades: false,
+            gap_close_spades: false,
         }
     }
 }
@@ -186,6 +190,9 @@ pub fn run_chrysalis_pipeline(
         // rnaSPAdes 图清理的跨组件统计与耗时累计（各组件并行, 锁合并）
         let clean_stats: Mutex<crate::graph_clean::CleanStats> = Mutex::new(Default::default());
         let clean_nanos = std::sync::atomic::AtomicU64::new(0);
+        // SPAdes 式 gap 缝合的跨组件统计与耗时累计（同清理的合并模式）
+        let gap_stats: Mutex<crate::gap_close::GapCloseStats> = Mutex::new(Default::default());
+        let gap_nanos = std::sync::atomic::AtomicU64::new(0);
         let mut writers: HashMap<PathBuf, Mutex<PackWriter>> = HashMap::new();
         let mut tmp_indexes: HashMap<PathBuf, PackIndex> = HashMap::new();
         for (_, base) in &listing {
@@ -225,6 +232,9 @@ pub fn run_chrysalis_pipeline(
                                 p.graph_clean_rnaspades,
                                 &clean_stats,
                                 &clean_nanos,
+                                p.gap_close_spades,
+                                &gap_stats,
+                                &gap_nanos,
                             ) {
                                 Ok(()) => None,
                                 Err(e) => Some(format!("{}: {e}", base.display())),
@@ -264,6 +274,37 @@ pub fn run_chrysalis_pipeline(
             {
                 use std::io::Write;
                 let _ = writeln!(fh, "graph_clean\t{secs:.3}");
+            }
+        }
+        // 缝合统计行 + 落 .stage_timings（CPU 时间累计: 各组件并行缝合的耗时和）
+        if p.gap_close_spades {
+            let st = gap_stats.lock().unwrap();
+            println!(
+                "-gap-close-spades: {} components, tips (out {} + in {}), tip reads {}, pair votes {}, candidates {}, checked {}, closed {} (perfect {} + corrected {}), rejected (low-complexity {} + hamming {} + kmer-clash {}), bridge nodes {}",
+                st.components,
+                st.out_tips,
+                st.in_tips,
+                st.tip_reads,
+                st.pair_votes,
+                st.candidate_pairs,
+                st.pairs_checked,
+                st.gaps_closed,
+                st.closed_perfect,
+                st.closed_corrected,
+                st.rejected_low_complexity,
+                st.rejected_hamming,
+                st.rejected_kmer_clash,
+                st.bridge_nodes,
+            );
+            drop(st);
+            let secs = gap_nanos.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e9;
+            if let Ok(mut fh) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(out_dir.join(".stage_timings"))
+            {
+                use std::io::Write;
+                let _ = writeln!(fh, "gap_close\t{secs:.3}");
             }
         }
         if !failures.is_empty() {
@@ -315,7 +356,9 @@ fn read_tmp_record(dir: &Path, idx: &PackIndex, id: u64, kind: u64) -> Result<Ve
 /// 逐组件 QuantifyGraph: 从 Cbin 的 tmp 包读 graph.tmp/reads.tmp 记录,
 /// 产物追加进 graphs 包。输入的删除由调用方在整阶段成功后整包完成。
 /// `graph_clean`：开启时对 graph.out 文本做 rnaSPAdes 式清理（tip→EC→rcc,
-/// 见 graph_clean 模块）; 统计/耗时并入 `clean_stats`/`clean_nanos`。
+/// 见 graph_clean 模块）; `gap_close`：清理之后做 SPAdes 式 tip 对 tip
+/// overlap 缝合（PE 证据来自 reads.tmp, 见 gap_close 模块）。统计/耗时
+/// 分别并入对应 Mutex/原子量。
 #[allow(clippy::too_many_arguments)]
 fn run_quantify_packed(
     id: u64,
@@ -326,6 +369,9 @@ fn run_quantify_packed(
     graph_clean: bool,
     clean_stats: &Mutex<crate::graph_clean::CleanStats>,
     clean_nanos: &std::sync::atomic::AtomicU64,
+    gap_close: bool,
+    gap_stats: &Mutex<crate::gap_close::GapCloseStats>,
+    gap_nanos: &std::sync::atomic::AtomicU64,
 ) -> Result<(), String> {
     let graph = read_tmp_record(dir, tmp_idx, id, KIND_GRAPH_TMP)?;
     let reads = read_tmp_record(dir, tmp_idx, id, KIND_READS_TMP)?;
@@ -338,6 +384,18 @@ fn run_quantify_packed(
             .fetch_add(t0.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
         clean_stats.lock().unwrap().add_assign(&st);
         cleaned
+    } else {
+        gout
+    };
+    // SPAdes 流程里 gap closer 在 simplification 之后跑（config.info
+    // after_simplify=true）——此处清理之后缝合, 顺序一致。
+    let gout = if gap_close {
+        let t0 = std::time::Instant::now();
+        let (closed, st) = crate::gap_close::close_gaps_spades(&gout, &reads, p.strand);
+        gap_nanos
+            .fetch_add(t0.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+        gap_stats.lock().unwrap().add_assign(&st);
+        closed
     } else {
         gout
     };

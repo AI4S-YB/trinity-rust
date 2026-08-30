@@ -1618,3 +1618,109 @@ graph.out（pack 内文本, 写库前）, 默认关 = 代码路径不动。
 | 2026-08-29 | dev1 | R=13.7% P=81.6% **F1=23.5%** | N50=1824 n=7850 | --graph-clean-rnaspades --CPU 8 --max_memory 8G |
 | 2026-08-29 | dev1 | R=14.0% P=81.0% **F1=23.9%** | N50=1843 n=7869 | --CPU 8 --max_memory 8G（基线缓存 ee22d353bcae2d67） |
 | 2026-08-29 | dev1 | R=14.0% P=81.5% **F1=23.9%** | N50=1833 n=7834 | --CPU 8 --max_memory 8G（新二进制无 flag 全新跑, 波动带内） |
+| 2026-08-29 | gapclose-dev1 | R=14.1% P=79.6% **F1=24.0%** | N50=1868 n=7887 | --gap-close-spades --CPU 8 --max_memory 8G |
+| 2026-08-29 | gapclose-off-dev1 | R=14.1% P=80.2% **F1=24.0%** | N50=1856 n=7889 | --CPU 8 --max_memory 8G |
+
+## SPAdes gap closer 落地（--gap-close-spades, 2026-08-29）
+
+SPAdes gap_closer.cpp（GapCloserPairedIndexFiller L28-178 / GapCloser L180-469）
++ configs/config.info gap_closer 段（minimal_intersection 10 / weight_threshold
+2.0 / max_dist_to_tip 5000）移植到 chrysalis 图。新模块
+`trinity-chrysalis/src/gap_close.rs`, 在 QuantifyGraph（与可选 graph_clean）
+之后逐组件缝合 c*.graph.out（pack 内文本, 写库前）, 默认关 = 逐字节不变。
+**保守变体**: 不做局部重组装（python 原型已证伪多路径歧义）, 只做 tip 对
+tip 的 overlap 缝合 + PE 证据排序。
+
+- **映射**: out-tip = 汇向死端链（末端 outdeg==0 沿唯一前驱回溯, 不含分支
+  点）; in-tip = 源向死端链（首端 indeg==0 沿唯一后继, 不含汇合点）;
+  max_dist_to_tip 5000 → 链端 200bp（177 个 24mer）作 PE 命中窗口（组件小,
+  任务书指定取舍）; PE 票 = 同 pair（read name 去尾 /1|/2）两 mate 分落
+  out/in tip 末端区（kmer 命中, 非链特异双向试, 镜像 QuantifyGraph）各 +1,
+  阈值 ≥2; overlap 自 k-1=23 递减到 10, 低复杂度（单碱基 > (0.8+0.2(gap-1)
+  /13)×overlap, 严格 >）整对放弃, 汉明 ≤2（config 未给, 构造注释
+  min_intersection/5; 默认 0 会关闭修正路径）进入分派——完美 → 机械桥接
+  （gap-1 新节点 + gap 条新边, 全程合法 1bp 漂移, 覆盖 = max(1, min(两链
+  覆盖))）; 错配 → HandlePositiveHammingDistanceCase 简化语义（以覆盖高侧
+  为权威, tie 右侧优先 ≈ SPAdes 先 CanCorrectLeft）: 未压缩图节点不可分割,
+  可修窗口只剩贴端单位置（改 a 末位 / 改 b 首位定义行 kmer）, 窗口外放弃。
+  防假阳性: 同链共节点对不缝（≈ avoid_rc_connections）, 改写/新节点 kmer
+  查重（防 butterfly 按 kmer 并节点短路）, 缝合前复查两端仍死端/源头
+  （L434-437）, 每 out-tip 首个可行候选即 break。
+- **缝合表示决策**: 新增桥接边行（不改既有行 to/frm; 修正路径才改写锚点
+  定义行 kmer 列）——butterfly 重建图后即见 a→…→b 普通路径, 两段 contig
+  可连成一条转录本; 合并链序列会丢图内覆盖结构, 不采用。
+- **走线**: `--gap-close-spades` → TrinityArgs（单端警告置关 = SPAdes "no
+  paired-end libraries" 跳过语义; --recursive 警告不生效）→ ChrysalisParams
+  → run_quantify_packed（清理之后, 与 SPAdes after_simplify 顺序一致）;
+  统计行打印 + `gap_close` 行落 .stage_timings（并行 CPU 时间累计）。
+- **测试**: 12 个单测（PE 权重阈值 1 票不缝/2 票缝、overlap=9 拒/=10 缝、
+  poly-A 低复杂度拒、贴 a 末位错配右权威修正、贴 b 首位错配左权威修正、
+  中间错配拒、同链自连拒、无 reads 逐字节不变、pair_key 后缀、flag 解析与
+  单端降级）; cargo test --workspace 全绿, clippy --workspace --all-targets
+  零警告。
+- **bench dev1（cache e1e5e63758acc2db）**: 统计行 `6386 components, tips
+  (out 6932 + in 6949), tip reads 1135564, pair votes 42683, candidates 199,
+  checked 194, closed 10 (perfect 10 + corrected 0), rejected (low-complexity 1
+  + hamming 2), bridge nodes 26`; 指标 R=14.1% R70=53.2% Rp=10.8% hcR=34.4%
+  P=79.6% F1=24.0% N50=1868 n=7887 P_full=63.5%。同二进制无 flag 全新跑
+  （cache 82e8f2e571f7fe2a）: R=14.1% R70=53.4% Rp=10.8% hcR=34.6% P=80.2%
+  F1=24.0% n=7889——对照基线 ee22（14.0/53.4/10.8/34.4/81.0/23.9/7869）在
+  已知 inchworm 波动带内 ✓ 回归通过。
+- **裁定: 中性（噪声带内）**。缝合仅 10 处（199 候选 → overlap 通过 5%）,
+  与 python 原型"收益微小"的预示一致: R/F1 与无 flag 持平（14.1/24.0）,
+  P 79.6 vs 80.2 的 -0.6pp 处于 inchworm 运行间波动量级（两次全新跑前置
+  产物不同）, 不归因缝合本身。机制工作正常且全程确定（同前置 checkpoint
+  重跑产物逐字节一致, 已验证）。flag 默认关, 保留备用。
+- **严格 A/B（同前置 checkpoint 续跑, 排除 inchworm 波动）**: 同一
+  inchworm/chrysalis 输入下无 flag 7885 条 vs 带 flag 7887 条（净 +2）;
+  按转录本名共有 7842, 各独有 43/45（缝合改变组件内路径枚举导致名字
+  重排, 独有数系上限）——缝合真实效应规模 ≈ 45 条转录本, 指标差异
+  确实在噪声带内。
+| 2026-08-30 | rnaspades-dev1 | R=10.6% P=88.8% **F1=19.0%** | N50=1597 n=6739 | --path-engine rnaspades --CPU 8 --max_memory 8G |
+| 2026-08-30 | rnaspades-regress-classic | R=14.0% P=80.8% **F1=23.9%** | N50=1834 n=7851 | --CPU 8 --max_memory 8G |
+
+## rnaSPAdes 路径引擎落地（--path-engine rnaspades, 2026-08-30）
+
+复刻计划 B4 最后一项: rnaSPAdes PathExtend MultiExtender 核心规则的组件级
+复刻（spades-main `path_extenders.cpp:303-347` MultiExtender::AddCandidates +
+`rna_mode.info:155-197` path_cleaning default 档）。新模块
+`trinity-butterfly/src/rnaspades.rs`, 默认关 = classic 逐字节不变。
+
+- **规则复刻**: 0 候选停; 1 候选延伸; **恰好 2 候选且构成简单 bulge →
+  复制路径各走一支（产 2 个 isoform）**; 其他一切多歧义（2 候选非 bulge /
+  ≥3 候选）→ 停止延伸（宁可断不可错连）。bulge 的图语义映射: SPAdes 图
+  经压缩（边=unitig, bulge=同起点同终点的平行边）, 本组件图节点=kmer、
+  未压缩——翻译为"两条内部简单（出度恒 1）的分叉链在 ≤50 节点内重汇合到
+  同一入度恰 2 的节点 C"（SNP bubble, 支长 ≈ k）。种子 = 无真实前驱源点
+  按 (-cnt, vid) 排序; 纯环组件退化为最高覆盖单种子; 路径内节点不复走
+  防环; 每组件 4096 路径安全阀（SPAdes 无此帽）。
+- **简化点（明示）**: 不做 PE pair 权重（RNAExtensionChooser /
+  PathCoverWeightCounter 未复刻）, 候选排序用覆盖一致性 score =
+  1/(1+|cnt−路径均覆盖|), 保留 score ≥ max/1.5（priority_coeff,
+  pe_params.info 默认）的全部并列者以触发 bulge 判定; 组件 graph.reads
+  因此不消费。path_cleaning 只实现 default 档两条硬阈值（≥110bp 且
+  平均 kmer 覆盖 ≥2）, isolated/relative 过滤未复刻（harvest 层全序列
+  去重兜底）。LoopDetector / used_unique_storage 未复刻。
+- **走线**: args.rs PathEngine 加 RnaSpades 变体（与 --recursive 互斥,
+  沿 gtasm 先例; --gt-weights 在非 gtasm 下一律警告忽略）→
+  butterfly_pool 分发（只读 graph.out）→ harvest 通道与 gtasm 相同
+  （FASTA 头 `>{comp}_g{j}_i1 len=L path=[rnaspades]`, gene_trans_map 兼容）。
+- **测试**: 9 个单测（bulge 分叉产 2 isoform 且序列逐字节等于两支等位、
+  非 bulge 双歧义停、三岔口停、覆盖一致性滤掉低覆盖干扰支、纯环组件
+  高覆盖种子+防环一周、path_cleaning 长度 110/109 与覆盖 2.0/1 边界、
+  空图、FASTA 头与 60 列折行）; cargo test --workspace 全绿,
+  clippy --workspace --all-targets 零警告。
+- **bench dev1（cache cf94bb82c6912d3c）**: R=10.6% R70=45.3% Rp=8.9%
+  hcR=30.8% **P=88.8%** F1=19.0% N50=1597 n=6739。对照 classic
+  （R=14.0% R70=53.4% Rp=10.8% hcR=34.4% P=81.0% F1=23.9%）与 gtasm
+  （R=12.3% R70=49.7% Rp=9.9% P=88.8%）: 召回 -3.4pp、精度 +7.8pp——
+  与"宁可断不可错连"的保守语义自洽（无 PE 权重时歧义点只能停, 长转录本
+  被截断 → R70 掉 8.1pp）; P 与 gtasm 并列最高。
+- **classic 回归（同二进制无 flag 全新跑, cache 9ae734d899a34ae3）**:
+  R=14.0% R70=53.4% Rp=10.7% hcR=34.4% P=80.8% F1=23.9% n=7851——对照
+  基线（14.0/53.4/10.8/34.4/81.0/23.9/7869）在已知 inchworm 波动带内
+  ✓ 回归通过。
+- **裁定: 引擎本身可用但非增益**（F1 19.0% < classic 23.9%）。价值在
+  规则正确性（bulge 双 isoform 是 classic/gtasm 都没有的机制）与高精
+  度补充视角; 要追召回需补 PE 权重延伸（任务书原始 B4 的完整版）, 当前
+  按收窄 scope 交付。flag 默认关。
