@@ -1825,3 +1825,21 @@ reads 深度>=5x（候选真实/未注释, StringTie 参照本身不全）; 疑�
 | 2026-08-30 | dev1 | R=15.4% P=79.9% **F1=25.9%** | N50=1896 n=8548 | --CPU 8 --max_memory 8G |
 | 2026-08-30 | nomultik-dev1 | R=14.0% P=82.2% **F1=23.9%** | N50=1822 n=7828 | --no-multi-k --CPU 8 --max_memory 8G |
 | 2026-08-30 | gtasm-singlek-dev1 | R=12.2% P=89.1% **F1=21.5%** | N50=1672 n=6768 | --path-engine gtasm --gt-weights /storage/home/senior007/test/athal/bench/export/gtnet_dev1.gtw --CPU 8 --max_memory 8G |
+| 2026-08-30 | dev1 | R=12.6% P=89.2% **F1=22.1%** | N50=1709 n=6445 | --path-engine gtasm --gt-weights /storage/home/senior007/test/athal/bench/export/gtnet_dev1.gtw --multi-k auto --CPU 8 --max_memory 8G |
+
+## gtasm×multi-k 组合验证（2026-08-30, cache 6f007a16810cb61a）
+
+用户指定验证项。gt_support 的 k2v 按图内实际 kmer 长自适应（k=37 图=36mer,
+机械兼容）。dev1 三方对照:
+
+| 引擎 | R | R70 | Rp | hcR | P | F1 |
+|---|---|---|---|---|---|---|
+| gtasm@单k25 | 12.2% | 49.7% | 9.9% | 33.4% | 88.8% | 21.5% |
+| **gtasm@multi-k** | **12.6%** | **50.8%** | **10.3%** | 33.6% | **89.2%** | **22.1%** |
+| classic@multi-k | 15.3% | 56.7% | 11.4% | 35.6% | 80.4% | 25.8% |
+
+- **gtasm 全轴受益于多 k 图**（R +0.4 / R70 +1.1 / Rp +0.4 / P +0.4pp,
+  P=89.2% 为全项目精度纪录）——更好的图对任何引擎都是更好的图。
+- 但同图对比 classic 仍 -2.7pp R: 引擎差距（butterfly read-threading 的
+  提取能力）大于图改进（+0.4pp）, gtasm 仍未吃干榨尽图里的路径。
+- 建议: 解除 gtasm 缺省强制单 k 的限制（组合已验证为正）, 警告可降级。
