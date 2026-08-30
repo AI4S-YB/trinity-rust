@@ -28,7 +28,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use trinity_common::kmer::kmer_to_intval;
+use trinity_common::kmer::{kmer_to_intval, KmerId};
 use trinity_inchworm::irke::{
     compute_sequence_assemblies_from_seeds, populate_from_kmers, prune_some_kmers, AssemblyParams,
     IrkeParams, Monitor,
@@ -115,7 +115,7 @@ fn replay_with_original_seed_order_is_byte_identical() {
     prune_some_kmers(&mut counter, 1, 0.0, true, 0.005);
 
     let seeds_text = std::fs::read_to_string(fixture("smoke.seed_order.orig.tsv")).unwrap();
-    let seeds: Vec<(u64, u32)> = seeds_text
+    let seeds: Vec<(KmerId, u32)> = seeds_text
         .lines()
         .map(|l| {
             let (kmer, count) = l.split_once('\t').unwrap();
@@ -281,7 +281,7 @@ fn cli_validation_exit_2() {
     let (code, _, _) = run(&["--run_inchworm".to_string()]);
     assert_eq!(code, 2, "缺 --reads/--kmers");
 
-    for bad in ["0", "33", "abc"] {
+    for bad in ["0", "65", "abc"] {
         let (code, _, err) = run(&base(&["-K", bad]));
         assert_eq!(code, 2, "-K {bad}: {err}");
     }

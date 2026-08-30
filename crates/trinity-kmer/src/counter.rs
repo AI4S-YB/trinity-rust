@@ -7,29 +7,32 @@
 use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 
-use trinity_common::kmer::{get_ds_kmer_val, KmerId};
+use trinity_common::kmer::{get_ds_kmer_val, KmerId, MAX_KMER_LENGTH};
 
 pub type CountMap = FxHashMap<KmerId, u32>;
 
 /// 对一条序列（原始字节）枚举有效 kmer，回调规范化后的键。
 /// 镜像 jellyfish: 非 gatc 字符使包含它的窗口失效，窗口继续前滑（不是重启）。
 pub fn for_each_kmer(seq: &[u8], k: usize, ds: bool, mut f: impl FnMut(KmerId)) {
-    let mask: KmerId = if k >= 32 {
-        u64::MAX
+    // u128 扩容: k=64 时 2k=128, `(1 << 2k)` 溢出 u128 → 满宽掩码兜底
+    // （自限正确: 超窗高位随左移自然掉出）。
+    let mask: KmerId = if k >= MAX_KMER_LENGTH {
+        KmerId::MAX
     } else {
-        (1u64 << (2 * k as u32)) - 1
+        (1u128 << (2 * k as u32)) - 1
     };
     let mut kmer: KmerId = 0;
     let mut valid: usize = 0;
     // M7-norm: 滚动 revcomp（revcomp(km<<2|v) == (revcomp(km)>>2) | (v^3)<<(2k-2)），
     // 免去每 kmer 的 25 迭代 revcomp_val 循环; 与 get_ds_kmer_val(kmer,k) 数值恒等。
-    // k > 32 时移位会溢出（MAX_KMER_LENGTH 之外本就无定义），回落旧路径防御。
-    if ds && k <= 32 {
+    // rev_shift = 2k-2 ≤ 126（k ≤ MAX_KMER_LENGTH=64）在 u128 内恒安全;
+    // k > 64 超出编码定义域，回落旧路径防御。
+    if ds && k <= MAX_KMER_LENGTH {
         let rev_shift: u32 = (2 * k - 2) as u32;
         let mut rev: KmerId = 0;
         for &c in seq {
             let v = match c {
-                b'G' | b'g' => 0u64,
+                b'G' | b'g' => 0u128,
                 b'A' | b'a' => 1,
                 b'T' | b't' => 2,
                 b'C' | b'c' => 3,
@@ -53,7 +56,7 @@ pub fn for_each_kmer(seq: &[u8], k: usize, ds: bool, mut f: impl FnMut(KmerId)) 
     }
     for &c in seq {
         let v = match c {
-            b'G' | b'g' => 0u64,
+            b'G' | b'g' => 0u128,
             b'A' | b'a' => 1,
             b'T' | b't' => 2,
             b'C' | b'c' => 3,
@@ -172,9 +175,13 @@ pub fn inject_trusted_kmers(counts: &mut CountMap, trusted_fasta: &[u8], k: usiz
     inserted
 }
 
-/// mer_counts 二进制记录布局: `u64 key, u32 count`（小端）, 头部魔数
-/// `TRMC` + u32 k + u8 ds（读回时校验）。M7 消 dump 直桥的落盘格式,
+/// mer_counts 二进制记录布局: `u128 key, u32 count`（小端, 20B/条）, 头部魔数
+/// `TRM2` + u32 k + u8 ds（读回时校验）。M7 消 dump 直桥的落盘格式,
 /// 管线（orchestrate）与离线工具（xtask export-edges）共用。
+///
+/// 格式沿革（u128 扩容, 2026-08-30）: KmerId u64→u128 前为魔数 `TRMC` +
+/// 8B key（12B/条）。键宽翻倍后旧文件静默错位解析的风险不可接受 → 魔数升版
+/// 硬拒绝（"bad header" 报错）, 不做双格式读（counts_bin 是易失缓存, 重算即可）。
 pub fn save_counts_bin(
     path: &std::path::Path,
     counts: &CountMap,
@@ -182,7 +189,7 @@ pub fn save_counts_bin(
     ds: bool,
 ) -> Result<(), trinity_common::error::CommonError> {
     let mut buf: Vec<u8> = Vec::new();
-    buf.extend_from_slice(b"TRMC");
+    buf.extend_from_slice(b"TRM2");
     buf.extend_from_slice(&(k as u32).to_le_bytes());
     buf.push(ds as u8);
     for (&key, &c) in counts.iter() {
@@ -193,7 +200,8 @@ pub fn save_counts_bin(
     Ok(())
 }
 
-/// save_counts_bin 的读回侧; k/ds 不匹配或头损坏报错。
+/// save_counts_bin 的读回侧; k/ds 不匹配或头损坏报错（u64 时代的 `TRMC`
+/// 旧格式同走 bad header 硬拒绝——见 save_counts_bin 的格式沿革注记）。
 pub fn load_counts_bin(
     path: &std::path::Path,
     k: usize,
@@ -201,7 +209,7 @@ pub fn load_counts_bin(
 ) -> Result<CountMap, trinity_common::error::CommonError> {
     use trinity_common::error::CommonError;
     let data = std::fs::read(path)?;
-    if data.len() < 9 || &data[..4] != b"TRMC" {
+    if data.len() < 9 || &data[..4] != b"TRM2" {
         return Err(CommonError::Parse(format!(
             "corrupt k-mer table {}: bad header",
             path.display()
@@ -217,11 +225,11 @@ pub fn load_counts_bin(
     }
     let mut counts = CountMap::default();
     let mut i = 9;
-    while i + 12 <= data.len() {
-        let key = u64::from_le_bytes(data[i..i + 8].try_into().unwrap());
-        let c = u32::from_le_bytes(data[i + 8..i + 12].try_into().unwrap());
+    while i + 20 <= data.len() {
+        let key = u128::from_le_bytes(data[i..i + 16].try_into().unwrap());
+        let c = u32::from_le_bytes(data[i + 16..i + 20].try_into().unwrap());
         counts.insert(key, c);
-        i += 12;
+        i += 20;
     }
     Ok(counts)
 }
@@ -351,7 +359,8 @@ mod tests {
     }
 
     /// M7-norm oracle: 滚动 revcomp 路径产出的 DS 键与逐 kmer get_ds_kmer_val 恒等
-    /// （含 N 断窗、小写、滑窗恢复、k=1/k=2 边界）。
+    /// （含 N 断窗、小写、滑窗恢复、k=1/k=2 边界; u128 扩容后加 k=33/37——
+    /// 滚动路径在 u64 时代对 k>32 回落, 现对 k≤64 全程生效）。
     #[test]
     fn rolling_revcomp_matches_get_ds_kmer_val() {
         let seqs = [
@@ -359,9 +368,14 @@ mod tests {
             "acgtNNNNacgtacgtacgtacgtacg",
             "GGGGG",
             "TTTTGGGGCCCCAAAATTTTGGGGCACGTN",
+            // 70bp 长序列覆盖 k=33/37 的多窗滑窗（含首尾窗口的高位碱基）
+            "ACGTACGTTTGCAGTCGATCGTACGATCGATGCATCGATCGTACGATGCTAGCTAGCATCGA",
         ];
         for &seq in &seqs {
-            for k in [1usize, 2, 4, 25] {
+            for k in [1usize, 2, 4, 25, 33, 37] {
+                if k > seq.len() {
+                    continue;
+                }
                 let mut rolling: Vec<KmerId> = Vec::new();
                 for_each_kmer(seq.as_bytes(), k, true, |key| rolling.push(key));
                 // naive: 逐窗口 kmer_to_intval + get_ds_kmer_val
@@ -377,6 +391,34 @@ mod tests {
                 assert_eq!(rolling, naive, "seq={seq} k={k}");
             }
         }
+    }
+
+    /// counts_bin TRM2（u128 键）落盘/读回往返, 含 k=37 的高位键;
+    /// u64 时代 TRMC 旧格式被硬拒绝（防静默错位解析）。
+    #[test]
+    fn counts_bin_trm2_roundtrip_and_legacy_rejected() {
+        let dir = std::env::temp_dir().join(format!("trmc2_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let bin = dir.join("m.bin");
+        let mut m: CountMap = FxHashMap::default();
+        let hi = kmer_to_intval(b"ACGTACGTACGTACGTACGTACGTACGTACGTACGTA").unwrap(); // 37-mer
+        assert!(hi > u64::MAX as u128); // 确为 u64 放不下的键
+        m.insert(hi, 7);
+        m.insert(kmer_to_intval(b"AAAA").unwrap(), 3);
+        save_counts_bin(&bin, &m, 37, true).unwrap();
+        let back = load_counts_bin(&bin, 37, true).unwrap();
+        assert_eq!(back.len(), 2);
+        assert_eq!(back[&hi], 7);
+        // k/ds 不匹配 → 报错
+        assert!(load_counts_bin(&bin, 25, true).is_err());
+        assert!(load_counts_bin(&bin, 37, false).is_err());
+        // 旧 TRMC 魔数（u64 版）→ bad header 硬拒绝
+        let mut legacy = b"TRMC".to_vec();
+        legacy.extend_from_slice(&37u32.to_le_bytes());
+        legacy.push(1);
+        std::fs::write(&bin, &legacy).unwrap();
+        assert!(load_counts_bin(&bin, 37, true).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

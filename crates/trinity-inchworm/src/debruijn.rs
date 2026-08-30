@@ -24,7 +24,7 @@ const A_MASK: u8 = 4;
 const T_MASK: u8 = 2;
 const C_MASK: u8 = 1;
 
-fn base_mask(code: u64) -> u8 {
+fn base_mask(code: KmerId) -> u8 {
     match code {
         0 => G_MASK, // G
         1 => A_MASK, // A
@@ -88,10 +88,11 @@ impl DeBruijnKmer {
 
     /// DeBruijnGraph.cpp:105 get_prev_kmers — 候选 = 首碱基拼上 k 的后缀
     /// （k >> 2）；序 G,A,T,C（只产掩码位非零者）。
+    /// u128 扩容: 位移量 2k-2 ≤ 126（k≤64）恒安全。
     pub fn get_prev_kmers(&self, kmer_length: usize) -> Vec<KmerId> {
         let reverse_suffix = self.kmer >> 2;
         let mut prev_kmers = Vec::new();
-        for (mask, code) in [(G_MASK, 0u64), (A_MASK, 1), (T_MASK, 2), (C_MASK, 3)] {
+        for (mask, code) in [(G_MASK, 0u128), (A_MASK, 1), (T_MASK, 2), (C_MASK, 3)] {
             if self.prev & mask != 0 {
                 prev_kmers.push((code << (kmer_length * 2 - 2)) | reverse_suffix);
             }
@@ -103,10 +104,10 @@ impl DeBruijnKmer {
     /// 首碱基）拼上末碱基；序 G,A,T,C。
     pub fn get_next_kmers(&self, kmer_length: usize) -> Vec<KmerId> {
         // 原版 (k << (33-K)*2) >> (32-K)*2 == (k & 低 2K-2 位) << 2
-        // （截掉首碱基的高 2 位后整体左移一个碱基）
-        let forward_prefix = (self.kmer & ((1u64 << (kmer_length * 2 - 2)) - 1)) << 2;
+        // （截掉首碱基的高 2 位后整体左移一个碱基; u128 下 2K-2 ≤ 126 恒安全）
+        let forward_prefix = (self.kmer & ((1u128 << (kmer_length * 2 - 2)) - 1)) << 2;
         let mut next_kmers = Vec::new();
-        for (mask, code) in [(G_MASK, 0u64), (A_MASK, 1), (T_MASK, 2), (C_MASK, 3)] {
+        for (mask, code) in [(G_MASK, 0u128), (A_MASK, 1), (T_MASK, 2), (C_MASK, 3)] {
             if self.next & mask != 0 {
                 next_kmers.push(forward_prefix | code);
             }

@@ -267,8 +267,12 @@ fn args_mixing_and_missing_reads_rejected() {
 #[test]
 fn args_ranges_and_unknown_option() {
     let mut v = base_args();
-    v.extend(["--KMER_SIZE".into(), "33".into()]);
+    // u128 扩容后支持域上限 63: 33 已合法, 65 越界
+    v.extend(["--KMER_SIZE".into(), "65".into()]);
     assert!(parse_args(&v).is_err());
+    let mut v = base_args();
+    v.extend(["--KMER_SIZE".into(), "37".into()]);
+    assert!(parse_args(&v).is_ok());
     let mut v = base_args();
     v.extend(["--min_contig_length".into(), "99".into()]);
     let e = parse_args(&v).unwrap_err();

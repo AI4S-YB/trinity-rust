@@ -1,7 +1,7 @@
 //! 黄金向量: 与原版 C++（sequenceUtil.cpp 直链 harness）位级一致。
 
 use trinity_common::kmer::{
-    compute_entropy, decode_kmer_from_intval, get_ds_kmer_val, kmer_to_intval, revcomp_val,
+    compute_entropy, decode_kmer_from_intval, get_ds_kmer_val, kmer_to_intval, revcomp_val, KmerId,
 };
 
 #[test]
@@ -16,9 +16,10 @@ fn kmer_ops_match_original_cpp_bit_for_bit() {
         let cols: Vec<&str> = line.split('\t').collect();
         assert_eq!(cols.len(), 5, "行格式异常: {line}");
         let kmer = cols[0].as_bytes();
-        let intval: u64 = cols[1].parse().unwrap();
-        let revcomp: u64 = cols[2].parse().unwrap();
-        let dsval: u64 = cols[3].parse().unwrap();
+        // u128 扩容: k≤32 的键值零扩展后与 u64 黄金值逐位一致
+        let intval: KmerId = cols[1].parse().unwrap();
+        let revcomp: KmerId = cols[2].parse().unwrap();
+        let dsval: KmerId = cols[3].parse().unwrap();
         // %.9g 十进制位足以唯一确定 f32 → 解析回的 f32 与原版逐位一致
         let entropy: f32 = cols[4].parse().unwrap();
         let k = kmer.len();

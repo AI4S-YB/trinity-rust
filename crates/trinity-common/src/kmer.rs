@@ -3,11 +3,15 @@
 
 use crate::error::CommonError;
 
-/// 原版 kmer_int_type_t = unsigned long long（sequenceUtil.hpp:20）
-pub type KmerId = u64;
+/// 原版 kmer_int_type_t = unsigned long long（sequenceUtil.hpp:20）。
+/// **扩容（2026-08-30）: u64 → u128**, 解锁 rnaSPAdes auto k 公式的原值落地
+/// （RL=76 → [29,37]; 2bit 编码下 u128 上限 k=64）。k≤32 的既有键值在数值上
+/// 与 u64 时代完全一致（零扩展）, 故 u64 口径的全部黄金断言不受影响。
+pub type KmerId = u128;
 
-/// sequenceUtil.cpp:258 — kmer 长度上限（64bit / 2bit）
-pub const MAX_KMER_LENGTH: usize = 32;
+/// sequenceUtil.cpp:258 — kmer 长度上限（原版 64bit / 2bit = 32;
+/// KmerId=u128 后 = 64）。
+pub const MAX_KMER_LENGTH: usize = 64;
 
 /// _int_to_base 表（sequenceUtil.cpp:10）
 pub const INT_TO_BASE: [u8; 4] = [b'G', b'A', b'T', b'C'];
@@ -39,7 +43,7 @@ pub fn kmer_to_intval(kmer: &[u8]) -> Result<KmerId, CommonError> {
 }
 
 /// sequenceUtil.cpp:298 decode_kmer_from_intval — 从低位端逐 2-bit 解出，写在逆序位置
-/// kmer_length 无上界守卫（与原版一致）；>32 时高位越界读出前导 G。
+/// kmer_length 无上界守卫（与原版一致）；>64（MAX_KMER_LENGTH）时高位越界读出前导 G。
 pub fn decode_kmer_from_intval(intval: KmerId, kmer_length: usize) -> Vec<u8> {
     let mut kmer = vec![0u8; kmer_length];
     let mut v = intval;
@@ -52,7 +56,7 @@ pub fn decode_kmer_from_intval(intval: KmerId, kmer_length: usize) -> Vec<u8> {
 }
 
 /// sequenceUtil.cpp:181 revcomp_val — ~kmer 完成互补，循环移位完成 2-bit 组反转。
-/// 注意 ~ 会翻转全部 64 位，但循环只提取低 kmer_length 组，高位自然丢弃。
+/// 注意 ~ 会翻转全部 128 位，但循环只提取低 kmer_length 组，高位自然丢弃。
 pub fn revcomp_val(mut kmer: KmerId, kmer_length: usize) -> KmerId {
     let mut rev_kmer: KmerId = 0;
     kmer = !kmer;
@@ -135,10 +139,11 @@ mod tests {
             kmer_to_intval(b"ACGN"),
             Err(CommonError::NonGatcChar { .. })
         ));
-        let long = vec![b'A'; 33];
+        // u128 上限 64: 65 碱基超长
+        let long = vec![b'A'; 65];
         assert!(matches!(
             kmer_to_intval(&long),
-            Err(CommonError::KmerTooLong { len: 33 })
+            Err(CommonError::KmerTooLong { len: 65 })
         ));
     }
 
@@ -198,29 +203,67 @@ mod tests {
 
     #[test]
     fn error_messages_mirror_original() {
-        // 原版 cerr 消息（去 \n\n 前缀）格式固定
+        // 原版 cerr 消息（去 \n\n 前缀）格式固定; 上限数字随 KmerId=u128 变 64
         assert_eq!(
             kmer_to_intval(b"ACGN").unwrap_err().to_string(),
             "error, kmer contains nongatc: ACGN"
         );
         assert_eq!(
-            kmer_to_intval(&[b'A'; 33]).unwrap_err().to_string(),
-            "error, kmer length exceeds 32: 33"
+            kmer_to_intval(&[b'A'; 65]).unwrap_err().to_string(),
+            "error, kmer length exceeds 64: 65"
         );
     }
 
     #[test]
     fn kmer_length_boundaries() {
-        // 32 碱基是接受上限（MAX_KMER_LENGTH）
-        let k32 = vec![b'A'; 32];
-        assert!(kmer_to_intval(&k32).is_ok());
+        // 64 碱基是接受上限（MAX_KMER_LENGTH, u128/2bit）
+        let k64 = vec![b'A'; 64];
+        assert!(kmer_to_intval(&k64).is_ok());
         // 0 长度: 原版返回 0（循环零次）
         assert_eq!(kmer_to_intval(b"").unwrap(), 0);
-        // 脏高位: revcomp 只看低 2*k 位（u64::MAX 的低 4 位全 1 → 单碱基 revcomp 视角）
+        // 脏高位: revcomp 只看低 2*k 位（KmerId::MAX 的低 2 位全 1 → 单碱基 revcomp 视角）
         // 推演: !MAX=0 → base=0&3=0 → rev_kmer=0（sequenceUtil.cpp:181-195 原版同结果）
-        assert_eq!(revcomp_val(u64::MAX, 1), 0);
+        assert_eq!(revcomp_val(KmerId::MAX, 1), 0);
         // decode/entropy 对任意长度行为良定义（此处只验证不 panic 且熵=0）
         // 推演: MAX&3=3 → counts[3]=1 → prob=1.0 → 1.0*ln(1)/ln(2)=0
-        assert!(compute_entropy(u64::MAX, 1).abs() < 1e-6); // 单碱基熵为 0
+        assert!(compute_entropy(KmerId::MAX, 1).abs() < 1e-6); // 单碱基熵为 0
+    }
+
+    /// u128 扩容边界: k=33（首个 u64 放不下的 k）、37（rnaSPAdes RL=76 的 upper_k）、
+    /// 55（RNA_MAX_LOWER_K）、64（物理上限）的编码/解码/revcomp 往返。
+    /// 关键不变量: 高位碱基（>32 位部分）不丢——u64 时代这些位被静默截断。
+    #[test]
+    fn u128_beyond_32_boundaries_roundtrip() {
+        for k in [33usize, 37, 55, 64] {
+            // 首尾异质 + 中段混合的确定性序列（首 C 尾 A, 让高低两端都有非零位）
+            let seq: Vec<u8> = (0..k)
+                .map(|i| match (i * 7 + k) % 4 {
+                    0 => b'G',
+                    1 => b'A',
+                    2 => b'T',
+                    _ => b'C',
+                })
+                .collect();
+            let v = kmer_to_intval(&seq).unwrap();
+            // 编码值占满 2k 位空间且不丢高位: 重编码解码结果必须逐字节还原
+            assert_eq!(decode_kmer_from_intval(v, k), seq, "k={k} 编解码往返");
+            // revcomp 双取复原
+            assert_eq!(revcomp_val(revcomp_val(v, k), k), v, "k={k} revcomp 往返");
+            // DS canonical 幂等（max(k, rc(k)) 再 canonical 不变）
+            let canon = get_ds_kmer_val(v, k);
+            assert_eq!(get_ds_kmer_val(canon, k), canon, "k={k} canonical 幂等");
+            // 熵计算在 2k>64 位的值上不 panic 且落在 [0, 2]
+            let h = compute_entropy(v, k);
+            assert!((0.0..=2.0).contains(&h), "k={k} 熵 {h} 越界");
+        }
+        // k=37 目标用例显式锁: 第 33 位碱基（u64 时代的截断点）参与键值
+        let seq37: Vec<u8> = std::iter::once(b'C')
+            .chain(std::iter::repeat_n(b'A', 35))
+            .chain(std::iter::once(b'T'))
+            .collect();
+        assert_eq!(seq37.len(), 37);
+        let v37 = kmer_to_intval(&seq37).unwrap();
+        assert!(v37 > u64::MAX as u128, "k=37 全 C..T 键值应超出 u64");
+        assert_eq!(decode_kmer_from_intval(v37, 37), seq37);
     }
 }

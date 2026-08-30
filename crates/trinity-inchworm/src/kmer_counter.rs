@@ -1,7 +1,8 @@
 //! KmerCounter — 直译 Inchworm/src/KmerCounter.cpp 的 kmer 计数目录（单线程版）。
 //!
 //! 语义要点（对照原版行号）:
-//! - 键 = kmer_int_type_t(u64)，值 = unsigned int(u32) 计数（KC:13）
+//! - 键 = kmer_int_type_t（原版 u64; 本实现 KmerId=u128 扩容, 2026-08-30），
+//!   值 = unsigned int(u32) 计数（KC:13）
 //! - DS 模式下 add/find/clear 全部先 canonical: max(k, revcomp(k))
 //!   （KC:367-375 find_kmer / KC:476-480 add_kmer / KC:420-436 clear_kmer）
 //! - 删除是惰性的: 置 0 不 erase（KC:430 `it->second = 0`），size() 含 0 值键（KC:51-53）
@@ -51,9 +52,11 @@ pub trait KmerCatalog {
     /// KC:507-533 forward 候选（count>0 过滤 + count 降序稳定排序——默认实现）
     fn get_forward_kmer_candidates(&self, kmer: KmerId) -> Vec<(KmerId, u32)> {
         let kmer_length = self.get_kmer_length();
-        // K=32 时 (33-K)*2=2、(32-K)*2=0；K=1 时左移 64 在原版是 UB（x86 硬件按
-        // 移位量 mod 64 回绕），wrapping_shl 的回绕语义与之相同。
-        let prefix = kmer.wrapping_shl(((33 - kmer_length) * 2) as u32) >> ((32 - kmer_length) * 2);
+        // 原版 u64 公式 (kmer << (33-K)*2) >> (32-K)*2 的 u128 平移: 常数随位宽
+        // 换成 (65-K)*2 / (64-K)*2（语义 = 丢弃首碱基后整体左移一个碱基;
+        // K=64 时 <<2 >>0; K=1 时左移 128 在原版是 UB（x86 硬件按移位量 mod 位宽
+        // 回绕），wrapping_shl 的回绕语义与之相同）。
+        let prefix = kmer.wrapping_shl(((65 - kmer_length) * 2) as u32) >> ((64 - kmer_length) * 2);
         let mut candidates = Vec::with_capacity(4);
         for i in 0..4 {
             let candidate = prefix | i;
@@ -93,11 +96,12 @@ pub struct KmerCounter {
 }
 
 impl KmerCounter {
-    /// KC:13-17: kmer_length > 32 抛错（64bit / 2bit 编码上限），消息原样保留。
+    /// KC:13-17: kmer_length > MAX_KMER_LENGTH 抛错（原版 64bit/2bit 上限 32;
+    /// KmerId=u128 后上限 64），消息数字同步。
     pub fn new(kmer_length: usize, ds_mode: bool) -> Self {
         assert!(
             kmer_length <= MAX_KMER_LENGTH,
-            "Kmer length exceeds max of 32"
+            "Kmer length exceeds max of {MAX_KMER_LENGTH}"
         );
         KmerCounter {
             kmer_length,
@@ -287,10 +291,12 @@ mod tests {
 
     #[test]
     fn k32_forward_boundary_no_panic() {
-        // K=32: (33-32)*2 = 2，(32-32)*2 = 0 —— 退化为 (kmer << 2) | i
+        // K=32: (65-32)*2 = 66，(64-32)*2 = 64 —— 等价于"弃首碱基后 <<2"（掩码写法）
         let seed = enc(&[b'A'; 32]); // 0x5555_5555_5555_5555
         assert_eq!(seed, 0x5555_5555_5555_5555);
-        let prefix = seed << 2; // 顶 2 位（首个 A）被移出
+        // u64 时代 seed << 2 顶 2 位（首个 A）自然掉出 64 位; u128 下不会掉——
+        // 这里按实现同式的掩码推导预期值（低 62 位 <<2）
+        let prefix = (seed & ((1u128 << 62) - 1)) << 2;
         assert_eq!(prefix, 0x5555_5555_5555_5554);
         let mut kc = KmerCounter::new(32, false);
         kc.add_kmer(prefix, 4); // A*31 + G
@@ -311,16 +317,44 @@ mod tests {
         let mut kc = KmerCounter::new(32, false);
         kc.add_kmer(seed, 9); // A*32（前置 A）
         kc.add_kmer(suffix, 2); // G + A*31（前置 G，i=0）
-        kc.add_kmer((2u64 << 62) | suffix, 2); // T + A*31（前置 T，i=2）
+        kc.add_kmer((2u128 << 62) | suffix, 2); // T + A*31（前置 T，i=2）
         let rev = kc.get_reverse_kmer_candidates(seed);
         assert_eq!(
             rev,
-            vec![(seed, 9), (suffix, 2), ((2u64 << 62) | suffix, 2)]
+            vec![(seed, 9), (suffix, 2), ((2u128 << 62) | suffix, 2)]
         );
         // 平局 2:2 → GATC 序（前置 G 在前置 T 前）
         let mut expected = vec![b'G'];
         expected.extend(vec![b'A'; 31]);
         assert_eq!(kc.get_kmer_string(rev[1].0), expected);
+    }
+
+    /// u128 扩容边界（k>32, 解锁 rnaSPAdes 公式域）: 前/反向候选生成在
+    /// k=33（首个 u64 放不下的 k）、37（RL=76 的 upper_k）、55（RNA_MAX_LOWER_K）
+    /// 正确——首碱基丢弃、高位无残留、计数查询命中。
+    #[test]
+    fn forward_reverse_candidates_beyond_k32() {
+        for k in [33usize, 37, 55] {
+            // 种子 s = C + A*(k-2) + T（首 C 末 T, 高位有非零位）;
+            // 前向真候选 = 弃首 C 后拼 C → A*(k-2) + T + C;
+            // 反向真候选 = 弃末 T 后前置 G → G + C + A*(k-2)。
+            let mut s = vec![b'C'];
+            s.extend(std::iter::repeat_n(b'A', k - 2));
+            s.push(b'T');
+            let mut fwd = vec![b'A'; k - 2];
+            fwd.extend_from_slice(b"TC");
+            let mut rev = b"GC".to_vec();
+            rev.extend(std::iter::repeat_n(b'A', k - 2));
+            let mut kc = KmerCounter::new(k, false);
+            kc.add_kmer(enc(&fwd), 9);
+            kc.add_kmer(enc(&rev), 7);
+            let sv = enc(&s);
+            assert_eq!(sv >> (2 * k), 0, "k={k} 编码值应恰占低 2k 位");
+            assert_eq!(kc.get_forward_kmer_candidates(sv), vec![(enc(&fwd), 9)], "k={k}");
+            assert_eq!(kc.get_reverse_kmer_candidates(sv), vec![(enc(&rev), 7)], "k={k}");
+            // 解码往返（get_kmer_string 按存储值解码）
+            assert_eq!(kc.get_kmer_string(sv), s, "k={k}");
+        }
     }
 
     // ---- DS canonical / 累加 / 回绕 --------------------------------------
@@ -412,8 +446,9 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "Kmer length exceeds max of 32")]
-    fn kmer_length_over_32_rejected() {
-        let _ = KmerCounter::new(33, false);
+    #[should_panic(expected = "Kmer length exceeds max of 64")]
+    fn kmer_length_over_64_rejected() {
+        // u128 上限 64: 65 拒绝（原 u64 时代 33 即拒）
+        let _ = KmerCounter::new(65, false);
     }
 }

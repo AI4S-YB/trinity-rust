@@ -29,7 +29,7 @@ use trinity_chrysalis::pack::{read_at, PackIndex, GRAPHS_PACK, KIND_GRAPH_OUT};
 use trinity_common::error::CommonError;
 use trinity_common::fasta::FastaReader;
 use trinity_common::io_util::open_maybe_gz;
-use trinity_common::kmer::{kmer_to_intval, revcomp_val};
+use trinity_common::kmer::{kmer_to_intval, revcomp_val, KmerId};
 
 use crate::args::SeqType;
 
@@ -43,7 +43,11 @@ pub struct SupportStats {
 }
 
 /// k2v 键: (kmer 2bit 值, kmer 长度); 值: (cid, vid)。
-type K2V = FxHashMap<(u64, u32), (u64, i32)>;
+/// 键值类型 = KmerId（u128, 2026-08-30 扩容随动）: 本 pass 的 K 取自
+/// chrysalis 图（原型恒 24）, 不随 --multi-k 变化（multi-k×gtasm 在参数层
+/// 未接线/互斥——多 k 轮次各自建图, gtasm 仅见最终轮图）; KmerId 域内任意
+/// k ≤ 64 的图均可正确编码, 对 k>32 无隐性截断依赖。
+type K2V = FxHashMap<(KmerId, u32), (u64, i32)>;
 
 /// 每 comp 的真实图边集（pack_uv 键）——计数过滤用（见模块文档）。
 type EdgeSets = FxHashMap<u64, FxHashSet<u64>>;

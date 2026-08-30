@@ -37,8 +37,9 @@ const SR_FLAG: &str = "asm";
 // --max_memory 护栏（P1 审查 I2）
 // ---------------------------------------------------------------------------
 
-/// k-mer 哈希单条目的保守字节下限（u64 key + u32 count + 槽位开销）。
-pub const KMER_ENTRY_BYTES: u64 = 18;
+/// k-mer 哈希单条目的保守字节下限（u128 key + u32 count + 槽位开销;
+/// KmerId u64→u128 扩容（2026-08-30）后由 18 调整为 26）。
+pub const KMER_ENTRY_BYTES: u64 = 26;
 
 /// 归一化 / k-mer 计数阶段的**硬护栏**估算（保守代理公式）:
 /// 输入文件需整读进内存（`input_bytes`），计数哈希按"文件量级 distinct
@@ -963,7 +964,7 @@ mod tests {
         let g = 1024 * 1024 * 1024u64;
         let msg = memory_guard_error(g, g, "k-mer counting").expect("should error");
         assert!(msg.contains("1.2x input"), "{msg}");
-        assert!(msg.contains("distinct k-mers x 18 B"), "{msg}");
+        assert!(msg.contains("distinct k-mers x 26 B"), "{msg}");
         assert!(msg.contains("increase --max_memory"), "{msg}");
         assert!(msg.contains("k-mer counting"), "{msg}");
     }

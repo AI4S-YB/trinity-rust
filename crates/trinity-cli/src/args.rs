@@ -33,8 +33,9 @@ pub enum PathEngine {
 /// 缺省 = None（单 k classic, 行为逐字节不变）。
 ///
 /// - `Auto`: 按 reads 读长（前 1000 条抽样）走 rnaSPAdes `rna_k_values` 公式
-///   （multik::rna_k_values）, 再钳入支持域 [15, 32];
-/// - `List`: 显式递升 k 列表（逗号分隔, 每个 k ∈ [15, 32]）。
+///   （multik::rna_k_values）, 再钳入支持域 [15, 63]（KmerId=u128 扩容后,
+///   RL=76 的公式原值 [29,37] 直接落地）;
+/// - `List`: 显式递升 k 列表（逗号分隔, 每个 k ∈ [15, 63]）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MultiK {
     Auto,
@@ -59,7 +60,8 @@ pub struct TrinityArgs {
     /// `--max_memory xG` 字节数（必填，原版 L975-984 die）。
     pub max_memory: u64,
     pub output: PathBuf,
-    /// 原版 `__KMER_SIZE` 默认 25（本实现暴露为 `--KMER_SIZE`）; 1..=32。
+    /// 原版 `__KMER_SIZE` 默认 25（本实现暴露为 `--KMER_SIZE`）; 1..=63
+    /// （KmerId=u128 扩容, 上限与 multik::MULTI_K_MAX 同一支持域）。
     pub kmer_size: usize,
     /// 默认 200; >= ABSOLUTE_MIN_CONTIG_LENGTH（=100，原版 L29/L969-970）。
     pub min_contig_length: usize,
@@ -126,7 +128,7 @@ fn path_list(v: &str) -> Vec<PathBuf> {
 }
 
 /// `--multi-k k1,k2,...` 显式列表解析: 逗号分隔整数, 每个 k ∈
-/// [multik::MULTI_K_MIN, multik::MULTI_K_MAX]（15..=32, KmerId 位宽上限）,
+/// [multik::MULTI_K_MIN, multik::MULTI_K_MAX]（15..=63, KmerId=u128 支持域）,
 /// 严格递升。空段/非数字/越界/乱序/重复一律 usage 报错。
 fn parse_multi_k_list(v: &str) -> Result<Vec<usize>, CliError> {
     use crate::multik::{MULTI_K_MAX, MULTI_K_MIN};
@@ -272,9 +274,12 @@ pub fn parse_args(argv: &[String]) -> Result<TrinityArgs, CliError> {
             "Error, need either options 'left' and 'right' or option 'single'",
         ));
     }
-    if !(1..=32).contains(&kmer_size) {
+    // u128 扩容: 支持域上限与 multik::MULTI_K_MAX 一致（63 = MAX_KMER_LENGTH-1,
+    // 见 multik.rs 注记; 原版 u64 时代为 1..=32）
+    if !(1..=crate::multik::MULTI_K_MAX).contains(&kmer_size) {
         return Err(CliError::usage(format!(
-            "invalid --KMER_SIZE value: {kmer_size} (must be 1..=32)"
+            "invalid --KMER_SIZE value: {kmer_size} (must be 1..={})",
+            crate::multik::MULTI_K_MAX
         )));
     }
     // ABSOLUTE_MIN_CONTIG_LENGTH = 100（原版 L29）。
@@ -488,10 +493,13 @@ mod tests {
 
     #[test]
     fn multi_k_list_validation() {
-        // 越界: <15 或 >32 报错
+        // 越界: <15 或 >63 报错（u128 支持域 [15,63]; 33 扩容后合法）
         assert!(parse_args(&argv(&["--multi-k", "14,25"])).is_err());
-        assert!(parse_args(&argv(&["--multi-k", "25,33"])).is_err());
+        assert!(parse_args(&argv(&["--multi-k", "25,64"])).is_err());
         assert!(parse_args(&argv(&["--multi-k", "15,32"])).is_ok());
+        assert!(parse_args(&argv(&["--multi-k", "15,63"])).is_ok());
+        // RL=76 公式原值 [29,37] 作为显式列表合法（扩容动机）
+        assert!(parse_args(&argv(&["--multi-k", "29,37"])).is_ok());
         // 非数字 / 空段
         assert!(parse_args(&argv(&["--multi-k", "x"])).is_err());
         assert!(parse_args(&argv(&["--multi-k", "21,,25"])).is_err());

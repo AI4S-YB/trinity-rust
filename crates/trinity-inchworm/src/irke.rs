@@ -272,7 +272,7 @@ fn add_sequence(kcounter: &mut KmerCounter, seq: &[u8], cov: u32) {
         return;
     }
     for i in 0..=seq.len() - k {
-        // 唯一 Err 原因是非 gatc（窗口长度 == K ≤ 32）→ 镜像 add_kmer(string) 跳过
+        // 唯一 Err 原因是非 gatc（窗口长度 == K ≤ MAX_KMER_LENGTH=64）→ 镜像 add_kmer(string) 跳过
         if let Ok(kmer) = kmer_to_intval(&seq[i..i + k]) {
             kcounter.add_kmer(kmer, cov);
         }
@@ -1643,7 +1643,7 @@ mod tests {
             let seed = [vec![s0], p6.clone()].concat();
             let seed_first6 = seed[..6].to_vec();
 
-            let mut used: std::collections::HashSet<u64> = std::collections::HashSet::new();
+            let mut used: std::collections::HashSet<KmerId> = std::collections::HashSet::new();
             let mut claimed: std::collections::HashSet<u32> = std::collections::HashSet::new();
             let mut blocked: std::collections::HashSet<u32> = std::collections::HashSet::new();
             used.insert(val(&seed));
@@ -2375,7 +2375,7 @@ mod tests {
             let mut i: KmerId = 0;
             while kc.size() < 1200 {
                 if !matches!(i, 0..=15) {
-                    kc.add_kmer(1u64 << 40 | i, 1);
+                    kc.add_kmer(1u128 << 40 | i, 1);
                 }
                 i += 1;
             }

@@ -1,7 +1,7 @@
 //! Kmer_visitor — 直译 KmerCounter.cpp:756-799。
 //!
-//! 原版 std::set<kmer_int_type_t> → std::HashSet<u64>：集合语义一致；
-//! 4^32 键空间下两容器都不发生行为级碰撞差异（计划 Task 1 规格选择）。
+//! 原版 std::set<kmer_int_type_t> → std::HashSet<KmerId>（u128）: 集合语义一致;
+//! 键空间下两容器都不发生行为级碰撞差异（计划 Task 1 规格选择）。
 //! DS 模式下 add/exists/erase 全部先 canonical（KC:766-789）。
 
 use std::collections::HashSet;

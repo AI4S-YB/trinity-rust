@@ -12,7 +12,7 @@
 | kmer.rs::revcomp_val | Inchworm/src/sequenceUtil.cpp:181 | `~kmer` 互补 + 循环移位反转 2-bit 组 |
 | kmer.rs::get_ds_kmer_val | Inchworm/src/sequenceUtil.cpp:376 | canonical = max(kmer, revcomp(kmer)) |
 | kmer.rs::compute_entropy | Inchworm/src/sequenceUtil.cpp:316 | log2 香农熵，f32 逐项累加（浮点序不可变） |
-| kmer.rs::KmerId / MAX_KMER_LENGTH | Inchworm/src/sequenceUtil.hpp:20 | `kmer_int_type_t = unsigned long long`，上限 32 |
+| kmer.rs::KmerId / MAX_KMER_LENGTH | Inchworm/src/sequenceUtil.hpp:20 | 原版 `kmer_int_type_t = unsigned long long`（上限 32）；本实现 u64→**u128** 扩容（2026-08-30），上限 64 |
 | fasta.rs::FastaReader/FastaRecord | Inchworm/src/Fasta_reader.cpp:121-122 + Fasta_entry.cpp:22-30 | header/acc 语义 + 序列大写化去空白；4 处已证差异见文件头注释（有意为之） |
 | fasta.rs::add_fasta_seq_line_breaks | Inchworm/src/IRKE.cpp:386 | 每 interval 字符插换行，末组不换 |
 | fastq.rs::FastqReader | （原版由 Perl 脚本逐行转换，无独立 C++ 读者） | 严格 4 行记录；校验比原版严格 |

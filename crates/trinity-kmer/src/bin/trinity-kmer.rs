@@ -6,7 +6,7 @@
 //!                 [--SS_lib_type F|R|RF|FR] [--max_cov 200] [--min_cov 1] [--max_CV 10000] [-K 25]
 //!
 //! 参数校验（T2 审查 Important 修复）: 未知 flag 报错、值 flag 缺值报错、
-//! -K 非 1..=32 报错——一律 exit 2（不再静默忽略/采用默认值）。
+//! -K 非 1..=64 报错——一律 exit 2（不再静默忽略/采用默认值）。
 //! 解析器: trinity-common::cli（P3-T0 起两 bin 共用）。
 
 use std::io::{BufWriter, Read};
@@ -58,17 +58,19 @@ fn run_cli(r: Result<(), CliError>) -> i32 {
     }
 }
 
-/// -K 解析与 1..=32 校验（sequenceUtil "kmer length exceeds 32"）。
+/// -K 解析与 1..=64 校验（sequenceUtil "kmer length exceeds N" 文案;
+/// N 随 KmerId=u128 扩容为 MAX_KMER_LENGTH=64, 原版 u64 时代为 32）。
 fn parse_kmer(cli: &mut Cli) -> Result<usize, CliError> {
     match cli.value_flag("-K")? {
         None => Ok(25),
         Some(v) => {
             let k: usize = v.parse().map_err(|_| {
-                CliError::usage(format!("invalid -K value: {v} (expected integer 1..=32)"))
+                CliError::usage(format!("invalid -K value: {v} (expected integer 1..=64)"))
             })?;
-            if !(1..=32).contains(&k) {
+            if !(1..=trinity_common::kmer::MAX_KMER_LENGTH).contains(&k) {
                 return Err(CliError::usage(format!(
-                    "kmer length exceeds 32 or is zero: {k}"
+                    "kmer length exceeds {} or is zero: {k}",
+                    trinity_common::kmer::MAX_KMER_LENGTH
                 )));
             }
             Ok(k)

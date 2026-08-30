@@ -20,10 +20,14 @@ use crate::args::{SeqType, TrinityArgs};
 pub const RNA_MIN_K: usize = 29;
 /// rnaSPAdes RNA_MAX_LOWER_K（options_storage.py:78）。
 pub const RNA_MAX_LOWER_K: usize = 55;
-/// `--multi-k` 合法下界（KmerId 位宽上限见上界 MAX_KMER_LENGTH=32）。
+/// `--multi-k` 合法下界（KmerId 位宽上限见上界 MAX_KMER_LENGTH=64）。
 pub const MULTI_K_MIN: usize = 15;
-/// `--multi-k` 合法上界（u64 / 2bit 编码）。
-pub const MULTI_K_MAX: usize = MAX_KMER_LENGTH;
+/// `--multi-k` 合法上界: 63 = MAX_KMER_LENGTH(64) - 1（KmerId=u128 / 2bit,
+/// 2026-08-30 扩容后由 32 放宽）。保守留 1 碱基余量: k=64 物理可编码
+/// （编码层 MAX_KMER_LENGTH 允许）, 但 CLI 支持域取 63——让 `(1 << 2k)` 族
+/// 表达式恒落在位宽内（2k ≤ 126）, 不依赖满宽边界的自限回绕。
+/// rnaSPAdes 公式域内已覆盖 RL=76 的 [29,37] 原值。
+pub const MULTI_K_MAX: usize = MAX_KMER_LENGTH - 1;
 
 /// rnaSPAdes auto k 公式（spades_stage.py `rna_k_values` 直译）:
 /// - `upper_k = int(RL/2) - 1`
@@ -31,9 +35,9 @@ pub const MULTI_K_MAX: usize = MAX_KMER_LENGTH;
 /// - 两者均向下取奇（偶则 -1）
 /// - `upper_k <= lower_k` 时单 k = `[upper_k]`, 否则 `[lower_k, upper_k]`
 ///
-/// 忠实保留公式原值——可能超出本实现支持域 [15, 32]（如 RL=76 → [29, 37]）,
+/// 忠实保留公式原值——可能超出本实现支持域 [15, 63]（如 RL=250 → [55,123]）,
 /// 支持域钳制归 [`clamp_k_list`]（对应 SPAdes 公式内的 MAX_K=127 钳制步骤,
-/// 我们的位宽上限是 32）。
+/// 我们的位宽上限经 u128 扩容后为 63）。u64 时代的 [29,37]→[29,32] 钳制已解除。
 pub fn rna_k_values(rl: usize) -> Vec<usize> {
     // int(RL/2) - 1: usize 除法即截断（正数 = floor）; saturating 防极小 RL 下溢
     let mut upper_k = (rl / 2).saturating_sub(1);
@@ -54,8 +58,8 @@ pub fn rna_k_values(rl: usize) -> Vec<usize> {
 
 /// 公式值 → 支持域 [MULTI_K_MIN, MULTI_K_MAX] 钳制 + 保序去重。
 /// 输入递升 → 钳制后仍递升（可能出相邻重复）, `dedup` 收敛; 结果恒非空。
-/// 例: RL=76 公式 [29,37] → [29,32]; RL=150 公式 [49,73] → [32]（双双触顶
-/// 去重成单 k, 退化为 k=32 的 classic 结构——位宽上限下的诚实结果）。
+/// 例: RL=76 公式 [29,37] → **原值落地**（u128 扩容后不再钳）;
+/// RL=150 公式 [49,73] → [49,63]; RL=250 [55,123] → [55,63]。
 pub fn clamp_k_list(ks: Vec<usize>) -> Vec<usize> {
     let mut out: Vec<usize> = ks
         .into_iter()
@@ -145,14 +149,18 @@ mod tests {
 
     #[test]
     fn clamp_k_list_to_supported_domain() {
-        // RL=76 的公式值 [29,37] → 37 超位宽上限 → 钳到 32
-        assert_eq!(clamp_k_list(vec![29, 37]), vec![29, 32]);
-        // RL=150: [49,73] 双双触顶 → 去重成单 k=32
-        assert_eq!(clamp_k_list(vec![49, 73]), vec![32]);
+        // u128 扩容（[15,63]）: RL=76 的公式值 [29,37] 原值落地, 不再被钳
+        assert_eq!(clamp_k_list(vec![29, 37]), vec![29, 37]);
+        // RL=150: [49,73] → 73 超支持域上限 → 钳到 63
+        assert_eq!(clamp_k_list(vec![49, 73]), vec![49, 63]);
+        // 双双触顶去重成单 k（RL=250: [55,123] → [55,63] 不触顶去重;
+        // 构造双侧触顶: [70,80] → [63]）
+        assert_eq!(clamp_k_list(vec![70, 80]), vec![63]);
         // 下界: 公式给出 <15 的（短读长）→ 钳到 15
         assert_eq!(clamp_k_list(vec![11]), vec![15]);
-        // 域内不变
+        // 域内不变（含新边界 63 与旧上界 32 以上区域）
         assert_eq!(clamp_k_list(vec![21, 25]), vec![21, 25]);
+        assert_eq!(clamp_k_list(vec![29, 55, 63]), vec![29, 55, 63]);
     }
 
     fn write(p: &Path, bytes: &[u8]) {
