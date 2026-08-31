@@ -32,11 +32,14 @@ use trinity_common::error::CommonError;
 
 use crate::args::PathEngine;
 
-/// gtasm 引擎的池级共享上下文（模型 + 原始 reads 边支持表; 逐 comp 只读）。
+/// gtasm 引擎的池级共享上下文（模型 + 原始 reads 边支持表 + read pair 分支
+/// 支持表; 逐 comp 只读）。
 #[derive(Debug)]
 pub struct GtasmShared {
     pub model: GtModel,
     pub support: EdgeSupport,
+    /// read pair 分支支持（--gtasm-pair-support 关时为空表, 解码零开销）。
+    pub pair_support: trinity_butterfly::PairSupport,
 }
 
 /// 组件池参数（从 TrinityArgs 收敛）。
@@ -58,6 +61,12 @@ pub struct ButterflyPoolParams {
     /// gtasm 解码的 visited 穿越（--no-gtasm-visited-walk 关闭; 默认开,
     /// 机制见 trinity-butterfly gtdecode 模块文档）。仅 gtasm 引擎消费。
     pub gtasm_visited_walk: bool,
+    /// gtasm 解码的简单 bulge 双臂产出（--gtasm-bulge-dual 开; 默认关,
+    /// 机制见 gtdecode 模块文档）。仅 gtasm 引擎消费。
+    pub gtasm_bulge_dual: bool,
+    /// gtasm 解码的 read pair 分支证据乘性消费（--gtasm-pair-support 开;
+    /// 默认关）。仅 gtasm 引擎消费。
+    pub gtasm_pair_support: bool,
 }
 
 /// 原版 butterfly 命令实参（L2363-2388）:
@@ -209,10 +218,16 @@ fn run_one(
                 &g,
                 id,
                 &name,
-                params.min_contig_length,
                 &shared.model,
                 &shared.support,
-                params.gtasm_visited_walk,
+                &shared.pair_support,
+                &trinity_butterfly::GtasmParams {
+                    min_len: params.min_contig_length,
+                    seed: trinity_butterfly::GTASM_DEFAULT_SEED,
+                    allow_visited_walk: params.gtasm_visited_walk,
+                    bulge_dual: params.gtasm_bulge_dual,
+                    pair_boost: params.gtasm_pair_support,
+                },
             )
             .map_err(|e| CommonError::Parse(format!("gtasm 组件 {id} 失败: {e}")))?
         }

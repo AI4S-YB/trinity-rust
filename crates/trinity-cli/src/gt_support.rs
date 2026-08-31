@@ -17,6 +17,21 @@
 //!   未命中重置 prev。python 会对非边转移也计数, 但解码期只查图边——
 //!   计数时按边过滤对结果等价（内存小一个量级）。
 //! - python 的 revcomp 回退查询在此省略: k2v 已正反义双写, 回退永不新增命中。
+//!
+//! ## read pair 分支支持 pass（`--gtasm-pair-support` 配套, 近似静态版）
+//!
+//! 单 read 76bp 够不着 300-400bp 的分支间距; pair（insert ~300-400bp）是
+//! 够得着的证据源。规则（逐规格）: R1/R2 按 read 名配对（同序流式
+//! lockstep）, 两条 mate 各自线程化（沿用同一 k2v, K=图 kmer 长）; 对每个
+//! 分支出边 e=(v,w)（v 出度≥2, 按去重后继计）, 若一条 mate 的节点路径
+//! 包含 e（相邻命中、真实图边）且另一条命中 "v 的上游窗口节点集"（自 v
+//! 反向 BFS ≤ [`PAIR_WINDOW_EDGES`] 边的节点集合, 不含 v 自身）, 则
+//! pair_support[(cid,v,w)] += 1。每对每边至多计 1（双取向各评一次,
+//! 同对同边去重）。产物落盘 `gtasm_pair_support.bin`（GTP1 sidecar——
+//! 与 GTS1 记录布局同构、magic 区分, 与单 read 边支持绝不混用同一字段）。
+//!
+//! 与边支持 pass 的差异（无 python 原型约束处, 从简）: fastq 按严格 4 行
+//! 记录（不要 line%4 quirk）; kmer 窗口全扫（不要末窗 quirk）。
 
 use std::fs;
 use std::io::BufRead;
@@ -24,7 +39,7 @@ use std::path::{Path, PathBuf};
 
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use trinity_butterfly::{parse_component_graph, EdgeSupport};
+use trinity_butterfly::{parse_component_graph, EdgeSupport, PairSupport};
 use trinity_chrysalis::pack::{read_at, PackIndex, GRAPHS_PACK, KIND_GRAPH_OUT};
 use trinity_common::error::CommonError;
 use trinity_common::fasta::FastaReader;
@@ -53,6 +68,17 @@ type K2V = FxHashMap<(KmerId, u32), (u64, i32)>;
 /// 每 comp 的真实图边集（pack_uv 键）——计数过滤用（见模块文档）。
 type EdgeSets = FxHashMap<u64, FxHashSet<u64>>;
 
+/// 分支点上游窗口的 BFS 深度上限（边数; pair pass 规格: 自 v 反向 BFS ≤15 边）。
+pub const PAIR_WINDOW_EDGES: usize = 15;
+
+/// 单窗口节点数安全阀（防汇合密集区内存爆炸; 超限截断为下近似, 实测远不到）。
+const PAIR_WINDOW_MAX_NODES: usize = 1024;
+
+/// 分支点上游窗口表: (cid, 分支节点 v) → 反向 BFS ≤ [`PAIR_WINDOW_EDGES`] 边
+/// 的节点集（不含 v 自身; <0 哨兵不入——k2v 无其名, mate 命中不可能）。
+/// 键只在 v 的去重后继出度 ≥ 2（真分支点）时存在——计数期据此判分支出边。
+type BranchWindows = FxHashMap<(u64, i32), FxHashSet<i32>>;
+
 /// 跑整个支持 pass: 建 k2v → 扫 reads → 落盘。返回统计。
 pub fn run_support_pass(
     listing: &[(u64, PathBuf)],
@@ -61,7 +87,7 @@ pub fn run_support_pass(
     out_bin: &Path,
 ) -> Result<SupportStats, CommonError> {
     // ---- 1. 逐 comp 读 graph.out 记录, 建 k2v 与边集 ----
-    let (k2v, edge_sets, k) = build_k2v(listing)?;
+    let (k2v, edge_sets, k, _windows) = build_k2v(listing)?;
     eprintln!("-gtasm support: k2v {} 键 (K={k}), {} comps 边集", k2v.len(), edge_sets.len());
 
     // ---- 2. 扫原始 reads（逐文件并行, 末尾合并）----
@@ -102,11 +128,15 @@ pub fn run_support_pass(
     Ok(stats)
 }
 
-/// 从 graphs.pack 读全部 comp 的 graph.out → (k2v, 边集, K)。
+/// 从 graphs.pack 读全部 comp 的 graph.out → (k2v, 边集, K, 分支窗口)。
 /// K = 首个 kmer 的长度（原型恒 24; 图内 kmer 长度一致由 butterfly 解析保证）。
-fn build_k2v(listing: &[(u64, PathBuf)]) -> Result<(K2V, EdgeSets, usize), CommonError> {
+/// 分支窗口只被 pair pass 消费, 但与图解析同源, 一并构建以免重读 pack。
+fn build_k2v(
+    listing: &[(u64, PathBuf)],
+) -> Result<(K2V, EdgeSets, usize, BranchWindows), CommonError> {
     let mut k2v: K2V = FxHashMap::default();
     let mut edge_sets: EdgeSets = FxHashMap::default();
+    let mut windows: BranchWindows = FxHashMap::default();
     let mut k_len: Option<usize> = None;
     // listing 按 id 升序 → 同 Cbin 连续; 每 bin 的索引与句柄各开一次
     let mut cur_bin: Option<(PathBuf, PackIndex, fs::File)> = None;
@@ -152,8 +182,70 @@ fn build_k2v(listing: &[(u64, PathBuf)]) -> Result<(K2V, EdgeSets, usize), Commo
                 g.vids[g.dst[ei]],
             ));
         }
+        // 分支点上游窗口（pair pass 用）: 去重后继 ≥2 的节点 v → 反向 BFS
+        // ≤ PAIR_WINDOW_EDGES 边的节点集
+        let mut succ: FxHashMap<i32, Vec<i32>> = FxHashMap::default();
+        let mut pred: FxHashMap<i32, Vec<i32>> = FxHashMap::default();
+        for ei in 0..g.n_edges() {
+            let (s, d) = (g.vids[g.src[ei]], g.vids[g.dst[ei]]);
+            if d < 0 {
+                continue; // 防御: 哨兵不作路径节点
+            }
+            let e = succ.entry(s).or_default();
+            if !e.contains(&d) {
+                e.push(d);
+            }
+            if s >= 0 {
+                let p = pred.entry(d).or_default();
+                if !p.contains(&s) {
+                    p.push(s);
+                }
+            }
+        }
+        for (v, nexts) in &succ {
+            if nexts.len() >= 2 {
+                windows.insert(
+                    (*id, *v),
+                    upstream_window(&pred, *v, PAIR_WINDOW_EDGES, PAIR_WINDOW_MAX_NODES),
+                );
+            }
+        }
     }
-    Ok((k2v, edge_sets, k_len.unwrap_or(24)))
+    Ok((k2v, edge_sets, k_len.unwrap_or(24), windows))
+}
+
+/// 自 v 反向 BFS ≤ max_depth 边的上游节点集（不含 v 自身; seen 防环——
+/// 有环分量也不会重复入集; 节点数超 cap 截断, 截断为下近似）。
+fn upstream_window(
+    pred: &FxHashMap<i32, Vec<i32>>,
+    v: i32,
+    max_depth: usize,
+    cap: usize,
+) -> FxHashSet<i32> {
+    let mut seen: FxHashSet<i32> = [v].into_iter().collect();
+    let mut out: FxHashSet<i32> = FxHashSet::default();
+    let mut frontier = vec![v];
+    for _ in 0..max_depth {
+        let mut next = Vec::new();
+        for &x in &frontier {
+            if let Some(ps) = pred.get(&x) {
+                for &p in ps {
+                    if seen.insert(p) {
+                        out.insert(p);
+                        next.push(p);
+                        if out.len() >= cap {
+                            return out;
+                        }
+                    }
+                }
+            }
+        }
+        if next.is_empty() {
+            break;
+        }
+        frontier = next;
+    }
+    out
 }
 
 /// 单序列窗口扫描（python `process` 语义, 含"不含最后一窗"quirk）。
@@ -267,6 +359,236 @@ fn scan_reads_file(
     Ok((sup, stats))
 }
 
+// ---------------------------------------------------------------------------
+// read pair 分支支持 pass（机制见模块文档）
+// ---------------------------------------------------------------------------
+
+/// pair 支持 pass 统计（日志用）。
+#[derive(Debug, Default, Clone, Copy)]
+pub struct PairSupportStats {
+    /// 输入 read 对数。
+    pub pairs: u64,
+    /// 跨分支证据计数（每对每边去重后的总增量）。
+    pub branch_hits: u64,
+    /// 有 pair 支持的分支出边数（表大小）。
+    pub edges_with_support: usize,
+    /// lockstep 名不匹配的对数（>0 = 两文件可能错序, 警告用）。
+    pub name_mismatches: u64,
+}
+
+/// 跑整个 pair 支持 pass: 建 k2v/边集/分支窗口 → 双端文件逐对同序流式
+/// （逐文件对并行, 末尾合并）→ 落盘 GTP1。返回统计。
+pub fn run_pair_support_pass(
+    listing: &[(u64, PathBuf)],
+    left_files: &[PathBuf],
+    right_files: &[PathBuf],
+    seq_type: SeqType,
+    out_bin: &Path,
+) -> Result<PairSupportStats, CommonError> {
+    if left_files.len() != right_files.len() {
+        return Err(CommonError::Parse(format!(
+            "gtasm pair support: --left（{} 个）与 --right（{} 个）文件数不齐",
+            left_files.len(),
+            right_files.len()
+        )));
+    }
+    let (k2v, edge_sets, k, windows) = build_k2v(listing)?;
+    eprintln!(
+        "-gtasm pair support: k2v {} 键 (K={k}), {} 分支点窗口",
+        k2v.len(),
+        windows.len()
+    );
+
+    let mut stats = PairSupportStats::default();
+    let mut results: Vec<Result<(PairSupport, PairSupportStats), CommonError>> = Vec::new();
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = left_files
+            .iter()
+            .zip(right_files.iter())
+            .map(|(l, r)| {
+                scope.spawn(|| scan_mate_pair_files(l, r, seq_type, k, &k2v, &edge_sets, &windows))
+            })
+            .collect();
+        for h in handles {
+            results.push(h.join().unwrap_or_else(|_| {
+                Err(CommonError::Parse(
+                    "gtasm pair support 扫描线程 panic".to_string(),
+                ))
+            }));
+        }
+    });
+    let mut merged = PairSupport::new();
+    for r in results {
+        let (s, st) = r?;
+        stats.pairs += st.pairs;
+        stats.branch_hits += st.branch_hits;
+        stats.name_mismatches += st.name_mismatches;
+        merged.merge(&s);
+    }
+    stats.edges_with_support = merged.len();
+    merged.save(out_bin)?;
+    Ok(stats)
+}
+
+/// 单序列线程化（pair pass 用）: 逐窗 k2v 查询, 返回有序命中列
+/// (窗口位置, cid, vid); 未命中的窗天然造成位置断档（等价 process_seq 的
+/// prev 重置语义）。**全窗扫描**（pair pass 无 python 原型约束, 不保留
+/// 末窗 quirk）。
+fn thread_read(seq: &[u8], k: usize, k2v: &K2V) -> Vec<(u32, u64, i32)> {
+    let mut hits = Vec::new();
+    if seq.len() < k {
+        return hits;
+    }
+    let k32 = k as u32;
+    for i in 0..=(seq.len() - k) {
+        if let Some(&(cid, vid)) = kmer_to_intval(&seq[i..i + k])
+            .ok()
+            .and_then(|val| k2v.get(&(val, k32)))
+        {
+            hits.push((i as u32, cid, vid));
+        }
+    }
+    hits
+}
+
+/// 单对 mates 的分支证据计数（规格见模块文档）: 双取向各评一次——取向一
+/// X 的节点路径含分支出边 (v,w)（位置相邻的同 comp 命中、真实图边、v 是
+/// 分支点）且 Y 命中 v 的上游窗口 → 计入; 每对每边（双取向合并）至多 1。
+/// 返回本对的增量计数（统计用）。
+fn process_pair(
+    xa: &[(u32, u64, i32)],
+    xb: &[(u32, u64, i32)],
+    edge_sets: &EdgeSets,
+    windows: &BranchWindows,
+    out: &mut PairSupport,
+) -> u64 {
+    let mut counted: FxHashSet<(u64, i32, i32)> = FxHashSet::default();
+    for (x, y) in [(xa, xb), (xb, xa)] {
+        for w in x.windows(2) {
+            let (p0, c0, v0) = w[0];
+            let (p1, c1, v1) = w[1];
+            if c0 != c1 || p1 != p0 + 1 {
+                continue; // 非同 comp 或位置断档（中间有未命中窗）→ 非相邻转移
+            }
+            let Some(win) = windows.get(&(c0, v0)) else {
+                continue; // v0 非分支点
+            };
+            let Some(es) = edge_sets.get(&c0) else {
+                continue;
+            };
+            if !es.contains(&trinity_butterfly::gtdecode::pack_uv(v0, v1)) {
+                continue; // 非真实图边
+            }
+            if y.iter().any(|&(_, c, vid)| c == c0 && win.contains(&vid)) {
+                counted.insert((c0, v0, v1));
+            }
+        }
+    }
+    let n = counted.len() as u64;
+    for &(c, v, w) in &counted {
+        out.add(c, v, w);
+    }
+    n
+}
+
+/// fastq 严格 4 行记录读取（pair pass 从简, 无 line%4 quirk）:
+/// Ok(Some(四行)) = 一条记录; Ok(None) = 干净 EOF; Err = 截断。
+fn read_fq_record(reader: &mut impl BufRead, path: &Path) -> Result<Option<[String; 4]>, CommonError> {
+    let mut rec: [String; 4] = Default::default();
+    let mut got = 0usize;
+    for slot in rec.iter_mut() {
+        slot.clear();
+        if reader.read_line(slot)? == 0 {
+            break;
+        }
+        got += 1;
+    }
+    match got {
+        0 => Ok(None),
+        4 => Ok(Some(rec)),
+        _ => Err(CommonError::Parse(format!(
+            "{}: fastq 记录截断（{got}/4 行）",
+            path.display()
+        ))),
+    }
+}
+
+/// read 名归一化（配对校验用）: 首个空白前截断, 再去尾部 /1、/2。
+fn norm_read_name(header: &str) -> &str {
+    let t = header.split_whitespace().next().unwrap_or("");
+    t.strip_suffix("/1").or_else(|| t.strip_suffix("/2")).unwrap_or(t)
+}
+
+/// 扫一对 mates 文件（fq 严格 4 行 lockstep / fa FASTA lockstep, 同序配对;
+ /// 首条记录名不匹配计数, 末尾统计告警）。返回 (pair 支持表, 统计)。
+fn scan_mate_pair_files(
+    left: &Path,
+    right: &Path,
+    seq_type: SeqType,
+    k: usize,
+    k2v: &K2V,
+    edge_sets: &EdgeSets,
+    windows: &BranchWindows,
+) -> Result<(PairSupport, PairSupportStats), CommonError> {
+    let mut sup = PairSupport::new();
+    let mut stats = PairSupportStats::default();
+    let mut ra = open_maybe_gz(left)?;
+    let mut rb = open_maybe_gz(right)?;
+    match seq_type {
+        SeqType::Fq => loop {
+            let rec_a = read_fq_record(&mut ra, left)?;
+            let rec_b = read_fq_record(&mut rb, right)?;
+            match (rec_a, rec_b) {
+                (Some(a), Some(b)) => {
+                    if norm_read_name(&a[0]) != norm_read_name(&b[0]) {
+                        stats.name_mismatches += 1;
+                    }
+                    stats.pairs += 1;
+                    let xa = thread_read(a[1].trim().as_bytes(), k, k2v);
+                    let xb = thread_read(b[1].trim().as_bytes(), k, k2v);
+                    stats.branch_hits += process_pair(&xa, &xb, edge_sets, windows, &mut sup);
+                }
+                (None, None) => break,
+                _ => {
+                    return Err(CommonError::Parse(format!(
+                        "gtasm pair support: {} 与 {} 记录数不齐（截断/错配）",
+                        left.display(),
+                        right.display()
+                    )))
+                }
+            }
+        },
+        SeqType::Fa => {
+            let mut fa = FastaReader::new(ra);
+            let mut fb = FastaReader::new(rb);
+            loop {
+                let rec_a = fa.next_record()?;
+                let rec_b = fb.next_record()?;
+                match (rec_a, rec_b) {
+                    (Some(a), Some(b)) => {
+                        if norm_read_name(&a.header) != norm_read_name(&b.header) {
+                            stats.name_mismatches += 1;
+                        }
+                        stats.pairs += 1;
+                        let xa = thread_read(a.sequence.as_bytes(), k, k2v);
+                        let xb = thread_read(b.sequence.as_bytes(), k, k2v);
+                        stats.branch_hits += process_pair(&xa, &xb, edge_sets, windows, &mut sup);
+                    }
+                    (None, None) => break,
+                    _ => {
+                        return Err(CommonError::Parse(format!(
+                            "gtasm pair support: {} 与 {} 记录数不齐（截断/错配）",
+                            left.display(),
+                            right.display()
+                        )))
+                    }
+                }
+            }
+        }
+    }
+    Ok((sup, stats))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -292,7 +614,7 @@ mod tests {
             "Component 0\n10\t-1\t3\tAAAA\t1\n11\t10\t5\tAAAC\t1\n",
         );
         let listing = vec![(0u64, cbin.join("c0"))];
-        let (k2v, edge_sets, k) = build_k2v(&listing).unwrap();
+        let (k2v, edge_sets, k, _windows) = build_k2v(&listing).unwrap();
         assert_eq!(k, 4);
         // k2v 含正反义: AAAA 与 TTTT
         assert!(k2v.contains_key(&(kmer_to_intval(b"AAAA").unwrap(), 4)));
@@ -368,6 +690,84 @@ mod tests {
         assert_eq!(st.reads, 2);
         assert_eq!(st.pairs, 0);
         drop(sup);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // read pair 分支支持 pass
+    // -----------------------------------------------------------------------
+
+    /// BFS 窗口边界: 链 1→2→...→17→100（100 为分支点）。深度恰 15 边的节点
+    /// 在窗口内, 16 边不在; v 自身不在; 深度上限截断生效。
+    #[test]
+    fn upstream_window_depth_boundary() {
+        let mut pred: FxHashMap<i32, Vec<i32>> = FxHashMap::default();
+        for i in 2..=17 {
+            pred.insert(i, vec![i - 1]);
+        }
+        pred.insert(100, vec![17]);
+        // 100←17(1 边)←16(2)...←3(15)←2(16)←1(17): 窗口 = {3..=17}
+        let w = upstream_window(&pred, 100, PAIR_WINDOW_EDGES, PAIR_WINDOW_MAX_NODES);
+        assert_eq!(w.len(), 15);
+        assert!(w.contains(&3), "恰 15 边 → 在窗口");
+        assert!(!w.contains(&2), "16 边 → 不在窗口");
+        assert!(!w.contains(&100), "v 自身不在窗口");
+        let w3 = upstream_window(&pred, 100, 3, PAIR_WINDOW_MAX_NODES);
+        assert_eq!(w3, [17, 16, 15].into_iter().collect());
+        // 环不挂死: 100↔17 互指
+        let mut pred2: FxHashMap<i32, Vec<i32>> = FxHashMap::default();
+        pred2.insert(100, vec![17]);
+        pred2.insert(17, vec![100]);
+        let wc = upstream_window(&pred2, 100, 15, 1024);
+        assert_eq!(wc, [17].into_iter().collect());
+    }
+
+    /// pair pass 端到端小例（K=4 假装）: 分支点 12（出边 12→20 / 12→30）,
+    /// 上游窗口 {10, 11}。mate 分落上游与候选边 = 计; 同侧（都在上游,
+    /// 或另一条只命中分支点 v 自身）= 不计。
+    #[test]
+    fn pair_pass_counts_crossing_pair() {
+        let dir = std::env::temp_dir().join(format!("gt_pair_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let cbin = dir.join("Cbin0");
+        std::fs::create_dir_all(&cbin).unwrap();
+        // comp 0: -1→10→11→12, 12→{20→21, 30→31}（kmer 按 (K-1) 重叠构造:
+        // AACC→{ACCC, ACCG}, ACCC→CCCC, ACCG→CCGG）
+        write_graph(
+            &cbin,
+            0,
+            "Component 0\n10\t-1\t3\tAAAA\t1\n11\t10\t3\tAAAC\t1\n12\t11\t3\tAACC\t1\n\
+             20\t12\t3\tACCC\t1\n21\t20\t3\tCCCC\t1\n30\t12\t3\tACCG\t1\n31\t30\t3\tCCGG\t1\n",
+        );
+        let listing = vec![(0u64, cbin.join("c0"))];
+        // 4 对:
+        // r1: L 上游链 (10,11,12) × R 含分支出边 (12,20) → 计 (0,12,20)
+        // r2: 双侧都在上游 → 不计
+        // r3: L 含 (12,20) × R 只命中分支点 12 自身（不在窗口） → 不计
+        // r4: L 含 (12,30) × R 上游链 → 计 (0,12,30)
+        let left = dir.join("l.fq");
+        let right = dir.join("r.fq");
+        std::fs::write(
+            &left,
+            "@r1/1\nAAAACC\n+\nIIIIII\n@r2/1\nAAACC\n+\nIIIII\n@r3/1\nAACCC\n+\nIIIII\n@r4/1\nAACCG\n+\nIIIII\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &right,
+            "@r1/2\nAACCC\n+\nIIIII\n@r2/2\nAAAACC\n+\nIIIIII\n@r3/2\nAACC\n+\nIIII\n@r4/2\nAAAACC\n+\nIIIIII\n",
+        )
+        .unwrap();
+        let out_bin = dir.join("pair.bin");
+        let st =
+            run_pair_support_pass(&listing, &[left], &[right], SeqType::Fq, &out_bin).unwrap();
+        assert_eq!(st.pairs, 4);
+        assert_eq!(st.branch_hits, 2, "{st:?}");
+        assert_eq!(st.name_mismatches, 0);
+        assert_eq!(st.edges_with_support, 2);
+        let sup = PairSupport::load(&out_bin).unwrap();
+        assert_eq!(sup.get(0, 12, 20), 1);
+        assert_eq!(sup.get(0, 12, 30), 1);
+        assert_eq!(sup.get(0, 11, 12), 0); // 11 非分支点
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

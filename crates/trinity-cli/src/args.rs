@@ -104,6 +104,15 @@ pub struct TrinityArgs {
     /// 导致弱势 isoform 截断的缺口）; `--no-gtasm-visited-walk` 回退原型语义
     /// （沿 --no-multi-k 命名先例）。仅 gtasm 引擎生效。
     pub gtasm_visited_walk: bool,
+    /// **Rust 版扩展**: gtasm 解码的简单 bulge 双臂产出（前向延伸遇简单 bulge
+    /// 分叉点双臂各走一条、胜出起点的全部 fork 参与产出, 机制见 gtdecode
+    /// 模块文档）。**默认关**; `--gtasm-bulge-dual` 开启。仅 gtasm 引擎生效。
+    pub gtasm_bulge_dual: bool,
+    /// **Rust 版扩展**: gtasm 分支决策的 read pair 证据（乘性: gsc ×
+    /// (1+log1p(pair)); 支持 pass 产物 gtasm_pair_support.bin, 机制见
+    /// gt_support/gtdecode 模块文档）。**默认关**; `--gtasm-pair-support`
+    /// 开启。仅 gtasm 引擎、双端 reads（--left/--right）生效。
+    pub gtasm_pair_support: bool,
     /// **Rust 版扩展**: rnaSPAdes 式多 k 迭代的生效值（`--multi-k auto|k1,...` /
     /// `--no-multi-k` 经 [`resolve_multi_k`] 解析后的结果）。None = 单 k classic
     /// （k = --KMER_SIZE）; 缺省（无任何相关 flag）= Some(Auto)（2026-08-30 转正）。
@@ -311,6 +320,10 @@ pub fn parse_args(argv: &[String]) -> Result<TrinityArgs, CliError> {
     let gt_weights = cli.value_flag("--gt-weights")?.map(PathBuf::from);
     // --no-gtasm-visited-walk（沿 --no-multi-k 命名先例）: 回退原型 visited 硬排除
     let no_gtasm_visited_walk = cli.bool_flag("--no-gtasm-visited-walk");
+    // --gtasm-bulge-dual（Rust 版扩展, 默认关）: 简单 bulge 分叉点双臂各走一条
+    let gtasm_bulge_dual = cli.bool_flag("--gtasm-bulge-dual");
+    // --gtasm-pair-support（Rust 版扩展, 默认关）: read pair 分支证据乘性消费
+    let gtasm_pair_support = cli.bool_flag("--gtasm-pair-support");
     // --multi-k auto | k1,k2,...（Rust 版扩展, rnaSPAdes 式多 k 迭代; 显式值）
     let multi_k_explicit = match cli.value_flag("--multi-k")?.as_deref() {
         None => None,
@@ -392,6 +405,14 @@ pub fn parse_args(argv: &[String]) -> Result<TrinityArgs, CliError> {
         eprintln!("WARNING: --no-gtasm-visited-walk 仅在 --path-engine gtasm 下生效, 忽略");
     }
     let gtasm_visited_walk = !no_gtasm_visited_walk;
+    // bulge 双臂默认关; 非 gtasm 引擎给了旗标也只警告（沿 --gt-weights 先例）。
+    if path_engine != PathEngine::Gtasm && gtasm_bulge_dual {
+        eprintln!("WARNING: --gtasm-bulge-dual 仅在 --path-engine gtasm 下生效, 忽略");
+    }
+    // pair 支持同理（单端 reads 的运行期跳过警告在 orchestrate 发出）。
+    if path_engine != PathEngine::Gtasm && gtasm_pair_support {
+        eprintln!("WARNING: --gtasm-pair-support 仅在 --path-engine gtasm 下生效, 忽略");
+    }
     // gtasm/rnaspades × recursive 未实现（递归模式的分区池不走 butterfly 组件池）
     if path_engine != PathEngine::Classic && recursive {
         return Err(CliError::usage(format!(
@@ -475,6 +496,8 @@ pub fn parse_args(argv: &[String]) -> Result<TrinityArgs, CliError> {
         path_engine,
         gt_weights,
         gtasm_visited_walk,
+        gtasm_bulge_dual,
+        gtasm_pair_support,
         multi_k,
         graph_clean_rnaspades,
         gap_close_spades,
@@ -589,6 +612,54 @@ mod tests {
         // classic + 关闭旗标 → 通过（忽略并警告, 沿 --gt-weights 先例）
         let a = parse_args(&argv(&["--no-gtasm-visited-walk"])).unwrap();
         assert!(!a.gtasm_visited_walk);
+    }
+
+    #[test]
+    fn gtasm_bulge_dual_flag() {
+        // 默认关; --gtasm-bulge-dual 开; 非 gtasm 引擎给旗标 → 通过（忽略并警告）
+        let a = parse_args(&argv(&[
+            "--path-engine",
+            "gtasm",
+            "--gt-weights",
+            "/tmp/m.gtw",
+        ]))
+        .unwrap();
+        assert!(!a.gtasm_bulge_dual);
+        let a = parse_args(&argv(&[
+            "--path-engine",
+            "gtasm",
+            "--gt-weights",
+            "/tmp/m.gtw",
+            "--gtasm-bulge-dual",
+        ]))
+        .unwrap();
+        assert!(a.gtasm_bulge_dual);
+        let a = parse_args(&argv(&["--gtasm-bulge-dual"])).unwrap();
+        assert!(a.gtasm_bulge_dual); // 字段恒有值, 仅 gtasm 引擎消费
+    }
+
+    #[test]
+    fn gtasm_pair_support_flag() {
+        // 默认关; --gtasm-pair-support 开; 非 gtasm 引擎给旗标 → 通过（忽略并警告）
+        let a = parse_args(&argv(&[
+            "--path-engine",
+            "gtasm",
+            "--gt-weights",
+            "/tmp/m.gtw",
+        ]))
+        .unwrap();
+        assert!(!a.gtasm_pair_support);
+        let a = parse_args(&argv(&[
+            "--path-engine",
+            "gtasm",
+            "--gt-weights",
+            "/tmp/m.gtw",
+            "--gtasm-pair-support",
+        ]))
+        .unwrap();
+        assert!(a.gtasm_pair_support);
+        let a = parse_args(&argv(&["--gtasm-pair-support"])).unwrap();
+        assert!(a.gtasm_pair_support);
     }
 
     #[test]

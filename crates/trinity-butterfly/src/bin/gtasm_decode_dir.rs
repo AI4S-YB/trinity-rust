@@ -5,7 +5,7 @@
 //! 逐 comp 跑 gtasm 全链, 汇总写 FASTA。`visited_walk=0` 回退原型语义
 //! （visited 硬排除）, 用于与 python 原型逐字节对拍。
 
-use trinity_butterfly::{run_component_gtasm, EdgeSupport, GtModel};
+use trinity_butterfly::{run_component_gtasm, EdgeSupport, GtModel, GtasmParams, PairSupport, GTASM_DEFAULT_SEED};
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -51,8 +51,22 @@ fn main() {
             .unwrap_or_else(|| panic!("bad graph file name: {fname}"));
         let text = std::fs::read_to_string(f).unwrap();
         let name = fname.trim_end_matches(".graph.out").to_string();
-        let fasta = run_component_gtasm(&text, cid, &name, min_len, &model, &support, allow_visited_walk)
-            .unwrap_or_else(|e| panic!("comp {cid}: {e}"));
+        let fasta = run_component_gtasm(
+            &text,
+            cid,
+            &name,
+            &model,
+            &support,
+            &PairSupport::new(), // 对拍工具不消费 pair 证据
+            &GtasmParams {
+                min_len,
+                seed: GTASM_DEFAULT_SEED,
+                allow_visited_walk,
+                bulge_dual: false, // 对拍工具锁定原型语义, bulge 双臂不走此入口
+                pair_boost: false,
+            },
+        )
+        .unwrap_or_else(|e| panic!("comp {cid}: {e}"));
         n_contigs += fasta.matches('>').count();
         out.push_str(&fasta);
     }

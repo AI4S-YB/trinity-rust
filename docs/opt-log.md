@@ -1962,3 +1962,51 @@ visited 穿越后重解剖（dev1, classic@mk full 603 vs gtasm@mk+穿越 full 5
   pair 是 76bp 读长下唯一够得着 300-400bp 分支间距的证据, 未测）;
   (b) 简单 bulge 双臂都产出（rnaspades 规则嫁接, 精度换召回）;
   (c) 同 comp 碎片 pair-guided 合并（此前 OLC 系列证伪过, 谨慎）。
+| 2026-08-31 | dev1 | R=13.8% P=81.8% **F1=23.6%** | N50=1773 n=8018 | --path-engine gtasm --gt-weights /storage/home/senior007/test/athal/bench/export/gtnet_dev1.gtw --multi-k auto --gtasm-pair-support --CPU 8 --max_memory 8G |
+| 2026-08-31 | dev1 | R=13.8% P=67.0% **F1=22.9%** | N50=2194 n=9621 | --path-engine gtasm --gt-weights /storage/home/senior007/test/athal/bench/export/gtnet_dev1.gtw --multi-k auto --gtasm-pair-support --gtasm-bulge-dual --CPU 8 --max_memory 8G |
+| 2026-08-31 | dev1 | R=13.9% P=65.8% **F1=22.9%** | N50=2228 n=9650 | --path-engine gtasm --gt-weights /storage/home/senior007/test/athal/bench/export/gtnet_dev1.gtw --multi-k auto --gtasm-bulge-dual --CPU 8 --max_memory 8G |
+
+## 分支点保真两件套裁定: (a) pair 证据中性, (b) bulge 双臂证伪（2026-08-31, cache 43a460d9c29a2f5f / 15b011b4ddc4148b / 1cd9ceb4b4544327）
+
+「引擎差距追踪 v2」候选刀法 (a)(b) 落地并 bench（均默认关, 机制见
+gtdecode/gt_support 模块文档）:
+
+- **(b) `--gtasm-bulge-dual`**: 前向延伸遇简单 bulge（恰 2 个一级候选、
+  两支内部出度恒 1、≤50 节点内重汇合且 indeg(C)=2——rnaspades
+  `bulge_merge` 语义）不再 argmax 二选一, 双臂各走一条、胜出起点的全部
+  fork 参与产出（各自独立拼序列/min_len/指纹去重, visited 并集办结）。
+  安全阀: 单起点 64 fork / 每组件 4096 contig; 终止性不变（fork 共享
+  back 前缀或同起于 d0, 起点边两端仍必入 visited）。
+- **(a) `--gtasm-pair-support`（乘性变体）**: 支持 pass 对 R1/R2 同序
+  lockstep 配对, 一条 mate 的节点路径含分支出边 (v,w)（v 出度≥2）且
+  另一条命中 v 的上游窗口（反向 BFS ≤15 边, 不含 v 自身）→
+  `gtasm_pair_support.bin`（GTP1 sidecar, 与 GTS1 同布局异 magic,
+  与单 read 边支持字段分离）; 解码 gsc 追加 ×(1+log1p(pair))。
+  dev1 实测证据量: 4,483 条分支出边有 pair 支持, 计数总 73,729 对,
+  3,213 边 ≥2 对（证据真实存在, 非稀疏到无效）。
+
+dev1 对照（gtasm@multi-k + 穿越; 基线 = 08-30 已知数, 未复测）:
+
+| 变体 | n | R | R70 | Rp | hcR | P | F1 | N50 |
+|---|---|---|---|---|---|---|---|---|
+| 基线（08-30 已知） | 8026 | 13.9% | 54.3% | 10.7% | 34.3% | 82.0% | 23.8% | 1768 |
+| (a) pair 乘性 | 8018 | 13.8% | 54.2% | 10.6% | 34.2% | 81.8% | 23.6% | 1773 |
+| (b) bulge 双臂 | 9650 | 13.9% | 54.2% | 10.6% | 34.2% | **65.8%** | 22.9% | 2228 |
+| (a)+(b) 组合 | 9621 | 13.8% | 54.1% | 10.6% | 34.1% | **67.0%** | 22.9% | 2194 |
+
+**裁定**:
+
+- **(a) pair 乘性 = 中性**（全轴 −0.1~−0.2pp, 在采样噪声带 ±0.2pp 内）:
+  pair 证据存在且充足, 但与 gsc 已有的 sup 项在分支点上高度冗余——
+  GT 模型 + 单 read 支持本就大多选对臂, pair 不提供增量。不转正,
+  flag 保留默认关（A1 过滤式变体未实现: 乘性中性后过滤式预期同向,
+  不再投入）。
+- **(b) bulge 双臂 = 证伪**: R 纹丝不动（13.9 平基线）而 n +1,624 条、
+  P 崩 −16.2pp（82.0→65.8）——双臂产出把本应被 gsc 压制的弱臂/噪声臂
+  等量放出, 全是假阳性; dev1 碎片化主因**不是** bulge 型分支点
+  （与 rnaspades 引擎的图粒度差异: 未压缩 kmer 图上的"简单 bulge"大量是
+  测序错误/低覆盖分叉, 而非真 SNP bubble）。默认关保留, 不推荐开启;
+  若复用需加臂支持度门槛（弱臂 sup/pair ≥ 阈值才分叉）。
+- 组合无协同（P 同样崩, 归因全在 (b)）。
+- 残余分支点碎片化差距未收: 候选 (c) 碎片 pair-guided 合并成下一刀,
+  或转向"分支点选错的事后检测 + 重 walk"而非事前证据。

@@ -30,7 +30,7 @@ pub use graph_io::{
 };
 pub use gtdecode::{
     build_gt_features, decode_component, pack_uv, parse_component_graph, run_component_gtasm,
-    EdgeSupport, GtGraph, GtasmParams, GTASM_DEFAULT_SEED, NB_STARTS,
+    EdgeSupport, GtGraph, GtasmParams, PairSupport, GTASM_DEFAULT_SEED, NB_STARTS,
 };
 pub use gtmodel::{GtModel, GT_HEADS};
 pub use pair_paths::{

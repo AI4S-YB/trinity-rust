@@ -558,7 +558,51 @@ pub fn run_trinity(args: &TrinityArgs) -> Result<PathBuf, CommonError> {
             })
         })?;
         let support = trinity_butterfly::EdgeSupport::load(&sup_bin)?;
-        Some(std::sync::Arc::new(GtasmShared { model, support }))
+        // ---- 5.6 gtasm read pair 分支支持 pass（仅 --gtasm-pair-support;
+        // R1/R2 同序 lockstep 配对, 产物 gtasm_pair_support.bin（GTP1
+        // sidecar）; checkpoint .gtasm_pair_support.ok 保护）----
+        let pair_support = if args.gtasm_pair_support {
+            if paired {
+                let pair_bin = round_dir.join("gtasm_pair_support.bin");
+                let pair_ok = round_dir.join(".gtasm_pair_support.ok");
+                trinity_common::timer::timed(&round_dir, "gtasm_pair_support", || {
+                    run_with_checkpoint(&pair_ok, "GTasm pair support (raw reads)", || {
+                        let st = crate::gt_support::run_pair_support_pass(
+                            &listing,
+                            &args.left,
+                            &args.right,
+                            args.seq_type,
+                            &pair_bin,
+                        )?;
+                        eprintln!(
+                            "-gtasm pair support: pairs {}, 跨分支证据 {}, 有支持分支出边 {}{}",
+                            st.pairs,
+                            st.branch_hits,
+                            st.edges_with_support,
+                            if st.name_mismatches > 0 {
+                                format!("（WARNING: {} 对 read 名不匹配, 文件可能错序）", st.name_mismatches)
+                            } else {
+                                String::new()
+                            }
+                        );
+                        Ok(())
+                    })
+                })?;
+                trinity_butterfly::PairSupport::load(&pair_bin)?
+            } else {
+                eprintln!(
+                    "WARNING: --gtasm-pair-support 需要双端 reads（--left/--right）, 单端输入下跳过"
+                );
+                trinity_butterfly::PairSupport::new()
+            }
+        } else {
+            trinity_butterfly::PairSupport::new()
+        };
+        Some(std::sync::Arc::new(GtasmShared {
+            model,
+            support,
+            pair_support,
+        }))
     } else {
         None
     };
@@ -581,6 +625,8 @@ pub fn run_trinity(args: &TrinityArgs) -> Result<PathBuf, CommonError> {
                         path_engine: args.path_engine,
                         gtasm: gtasm_shared.clone(),
                         gtasm_visited_walk: args.gtasm_visited_walk,
+                        gtasm_bulge_dual: args.gtasm_bulge_dual,
+                        gtasm_pair_support: args.gtasm_pair_support,
                     },
                 )
             },
