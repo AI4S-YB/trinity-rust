@@ -634,10 +634,65 @@ pub fn run_trinity(args: &TrinityArgs) -> Result<PathBuf, CommonError> {
     })?;
 
     // ---- 7. 汇总（无 checkpoint; 每次重写 Trinity.tmp.fasta, L1916/L1943）----
+    // --gtasm-frag-merge（仅 gtasm 引擎 + 双端）: harvest 前加组件内碎片
+    // pair-guided 合并 pass（contig 末端 × 末端的 mate 链接 ≥2 → OLC/N 保守
+    // 拼接, 机制见 frag_merge 模块文档）; 扫描的是**原始** reads（args.left/
+    // args.right, 与 gtasm 支持 pass 同源——归一化后深度被稀释）。统计行落
+    // .stage_timings（第二列非数值 → bench 的 Top-stages 解析自动跳过）。
     let trinity_tmp = round_dir.join("Trinity.tmp.fasta");
-    let n_transcripts = trinity_common::timer::timed(&round_dir, "harvest", || {
-        harvest(&listing, args.min_contig_length, &trinity_tmp)
-    })?;
+    let frag_merge_on = args.gtasm_frag_merge && args.path_engine == PathEngine::Gtasm;
+    let n_transcripts = if frag_merge_on && paired {
+        let outcome = trinity_common::timer::timed(&round_dir, "gtasm_frag_merge", || {
+            crate::frag_merge::harvest_with_frag_merge(
+                &listing,
+                args.min_contig_length,
+                &trinity_tmp,
+                &args.left,
+                &args.right,
+                args.seq_type,
+            )
+        })?;
+        let st = &outcome.stats;
+        eprintln!(
+            "-gtasm frag merge: pairs {}, 候选链接 {}（达阈值 {}）, OLC 合 {} + N 连 {}（短拒 {}）, contigs {} → {}{}",
+            st.pairs,
+            st.links_total,
+            st.links_kept,
+            st.merged_olc,
+            st.merged_n,
+            st.rejected_short,
+            st.contigs_in,
+            st.contigs_out,
+            if st.name_mismatches > 0 {
+                format!("（WARNING: {} 对 read 名不匹配, 文件可能错序）", st.name_mismatches)
+            } else {
+                String::new()
+            }
+        );
+        if let Ok(mut fh) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(round_dir.join(".stage_timings"))
+        {
+            use std::io::Write;
+            let _ = writeln!(
+                fh,
+                "gtasm_frag_merge_detail\tlinks={} kept={} olc={} nj={} rejected_short={} contigs={}->{}",
+                st.links_total, st.links_kept, st.merged_olc, st.merged_n, st.rejected_short,
+                st.contigs_in, st.contigs_out
+            );
+        }
+        outcome.n_transcripts
+    } else {
+        if frag_merge_on && !paired {
+            eprintln!(
+                "WARNING: --gtasm-frag-merge 需要双端 reads（--left/--right）, 单端输入下跳过"
+            );
+        }
+        trinity_common::timer::timed(&round_dir, "harvest", || {
+            harvest(&listing, args.min_contig_length, &trinity_tmp)
+        })?
+    };
     if n_transcripts == 0 {
         return Err(CommonError::Parse(
             "WARNING: no transcripts harvested from butterfly output".to_string(),

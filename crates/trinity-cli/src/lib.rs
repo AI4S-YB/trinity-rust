@@ -8,6 +8,7 @@
 pub mod args;
 pub mod butterfly_pool;
 pub mod checkpoint;
+pub mod frag_merge;
 pub mod gt_support;
 pub mod harvest;
 pub mod multik;

@@ -99,14 +99,14 @@ pub fn harvest(
 }
 
 /// 打开一个 Cbin 的 butterfly 包（索引 + 数据句柄）。
-fn load_bin(dir: &Path) -> Result<(PathBuf, PackIndex, fs::File), CommonError> {
+pub(crate) fn load_bin(dir: &Path) -> Result<(PathBuf, PackIndex, fs::File), CommonError> {
     let idx = PackIndex::load(&dir.join(format!("{BUTTERFLY_PACK}.idx")))?;
     let file = fs::File::open(dir.join(format!("{BUTTERFLY_PACK}.pack")))?;
     Ok((dir.to_path_buf(), idx, file))
 }
 
 /// 简单 FASTA 解析: (header 行原文含 '>', 去空白序列)。
-fn records(text: &str) -> Vec<(String, String)> {
+pub(crate) fn records(text: &str) -> Vec<(String, String)> {
     let mut out = Vec::new();
     let mut header: Option<String> = None;
     let mut seq = String::new();

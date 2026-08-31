@@ -113,6 +113,12 @@ pub struct TrinityArgs {
     /// gt_support/gtdecode 模块文档）。**默认关**; `--gtasm-pair-support`
     /// 开启。仅 gtasm 引擎、双端 reads（--left/--right）生效。
     pub gtasm_pair_support: bool,
+    /// **Rust 版扩展**: gtasm 组件产出的碎片 pair-guided 合并（组件产出
+    /// contigs 后、入 harvest 前, 同组件内 contig 末端 × 末端的 mate 链接
+    /// ≥2 对 → OLC/N 保守拼接, 机制见 frag_merge 模块文档）。**默认关**;
+    /// `--gtasm-frag-merge` 开启。仅 gtasm 引擎、双端 reads（--left/--right）
+    /// 生效。
+    pub gtasm_frag_merge: bool,
     /// **Rust 版扩展**: rnaSPAdes 式多 k 迭代的生效值（`--multi-k auto|k1,...` /
     /// `--no-multi-k` 经 [`resolve_multi_k`] 解析后的结果）。None = 单 k classic
     /// （k = --KMER_SIZE）; 缺省（无任何相关 flag）= Some(Auto)（2026-08-30 转正）。
@@ -324,6 +330,8 @@ pub fn parse_args(argv: &[String]) -> Result<TrinityArgs, CliError> {
     let gtasm_bulge_dual = cli.bool_flag("--gtasm-bulge-dual");
     // --gtasm-pair-support（Rust 版扩展, 默认关）: read pair 分支证据乘性消费
     let gtasm_pair_support = cli.bool_flag("--gtasm-pair-support");
+    // --gtasm-frag-merge（Rust 版扩展, 默认关）: 组件产出碎片 pair-guided 合并
+    let gtasm_frag_merge = cli.bool_flag("--gtasm-frag-merge");
     // --multi-k auto | k1,k2,...（Rust 版扩展, rnaSPAdes 式多 k 迭代; 显式值）
     let multi_k_explicit = match cli.value_flag("--multi-k")?.as_deref() {
         None => None,
@@ -413,6 +421,10 @@ pub fn parse_args(argv: &[String]) -> Result<TrinityArgs, CliError> {
     if path_engine != PathEngine::Gtasm && gtasm_pair_support {
         eprintln!("WARNING: --gtasm-pair-support 仅在 --path-engine gtasm 下生效, 忽略");
     }
+    // 碎片合并同理（单端 reads 的运行期跳过警告在 orchestrate 发出）。
+    if path_engine != PathEngine::Gtasm && gtasm_frag_merge {
+        eprintln!("WARNING: --gtasm-frag-merge 仅在 --path-engine gtasm 下生效, 忽略");
+    }
     // gtasm/rnaspades × recursive 未实现（递归模式的分区池不走 butterfly 组件池）
     if path_engine != PathEngine::Classic && recursive {
         return Err(CliError::usage(format!(
@@ -498,6 +510,7 @@ pub fn parse_args(argv: &[String]) -> Result<TrinityArgs, CliError> {
         gtasm_visited_walk,
         gtasm_bulge_dual,
         gtasm_pair_support,
+        gtasm_frag_merge,
         multi_k,
         graph_clean_rnaspades,
         gap_close_spades,
@@ -660,6 +673,30 @@ mod tests {
         assert!(a.gtasm_pair_support);
         let a = parse_args(&argv(&["--gtasm-pair-support"])).unwrap();
         assert!(a.gtasm_pair_support);
+    }
+
+    #[test]
+    fn gtasm_frag_merge_flag() {
+        // 默认关; --gtasm-frag-merge 开; 非 gtasm 引擎给旗标 → 通过（忽略并警告）
+        let a = parse_args(&argv(&[
+            "--path-engine",
+            "gtasm",
+            "--gt-weights",
+            "/tmp/m.gtw",
+        ]))
+        .unwrap();
+        assert!(!a.gtasm_frag_merge);
+        let a = parse_args(&argv(&[
+            "--path-engine",
+            "gtasm",
+            "--gt-weights",
+            "/tmp/m.gtw",
+            "--gtasm-frag-merge",
+        ]))
+        .unwrap();
+        assert!(a.gtasm_frag_merge);
+        let a = parse_args(&argv(&["--gtasm-frag-merge"])).unwrap();
+        assert!(a.gtasm_frag_merge); // 字段恒有值, 仅 gtasm 引擎消费
     }
 
     #[test]

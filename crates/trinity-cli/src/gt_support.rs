@@ -493,7 +493,7 @@ fn process_pair(
 
 /// fastq 严格 4 行记录读取（pair pass 从简, 无 line%4 quirk）:
 /// Ok(Some(四行)) = 一条记录; Ok(None) = 干净 EOF; Err = 截断。
-fn read_fq_record(reader: &mut impl BufRead, path: &Path) -> Result<Option<[String; 4]>, CommonError> {
+pub(crate) fn read_fq_record(reader: &mut impl BufRead, path: &Path) -> Result<Option<[String; 4]>, CommonError> {
     let mut rec: [String; 4] = Default::default();
     let mut got = 0usize;
     for slot in rec.iter_mut() {
@@ -514,7 +514,7 @@ fn read_fq_record(reader: &mut impl BufRead, path: &Path) -> Result<Option<[Stri
 }
 
 /// read 名归一化（配对校验用）: 首个空白前截断, 再去尾部 /1、/2。
-fn norm_read_name(header: &str) -> &str {
+pub(crate) fn norm_read_name(header: &str) -> &str {
     let t = header.split_whitespace().next().unwrap_or("");
     t.strip_suffix("/1").or_else(|| t.strip_suffix("/2")).unwrap_or(t)
 }
