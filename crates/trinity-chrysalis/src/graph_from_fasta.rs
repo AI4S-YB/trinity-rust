@@ -19,6 +19,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use rayon::prelude::*;
+use rustc_hash::FxHashMap;
 
 use crate::dna_vector::{is_simple, read_fasta, revcomp, simple_halves_with, DnaSeq};
 use crate::kmer_align::KmerAlignCore;
@@ -395,141 +396,158 @@ pub fn graph_from_fasta(
     let table = NonRedKmerTable::set_up_templates(&crossover, kk, false);
     let table = table.with_read_counts(reads);
 
-    // ---- Phase 2（:1435-1754）：单线程确定性（见模块文档决策）----
+    // ---- Phase 2（:1435-1754）：并行收集 + 串行有序应用 ----
+    // 性能重构（2026-09-01）: 原版刻意单线程保确定性; 现拆为两段——
+    // (a) 收集（并行 over i）: 每命中算 weldable/is_shadow/encapsulates 等
+    //     纯函数判定（都不读 toasted/pools——weldable 只读 table 与序列,
+    //     判定条件全是迭代局部输入）, 产出事件流（Toast(c)/Weld(count)）;
+    // (b) 应用（串行, 按 (i,j,rc,m) 原序）: 先查 toasted（等价原 :438 提前
+    //     continue—— toasted 只增不减且写入条件与序无关）, 再 toast 或
+    //     add_reciprocal_iworm_link（pools 成员序 = 调用序, 严肃保留）。
+    // 归纳不变量: 应用阶段处理每个事件时的 toasted 集合与原版逐迭代处理
+    // 到同一点时完全一致 → pools/toasted/weld_support 最终态逐字节等价。
+    // （原版的差异仅在 toasted 命中的事件上不调 weldable——纯函数, 无影响。）
     let mut pools: BTreeMap<usize, Vec<usize>> = BTreeMap::new(); // map<int,Pool>
     let mut toasted: BTreeSet<usize> = BTreeSet::new();
     let mut weld_support: HashMap<String, u32> = HashMap::new();
     let mut iworm_lengths = vec![0i64; n];
-    // RC 命中侧的 contig revcomp 缓存（性能）: 原实现每个 RC 命中都 revcomp
-    // 整条 contig、每个 FW 命中都整段 clone; 现 FW 传引用零拷贝, RC 每 contig
-    // 至多物化一次。weldable 只读窗口, 语义不变。
-    let mut rc_cache: Vec<Option<Vec<u8>>> = Vec::new();
-    rc_cache.resize_with(n, || None);
+    for (i, d) in iworm_seqs.iter().enumerate() {
+        iworm_lengths[i] = d.seq.len() as i64; // :1457-1458 先于长度判断
+    }
 
-    for i in 0..n {
-        let d = &iworm_seqs[i].seq;
-        // :1457-1458 所有 contig 都记录长度（先于长度判断）
-        iworm_lengths[i] = d.len() as i64;
-        if d.len() < k {
-            continue; // :1460-1467
-        }
-        let cov_i = coverage(&iworm_seqs[i].name);
+    /// 事件（应用阶段消费）: c = 命中 contig; outcome = Toast(c) 或 Weld(count)。
+    enum Ev {
+        Toast(usize),
+        Weld(usize, u32),
+    }
 
-        for j in 0..=d.len() - k {
-            let sub = &d[j..j + k];
-            let matches_fw = core.get_matches(sub);
-            let matches_rc = if p.strand {
-                Vec::new()
-            } else {
-                core.get_matches(&revcomp(sub))
-            };
-            // :1485-1491 豁免：simple 且命中数 > 1（**无条件判断在 Phase 2
-            // 变成了合取**——与 Phase 1 不同）
-            if is_simple(sub) && matches_fw.len() + matches_rc.len() > 1 {
-                continue;
+    let events: Vec<Vec<Ev>> = (0..n)
+        .into_par_iter()
+        .map(|i| {
+            let mut evs = Vec::new();
+            let d = &iworm_seqs[i].seq;
+            if d.len() < k {
+                return evs; // :1460-1467
             }
+            let cov_i = coverage(&iworm_seqs[i].name);
+            // 线程局部 revcomp 缓存, 按命中 contig c 索引（每个 RC 命中的
+            // contig 至多物化一次; 与串行版 Vec<Option> 语义一致）
+            let mut rc_cache: FxHashMap<usize, Vec<u8>> = FxHashMap::default();
+            for j in 0..=d.len() - k {
+                let sub = &d[j..j + k];
+                let matches_fw = core.get_matches(sub);
+                let matches_rc = if p.strand {
+                    Vec::new()
+                } else {
+                    core.get_matches(&revcomp(sub))
+                };
+                // :1485-1491 豁免：simple 且命中数 > 1（Phase 2 合取）
+                if is_simple(sub) && matches_fw.len() + matches_rc.len() > 1 {
+                    continue;
+                }
+                for (rc, matches) in [(false, &matches_fw), (true, &matches_rc)] {
+                    for m in matches.iter() {
+                        let c = m.contig as usize;
+                        if c == i {
+                            continue; // :1501-1503 / :1635-1637
+                        }
+                        // toasted 检查移到应用阶段（序等价, 见上注）
+                        let cov_c = coverage(&iworm_seqs[c].name);
+                        // :1518-1525 minCov 截断 + clamp
+                        let higher = if cov_i > cov_c { cov_i } else { cov_c };
+                        let mut min_cov = (higher * glue_factor) as i32; // (int) 截断
+                        if (min_cov as i64) < min_glue_required as i64 {
+                            min_cov = min_glue_required as i32;
+                        }
+                        if p.max_glue_required > 0 && min_cov as i64 > p.max_glue_required {
+                            min_cov = p.max_glue_required as i32;
+                        }
 
-            for (rc, matches) in [(false, &matches_fw), (true, &matches_rc)] {
-                for m in matches.iter() {
-                    let c = m.contig as usize;
-                    if c == i {
-                        continue; // :1501-1503 / :1635-1637
-                    }
-                    if toasted.contains(&c) {
-                        continue; // :1505-1508 / :1640-1643
-                    }
-                    let cov_c = coverage(&iworm_seqs[c].name);
-                    // :1518-1525 minCov 截断 + clamp
-                    let higher = if cov_i > cov_c { cov_i } else { cov_c };
-                    let mut min_cov = (higher * glue_factor) as i32; // (int) 截断
-                    if (min_cov as i64) < min_glue_required as i64 {
-                        min_cov = min_glue_required as i32;
-                    }
-                    if p.max_glue_required > 0 && min_cov as i64 > p.max_glue_required {
-                        min_cov = p.max_glue_required as i32;
-                    }
+                        let (dd, start): (&[u8], i64) = if rc {
+                            let dd = rc_cache
+                                .entry(c)
+                                .or_insert_with(|| revcomp(&iworm_seqs[c].seq));
+                            let start = dd.len() as i64 - m.pos as i64 - k as i64;
+                            (dd.as_slice(), start)
+                        } else {
+                            (iworm_seqs[c].seq.as_slice(), m.pos as i64)
+                        };
 
-                    let (dd, start): (&[u8], i64) = if rc {
-                        let dd = rc_cache[c].get_or_insert_with(|| revcomp(&iworm_seqs[c].seq));
-                        let start = dd.len() as i64 - m.pos as i64 - k as i64;
-                        (dd.as_slice(), start)
-                    } else {
-                        (iworm_seqs[c].seq.as_slice(), m.pos as i64)
-                    };
-
-                    // :1538-1607（FW）/ :1676-1742（RC）同型体
-                    let mut welding_kmer = String::new();
-                    let mut welding_count = 0u32;
-                    if p.no_glue_required {
-                        add_reciprocal_iworm_link(
-                            &mut pools,
-                            &mut weld_support,
-                            i,
-                            c,
-                            welding_count,
-                        );
-                    } else {
-                        if !p.no_welds {
-                            // `!bNoWeld && !(W1 || W2)` —— 短路语义下 welding
-                            // 出参取最后一次实际调用（:1552-1554）
-                            let (ok1, k1, c1) = weldable(
-                                &table,
-                                d,
-                                j as i64,
-                                dd,
-                                start,
-                                min_cov,
-                                k,
-                                kk,
-                                p.disable_repeat_check,
-                            );
-                            welding_kmer = k1;
-                            welding_count = c1;
-                            let ok = ok1 || {
-                                let (ok2, k2, c2) = weldable(
+                        // :1538-1607（FW）/ :1676-1742（RC）同型体
+                        let mut welding_count = 0u32;
+                        if p.no_glue_required {
+                            evs.push(Ev::Weld(c, 0));
+                        } else {
+                            if !p.no_welds {
+                                // `!bNoWeld && !(W1 || W2)` 短路
+                                let (ok1, _k1, c1) = weldable(
                                     &table,
-                                    dd,
-                                    start,
                                     d,
                                     j as i64,
+                                    dd,
+                                    start,
                                     min_cov,
                                     k,
                                     kk,
                                     p.disable_repeat_check,
                                 );
-                                welding_kmer = k2;
-                                welding_count = c2;
-                                ok2
-                            };
-                            if !ok {
-                                continue; // :1561
+                                welding_count = c1;
+                                let ok = ok1 || {
+                                    let (ok2, _k2, c2) = weldable(
+                                        &table,
+                                        dd,
+                                        start,
+                                        d,
+                                        j as i64,
+                                        min_cov,
+                                        k,
+                                        kk,
+                                        p.disable_repeat_check,
+                                    );
+                                    welding_count = c2;
+                                    ok2
+                                };
+                                if !ok {
+                                    continue; // :1561
+                                }
+                            }
+                            if is_shadow(d, dd, j, start as usize, k) && cov_i > 2.0 * cov_c {
+                                evs.push(Ev::Toast(c)); // :1570-1577 toast 阴影
+                            } else if encapsulates(d, dd, j as i64, start)
+                                && d.len() / 10 > dd.len() // 整数除法（:1581）
+                                && align_get_per_id(d, dd, j, start as usize, k) > TOO_SIMILAR
+                            {
+                                evs.push(Ev::Toast(c)); // :1579-1592 toast 被包含者
+                            } else if min_glue_required > 0
+                                && !is_good_coverage(cov_i, cov_c, p.min_iso_ratio)
+                            {
+                                continue; // :1594-1602
+                            } else {
+                                evs.push(Ev::Weld(c, welding_count));
                             }
                         }
-                        if is_shadow(d, dd, j, start as usize, k) && cov_i > 2.0 * cov_c {
-                            // :1570-1577 toast 阴影（较小覆盖方）
-                            toasted.insert(c);
-                            continue;
-                        } else if encapsulates(d, dd, j as i64, start)
-                            && d.len() / 10 > dd.len() // 整数除法（:1581）
-                            && align_get_per_id(d, dd, j, start as usize, k) > TOO_SIMILAR
-                        {
-                            // :1579-1592 toast 被包含者
-                            toasted.insert(c);
-                            continue;
-                        } else if min_glue_required > 0
-                            && !is_good_coverage(cov_i, cov_c, p.min_iso_ratio)
-                        {
-                            continue; // :1594-1602
-                        }
-                        add_reciprocal_iworm_link(
-                            &mut pools,
-                            &mut weld_support,
-                            i,
-                            c,
-                            welding_count,
-                        );
                     }
-                    let _ = (&welding_kmer, p.report_welds, p.debug);
+                }
+            }
+            evs
+        })
+        .collect();
+
+    // 串行应用（严格按收集序 = 原迭代序）
+    for (i, evs) in events.iter().enumerate() {
+        for ev in evs {
+            match ev {
+                Ev::Toast(c) => {
+                    if toasted.contains(c) {
+                        continue; // :1505-1508 / :1640-1643（时序等价于原版前置检查）
+                    }
+                    toasted.insert(*c);
+                }
+                Ev::Weld(c, cnt) => {
+                    if toasted.contains(c) {
+                        continue;
+                    }
+                    add_reciprocal_iworm_link(&mut pools, &mut weld_support, i, *c, *cnt);
                 }
             }
         }
