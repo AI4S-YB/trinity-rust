@@ -2205,3 +2205,15 @@ QM4 中间产物直跑）定位真凶:
   再压需动计数器内核（u128→u64 键 for k≤32 或分片表）, 风险收益比下降。
 - 指标等价: dev1 R=15.4%/P=79.0%; QM4 R=43.8%/P=51.5%（波动带内）。
 | 2026-09-01 | qm4-opt4 | R=43.8% P=51.5% **F1=47.3%** | N50=1780 n=117888 | --multi-k auto --inchworm_cpu 32 --CPU 32 --max_memory 64G |
+| 2026-09-01 | dev1 | R=15.4% P=79.5% **F1=25.8%** | N50=1907 n=8553 | --CPU 8 --max_memory 8G |
+| 2026-09-01 | qm4-opt5 | R=43.9% P=51.5% **F1=47.4%** | N50=1787 n=118090 | --multi-k auto --inchworm_cpu 32 --CPU 32 --max_memory 64G |
+
+## 计数器免拷贝（counter.rs, bench 9471bbb5d4128ca4）
+
+split_fasta_sequences 的逐记录 owned 拷贝 → split_fasta_ranges 借用视图
+（单行序列段切片无内部 \n, for_each_kmer 断窗行为与滤除版逐字节等价;
+检测到多行段自动回退旧路径）+ merge_counts 小并入大。归一化计数段
+523→410s（单跑口径）, bench 内 normalize 748→584s（−22%）; 归一化输出
+逐字节一致, dev1/QM4 bench 指标波动带内。
+（bench 行见上表 qm4-opt5; 全程 ~33.6min, 与 opt4 的 32.5min 差异为系统
+噪声——归一化的 −164s 收益部分被评测/负载波动吃掉。）
