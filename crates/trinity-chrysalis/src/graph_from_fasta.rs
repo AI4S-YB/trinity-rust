@@ -400,6 +400,11 @@ pub fn graph_from_fasta(
     let mut toasted: BTreeSet<usize> = BTreeSet::new();
     let mut weld_support: HashMap<String, u32> = HashMap::new();
     let mut iworm_lengths = vec![0i64; n];
+    // RC 命中侧的 contig revcomp 缓存（性能）: 原实现每个 RC 命中都 revcomp
+    // 整条 contig、每个 FW 命中都整段 clone; 现 FW 传引用零拷贝, RC 每 contig
+    // 至多物化一次。weldable 只读窗口, 语义不变。
+    let mut rc_cache: Vec<Option<Vec<u8>>> = Vec::new();
+    rc_cache.resize_with(n, || None);
 
     for i in 0..n {
         let d = &iworm_seqs[i].seq;
@@ -444,12 +449,12 @@ pub fn graph_from_fasta(
                         min_cov = p.max_glue_required as i32;
                     }
 
-                    let (dd, start): (Vec<u8>, i64) = if rc {
-                        let dd = revcomp(&iworm_seqs[c].seq);
+                    let (dd, start): (&[u8], i64) = if rc {
+                        let dd = rc_cache[c].get_or_insert_with(|| revcomp(&iworm_seqs[c].seq));
                         let start = dd.len() as i64 - m.pos as i64 - k as i64;
-                        (dd, start)
+                        (dd.as_slice(), start)
                     } else {
-                        (iworm_seqs[c].seq.clone(), m.pos as i64)
+                        (iworm_seqs[c].seq.as_slice(), m.pos as i64)
                     };
 
                     // :1538-1607（FW）/ :1676-1742（RC）同型体
@@ -471,7 +476,7 @@ pub fn graph_from_fasta(
                                 &table,
                                 d,
                                 j as i64,
-                                &dd,
+                                dd,
                                 start,
                                 min_cov,
                                 k,
@@ -483,7 +488,7 @@ pub fn graph_from_fasta(
                             let ok = ok1 || {
                                 let (ok2, k2, c2) = weldable(
                                     &table,
-                                    &dd,
+                                    dd,
                                     start,
                                     d,
                                     j as i64,
@@ -500,13 +505,13 @@ pub fn graph_from_fasta(
                                 continue; // :1561
                             }
                         }
-                        if is_shadow(d, &dd, j, start as usize, k) && cov_i > 2.0 * cov_c {
+                        if is_shadow(d, dd, j, start as usize, k) && cov_i > 2.0 * cov_c {
                             // :1570-1577 toast 阴影（较小覆盖方）
                             toasted.insert(c);
                             continue;
-                        } else if encapsulates(d, &dd, j as i64, start)
+                        } else if encapsulates(d, dd, j as i64, start)
                             && d.len() / 10 > dd.len() // 整数除法（:1581）
-                            && align_get_per_id(d, &dd, j, start as usize, k) > TOO_SIMILAR
+                            && align_get_per_id(d, dd, j, start as usize, k) > TOO_SIMILAR
                         {
                             // :1579-1592 toast 被包含者
                             toasted.insert(c);

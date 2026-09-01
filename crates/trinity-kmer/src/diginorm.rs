@@ -165,8 +165,17 @@ pub fn run(
     std::fs::create_dir_all(out_dir)?;
     match reads {
         ReadsInput::Paired(left_paths, right_paths) => {
-            let (left_raw, lf) = read_side(left_paths)?;
-            let (right_raw, rf) = read_side(right_paths)?;
+            // 两侧解压并行（IO 密集; 各侧独立, 汇合后语义不变）
+            let (l, r) = std::thread::scope(|s| {
+                let hl = s.spawn(|| read_side(left_paths));
+                let hr = s.spawn(|| read_side(right_paths));
+                (
+                    hl.join().expect("read_side left panic"),
+                    hr.join().expect("read_side right panic"),
+                )
+            });
+            let (left_raw, lf) = l?;
+            let (right_raw, rf) = r?;
             let fmt = if lf != rf {
                 return Err(CommonError::FastqFormat(format!(
                     "Error, left is {lf:?} but right is {rf:?}; seqType must agree"
@@ -174,41 +183,63 @@ pub fn run(
             } else {
                 lf
             };
-            let left_fa = prep_side(&left_raw, fmt, ReadType::R1, params.ss_revcomp_left)?;
-            let right_fa = prep_side(&right_raw, fmt, ReadType::R2, params.ss_revcomp_right)?; // both.fa = left.fa 字节后接 right.fa 字节（原版 `cat left.fa right.fa` L350）
-            let mut both = left_fa.clone();
-            both.extend_from_slice(&right_fa);
-            let table = stats_query_table(&both, params);
+            // 两侧 prep 并行（fq→fa 转换与命名规范, 各侧独立）
+            let (l, r) = std::thread::scope(|s| {
+                let hl =
+                    s.spawn(|| prep_side(&left_raw, fmt, ReadType::R1, params.ss_revcomp_left));
+                let hr =
+                    s.spawn(|| prep_side(&right_raw, fmt, ReadType::R2, params.ss_revcomp_right));
+                (hl.join().expect("prep left panic"), hr.join().expect("prep right panic"))
+            });
+            let left_fa = l?;
+            let right_fa = r?;
+            // both.fa 拼接语义 → 两侧分别计数再合并（计数多重集等价: ds 路径
+            // 键已 canonical, 非 ds 的 canonical_merge_sum 是线性计数相加——
+            // 分侧合并 = 拼接合并; 省全量拷贝与一次性大分配）
+            let mut table = stats_query_table(&left_fa, params);
+            for (k2, c) in stats_query_table(&right_fa, params) {
+                *table.entry(k2).or_insert(0) += c;
+            }
             let left_rows = sorted_stats_rows(&left_fa, &table, params)?;
             let right_rows = sorted_stats_rows(&right_fa, &table, params)?;
             let merged = merge_pairs(&left_rows, &right_rows);
             let final_rows = merged_to_stats_rows(&merged);
             let selected = select_rows(&final_rows, params)?;
             let index = index_keys(&selected);
-            let (out_left, out_fmt) = emit_side(
-                &left_raw,
-                &left_fa,
-                fmt,
-                params,
-                &index,
-                SideOut {
-                    dir: out_dir,
-                    base: &side_base_name(left_paths),
-                    side: "left",
-                },
-            )?;
-            let (out_right, _) = emit_side(
-                &right_raw,
-                &right_fa,
-                fmt,
-                params,
-                &index,
-                SideOut {
-                    dir: out_dir,
-                    base: &side_base_name(right_paths),
-                    side: "right",
-                },
-            )?;
+            // 两侧输出并行（抽取+写盘, 各侧独立）
+            let (l, r) = std::thread::scope(|s| {
+                let hl = s.spawn(|| {
+                    emit_side(
+                        &left_raw,
+                        &left_fa,
+                        fmt,
+                        params,
+                        &index,
+                        SideOut {
+                            dir: out_dir,
+                            base: &side_base_name(left_paths),
+                            side: "left",
+                        },
+                    )
+                });
+                let hr = s.spawn(|| {
+                    emit_side(
+                        &right_raw,
+                        &right_fa,
+                        fmt,
+                        params,
+                        &index,
+                        SideOut {
+                            dir: out_dir,
+                            base: &side_base_name(right_paths),
+                            side: "right",
+                        },
+                    )
+                });
+                (hl.join().expect("emit left panic"), hr.join().expect("emit right panic"))
+            });
+            let (out_left, out_fmt) = l?;
+            let (out_right, _) = r?;
             Ok(DigiNormOutputs {
                 left: Some(out_left),
                 right: Some(out_right),

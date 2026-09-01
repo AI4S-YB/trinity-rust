@@ -17,8 +17,8 @@ use std::path::{Path, PathBuf};
 use trinity_chrysalis::pipeline::{run_chrysalis_pipeline, ChrysalisParams};
 use trinity_common::error::CommonError;
 use trinity_inchworm::irke::{
-    compute_sequence_assemblies_parallel, populate_from_table, prune_some_kmers,
-    write_kmer_count_report, AssemblyParams, IrkeParams, Monitor,
+    compute_sequence_assemblies_parallel, prune_some_kmers, write_kmer_count_report,
+    AssemblyParams, IrkeParams, Monitor,
 };
 use trinity_kmer::counter::{estimate_hash_size, KmerCountTable};
 use trinity_kmer::diginorm::{self, DigiNormParams, ReadsInput};
@@ -738,10 +738,11 @@ pub fn run_trinity(args: &TrinityArgs) -> Result<PathBuf, CommonError> {
 /// `trusted` = 上一轮 inchworm 产物（multi-k 链式注入; classic 恒 None）:
 /// 在 kmer_load 产出的**最终计数表**上注入其全部 k-mer——表中已存在的键不动
 /// 计数, 缺席的以 count=1 插入（presence-only, 见 counter::inject_trusted_kmers）。
-/// 注入点统一在 `populate_from_table` 之前: 计数表的两条构建路径（counts_bin
-/// 断点装载 / target_fa 重算）在此汇合, 注入因而先于 prune_some_kmers 生效,
-/// 且对两条路径全覆盖（counts_bin 断点内容保持 reads-only; 注入幂等, resume
-/// 走装载路径再注一次结果不变）。
+/// 注入点统一在计数表→KmerCounter 直构（`KmerCounter::from_count_map`）之前:
+/// 计数表的三条构建路径（count 阶段内存直传 / counts_bin 断点装载 / target_fa
+/// 重算）在此汇合, 注入因而先于 prune_some_kmers 生效, 且对所有路径全覆盖
+/// （counts_bin 断点内容保持 reads-only; 注入幂等, resume 走装载路径再注一次
+/// 结果不变）。
 ///
 /// 返回 inchworm 产物 fasta 路径（可能指向空文件——判定归调用方: 主线报错,
 /// multi-k 中间轮降级）。
@@ -759,27 +760,36 @@ fn run_count_and_inchworm(
         args.min_kmer_count
     ));
     let counts_bin = round_dir.join(format!("mer_counts.{k}.{SR_FLAG}.rs.bin"));
-    trinity_common::timer::timed(round_dir, "kmer_count", || -> Result<(), CommonError> {
-        if !checkpoint_exists(&count_ok) {
-            eprintln!("-- Trinity (rust) | Jellyfish count (K={k})");
-            // 硬护栏: target_fa 整读进内存 + 计数哈希。
-            if let Some(msg) =
-                memory_guard_error(args.max_memory, file_len(target_fa), "k-mer counting")
-            {
-                return Err(CommonError::Parse(msg));
+    // 性能: 计数刚算出的内存表直接透传到 kmer_load（同进程同型 CountMap,
+    // 跳过 4GB 级 counts_bin 的读回+重建; bin 照写供 resume）。
+    // resume（count_ok 已存在）时 None, kmer_load 回退 load_counts。
+    let counts_mem = trinity_common::timer::timed(
+        round_dir,
+        "kmer_count",
+        || -> Result<Option<trinity_kmer::counter::CountMap>, CommonError> {
+            if !checkpoint_exists(&count_ok) {
+                eprintln!("-- Trinity (rust) | Jellyfish count (K={k})");
+                // 硬护栏: target_fa 整读进内存 + 计数哈希。
+                if let Some(msg) =
+                    memory_guard_error(args.max_memory, file_len(target_fa), "k-mer counting")
+                {
+                    return Err(CommonError::Parse(msg));
+                }
+                let data = fs::read(target_fa)?;
+                // estimate_hash_size（Trinity:2598-2604 容量提示语义）→ 计数
+                // HashMap 预 reserve（每线程 estimate/18/CPU，函数内部再截上限）,
+                // 避免增长期 rehash 内存峰值。
+                let estimate = estimate_hash_size(args.max_memory, data.len() as u64);
+                let per_thread = (estimate / KMER_ENTRY_BYTES / args.cpu.max(1) as u64) as usize;
+                let counts =
+                    KmerCountTable::count_fasta_data_with_capacity(&data, k, ds, per_thread);
+                save_counts(&counts_bin, &counts, k, ds)?;
+                fs::write(&count_ok, b"")?;
+                return Ok(Some(counts));
             }
-            let data = fs::read(target_fa)?;
-            // estimate_hash_size（Trinity:2598-2604 容量提示语义）→ 计数
-            // HashMap 预 reserve（每线程 estimate/18/CPU，函数内部再截上限）,
-            // 避免增长期 rehash 内存峰值。
-            let estimate = estimate_hash_size(args.max_memory, data.len() as u64);
-            let per_thread = (estimate / KMER_ENTRY_BYTES / args.cpu.max(1) as u64) as usize;
-            let counts = KmerCountTable::count_fasta_data_with_capacity(&data, k, ds, per_thread);
-            save_counts(&counts_bin, &counts, k, ds)?;
-            fs::write(&count_ok, b"")?;
-        }
-        Ok(())
-    })?;
+            Ok(None)
+        },
+    )?;
 
     // ---- inchworm（L2654-2727）----
     // 命名镜像 L1576-1580: SS → inchworm.fa, 无 SS → inchworm.DS.fa。
@@ -800,14 +810,18 @@ fn run_count_and_inchworm(
                 round_dir,
                 "kmer_load",
                 || -> Result<(trinity_inchworm::kmer_counter::KmerCounter, usize), CommonError> {
-                    let mut counts = if checkpoint_exists(&counts_bin) {
-                        load_counts(&counts_bin, k, ds)?
-                    } else {
-                        let data = fs::read(target_fa)?;
-                        let estimate = estimate_hash_size(args.max_memory, data.len() as u64);
-                        let per_thread =
-                            (estimate / KMER_ENTRY_BYTES / args.cpu.max(1) as u64) as usize;
-                        KmerCountTable::count_fasta_data_with_capacity(&data, k, ds, per_thread)
+                    let mut counts = match counts_mem {
+                        Some(c) => c,
+                        None if checkpoint_exists(&counts_bin) => {
+                            load_counts(&counts_bin, k, ds)?
+                        }
+                        None => {
+                            let data = fs::read(target_fa)?;
+                            let estimate = estimate_hash_size(args.max_memory, data.len() as u64);
+                            let per_thread =
+                                (estimate / KMER_ENTRY_BYTES / args.cpu.max(1) as u64) as usize;
+                            KmerCountTable::count_fasta_data_with_capacity(&data, k, ds, per_thread)
+                        }
                     };
                     // multi-k trusted contig 注入（presence-only）: 计数表两条
                     // 构建路径汇合后的统一注入点, 先于 populate/剪枝。
@@ -820,7 +834,14 @@ fn run_count_and_inchworm(
                             t.display()
                         );
                     }
-                    populate_from_table(&counts, k, ds)
+                    // 计数表 move 直构（键已 canonical 且唯一, 与逐条 add_kmer 等价）
+                    let n = counts.len();
+                    Ok((
+                        trinity_inchworm::kmer_counter::KmerCounter::from_count_map(
+                            counts, k, ds,
+                        ),
+                        n,
+                    ))
                 },
             )?;
             write_kmer_count_report(&round_dir.join("inchworm.kmer_count"), counter.size())?;

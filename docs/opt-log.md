@@ -2045,3 +2045,124 @@ dev1 对照（gtasm@multi-k + 穿越; 基线 = 08-30 已知数, 未复测）:
 拼上即成嵌合体（N 填充与错接碱基直接吃 P）。分支保真三件
 套 (a)(b)(c) 全部落地完毕: 残余 49 条 principal 差距未收, 后续方向
 只剩"分支点选错的事后检测 + 重 walk"。
+
+
+## xRead 重叠图范式评估: 原版不可用 + 思想适配封顶 +0.85pp, 收档（2026-08-31, xRead + probe_read_bridge）
+
+外部建议引入 xRead（tcKong47/xRead, 论文 PMC11831799, "coverage-guided
+iterative overlapping graph construction"）替换/补充 de Bruijn 构图。两路验证:
+
+1. **原版实证: 短读长下不可用。** xRead 是长读长（ONT/PacBio 10kbp+）基因组
+   overlapper, 核心 "mimicking-and-mapping"（覆盖度引导迭代选种子 read 当
+   "虚拟参考", alignment skeleton 打分, 只留 CRO 高分 overlap）。编译
+   （make INCLUDES/LIBS 指向 miniconda zlib）后在 dev1 head 1M 条 76bp reads
+   实测: 默认 min_ove=500 超读长, 调 -m 40 后 **99.9% reads（999,158/1M）
+   零 overlap**, 全图仅 1,463 条 PAF。根因: 76bp read 仅 ~20 个 minimizer,
+   skeleton 共线链接评分无法建立, 覆盖度模型（median 0.0）不启动;
+   短读长下"虚拟参考"退化为 reads 全集, 方法学前提不成立。
+2. **思想适配量化（probe_read_bridge.py, cache 68349cb4e339ced0 单 k 图）**:
+   提取"read 级序列直接跨谷"——de Bruijn 图断掉的山谷, 单条 76bp read
+   或能完整跨越。GRAPH 桶 3202 条 principal: 缺失区间 8343 个（内部 3283 /
+   端部 4837 / 整条 223）; 内部区间 71.2% 跨度≤76bp 几何可行, 其中 77.7%
+   有≥1 桥接 read（探针 map 原始 reads, 两端深入锚点, ident≥0.9）。
+   **但"read 覆盖山谷"是 GRAPH 桶入桶条件的同义反复**, 真筛选层是谷内
+   kmer 深度（≈桥接 read 数, 一条跨谷 read 覆盖谷内全部窗口）:
+   内部≥3桥 + 端部缺失≤5% 口径, 全区间可桥 principal 仅 **44 条**,
+   理论增量 **R_full_p +0.85pp**（≥1 桥松口径 87 条/+1.68pp）。
+3. **裁定: 收档。** 上限 +0.85pp 与四条已实测机制（kmer 救援 85 条集/
+   maxC10000 兑现 2 条、frag_bridge +0.7pp 天花板、gap_close 中性缝 10 处、
+   frag_merge 证伪）共享同一证据源（山谷低深度 reads）与同一可操作集;
+   落地形态仅 kmer 注入（实测 2/85）或 read 序列直拼 contig（frag_merge
+   嵌合体证伪）两种, 皆已封顶。xRead 论文亦自明其图需配套长读长
+   layout/consensus, 与短读长转录组错位。
+- 脚本: export/probe_read_bridge.py（pkl 键=gaps 全局索引; 曾误用转录本内
+  局部序号致 principal 聚合失真, 已修并注）; 缓存 read_bridge.68349cb*.pkl;
+  xRead 源树 /storage/home/senior007/test/trinity_rust/xRead/（run 大文件
+  已删, 留 1463 行 PAF 证据）。
+- **方法论教训**: 探针疗效指标若复用入桶条件（reads 覆盖）= 自欺, 必须加
+  "证据深度/可注入性"筛选层; 本探针 v1 的 +59pp 假象即此型。
+- scratch 清理: bench/scratch 19G→16K（multi-k 拿图 run + 历史 test 遗留
+  全清; graph.out 确认在 partition 阶段消费后不保留, 图 kmer 集合日后须从
+  graphs.pack 的 kind=1 记录读）。
+
+
+## 碎片延长策略（学习版）全线量化: oracle +2.08pp 但规则实测 +0.08pp, 收档（2026-08-31, probe_extend_* / probe_reconnect_*）
+
+用户提议: 训练小模型（以 gtasm walk 为师）把产物里"碎的但可延长"的 contig 延长。
+完整量化链（dev1, 产物=44bc70316e3b7a32 gtasm@mk+穿越）:
+
+1. **oracle 上界（probe_extend_oracle）**: 完美拼接同 principal 全部产物 hits,
+   救回 108 条 full = **R_full_p +2.08pp**; 救回者 95/108 段间最大缺口 ≤50bp;
+   partial/weak 档 oracle 后无迁移（数据/图决定, 拼接救不了）。
+   **108 条全部段同组件**（contig 名口径）——组件内解图问题, 非跨组件。
+2. **病灶拆分**: 段对 197 个 = 138 紧邻/重叠（gap≤0, 首尾相接非 OLC 重叠）+
+   59 真缺口（图内连续在位 43 / 图外 14 / 单 k 口径锚点跨组件 48——multi-k
+   组件更大, 部分已被 trusted 注入合并, 单 k 口径高估此项）;
+   **多路径 0**——"模型选边"无对应病灶（选边数据集另测: 有效分支点仅 114,
+   最大覆盖度规则 69.3%, 训练/部署分布不同——成功 walk 来自简单组件,
+   部署现场是复杂组件）。
+3. **OLC 重叠信号证伪（probe_extend_overlap）**: ref 重叠层段对精确重叠
+   ≥20bp 仅 7/44——段间是紧邻（gap≈0/微缺口）, 末端序列天然不重叠;
+   frag_merge 式 OLC 从原理上够不着。
+4. **图内短路径规则（probe_reconnect_rule, 68349cb 单 k 图, 无向 BFS≤60bp）**:
+   P=0.63 R=0.39, **正确连接路径中位 2bp**——gtasm 在距正确连接 2 步处停下。
+   56 个"不该接但有路"是判别器的唯一战场。
+5. **应用级模拟（probe_reconnect_apply, 真拼接+bench 口径）**: 候选 193 对,
+   贪心执行 55 拼接 → **R_full_p 557→561 (+0.08pp), P 81.99→81.78 (−0.21pp)**。
+   oracle→实测的折损来源: 有路率 0.39（模型变不出路）、多段全连要求、
+   桥序列 ident 损耗（图序列 vs ref 变异）。
+   另坐实: bench 碱基级 P 口径下嵌合体代价小（两段都能 map 上, P 仅 −0.21pp,
+   frag_merge 时代的 P 风险感知应修正）。
+
+**裁定: 收档。** 模型判别理论增量 ≤+0.2pp（只压 fp, 不改有路率/桥 ident）,
+训练集 114 分支点且分布不迁移。与 read 桥接（+0.85pp）、frag_bridge（+0.7pp）、
+frag_merge 共享同一证据源与可操作集, 第五次汇合到同一结论:
+**碎片化天花板由数据与图结构决定, 后处理（规则或学习）兑现率极低。**
+gtasm "差 2 步停下"的根因仍是分支点分数/选择（visited 穿越已修其一）,
+若再动刀应在 walk 决策本身而非后处理。
+- 脚本: probe_extend_oracle.py / probe_extend_overlap.py /
+  probe_branch_dataset.py / probe_reconnect_rule.py / probe_reconnect_apply.py;
+  缓存 extend_oracle.pkl / extend_overlap.pkl / branch_dataset.*.pkl /
+  reconnect_rule.pkl / reconnect_apply.pkl; 产物 reconnected.44bc.fa。
+- 方法论教训②: oracle 上界(决策完美)与应用实测间有"有路率×全连率×ident"
+  三重折损, 评估任何后处理策略必须先量折损系数再谈模型。
+| 2026-08-31 | qm4 | R=43.9% P=51.7% **F1=47.5%** | N50=1783 n=117645 | --CPU 32 --max_memory 64G |
+| 2026-08-31 | qm4 | R=31.5% P=50.9% **F1=38.9%** | N50=1672 n=82276 | --no-multi-k --CPU 32 --max_memory 64G |
+| 2026-08-31 | qm4 | R=45.3% P=50.5% **F1=47.8%** | N50=1835 n=116816 | --multi-k 29,49,63 --CPU 32 --max_memory 64G |
+| 2026-09-01 | dev1 | R=13.8% P=82.3% **F1=23.6%** | N50=1756 n=8025 | --path-engine gtasm --gt-weights /storage/home/senior007/test/athal/bench/export/gtnet_dev1.gtw --multi-k auto --CPU 8 --max_memory 8G |
+| 2026-09-01 | dev1 | R=15.3% P=80.2% **F1=25.7%** | N50=1882 n=8546 | --CPU 8 --max_memory 8G |
+| 2026-09-01 | qm4-opt | R=44.0% P=51.8% **F1=47.6%** | N50=1774 n=117592 | --multi-k auto --inchworm_cpu 32 --CPU 32 --max_memory 64G |
+
+
+## 性能优化四件套: QM4 全程 137→63min（2.2×）, 语义等价（2026-09-01, bench 8a03b756/514d5be0）
+
+QM4（2135 万对 150bp）全程 137min 的 profile 后, 四处热点逐一落地:
+
+1. **kmer_load 消除（orchestrate.rs + kmer_counter.rs）**: kmer_count 阶段的
+   内存表 CountMap 直传 kmer_load（跳过 4GB counts_bin 读回+单线程重建）,
+   `KmerCounter::from_count_map` move 直构（计数表键已 canonical 且唯一,
+   与逐条 add_kmer 等价）——省二次 rehash 与 canonical 重算。
+   kmer_load: 622/406s → 0/15.6s。
+2. **gtasm_support（gt_support.rs）**: process_seq 滚动 2-bit 编码
+   （与逐窗 kmer_to_intval 逐位等价, 含 N 重置与"不含最后一窗"quirk）;
+   scan_reads_file 流水线并行（读取线程按 line%4 quirk 产出序列批 →
+   rayon 批内并行, EdgeSupport::merge 计数可交换）; build_k2v 按 bin 分组
+   rayon + 按序合并保"先写先赢"。
+3. **GraphFromFasta（kmer_align.rs + graph_from_fasta.rs）**:
+   get_matches 零克隆惰性两指针交（桶不再 to_vec; merge_sort_filter 挪
+   cfg(test)）; Phase 2 的 contig 整段 clone/revcomp → 引用 + 每 contig
+   revcomp 缓存。**实测 gff 仅 1199→1126s（−6%）——克隆非真热点,
+   真瓶颈是 Phase 2 刻意单线程段（下一步目标）**。
+4. **diginorm（diginorm.rs）**: 左右侧 read_side/prep_side/emit_side 三处
+   thread::scope 并行; both.fa 全量拷贝消除（两侧分别计数再合并,
+   canonical_merge_sum 线性可拆）。
+
+另发现: inchworm 组装线程 `args.inchworm_cpu` 默认 min(6, CPU)（原版语义）,
+大机器需显式 `--inchworm_cpu`（QM4 用 32 → inchworm 874+678s → 172+198s）。
+
+**验证**: 全 workspace 测试绿 + clippy 零警告; dev1 bench 语义等价
+（gtasm 链 R−0.1pp/P+0.3pp, classic 链 R−0.1pp/F1−0.2pp, 均在 ±0.3pp
+波动带）; QM4 [49,63] 指标 R=44.0%/P=51.8%（原 43.9/51.7）不变。
+**QM4 全程 137→63min**: normalize 3127→749s（4.2×）, inchworm 两轮
+26.5→6.2min（4.3×, 线程数）, kmer_load 全消, butterfly 289→77s。
+（QM4 系列 bench 行由 bench 自动登记于上表。）

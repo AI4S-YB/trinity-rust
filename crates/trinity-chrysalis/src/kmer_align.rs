@@ -124,36 +124,46 @@ impl KmerAlignCore {
     ///
     /// 返回值 = 与查询 24-mer 精确相等的位置集合（(contig, pos) 升序），
     /// 含查询来源 contig 的自匹配（原版无自排除）。
+    ///
+    /// 性能: 两指针交直接在借用切片上做（two 侧键 = (contig, pos-12) 惰性
+    /// 归一）, 不整桶克隆——高重复 24-mer 的大桶克隆曾是主要分配源
+    /// （GraphFromFasta Phase 2 热点）。
     pub fn get_matches(&self, seq: &[u8]) -> Vec<MatchRecord> {
         if seq.len() < WORD_SIZE {
             return Vec::new();
         }
         let n0 = bases_to_number(seq, 0, KMER_SIZE);
         let n1 = bases_to_number(seq, KMER_SIZE, KMER_SIZE);
-
-        let one: Vec<MatchRecord> = if n0 >= 0 {
-            self.bucket(n0).to_vec()
-        } else {
-            Vec::new()
-        };
-        let two: Vec<MatchRecord> = if n1 >= 0 {
-            // i=1 表的位置归一：pos - i*size（cc:221）
-            self.bucket(n1)
-                .iter()
-                .map(|&r| MatchRecord {
-                    contig: r.contig,
-                    pos: r.pos - KMER_SIZE as i32,
-                })
-                .collect()
-        } else {
-            Vec::new()
-        };
-        merge_sort_filter(&one, &two)
+        // 任一侧无桶（含非法字符 → n<0）→ 交集为空（与 merge_sort_filter 的空侧语义一致）
+        if n0 < 0 || n1 < 0 {
+            return Vec::new();
+        }
+        let one = self.bucket(n0);
+        let two = self.bucket(n1);
+        let k32 = KMER_SIZE as i32;
+        let mut result = Vec::new();
+        if one.is_empty() || two.is_empty() {
+            return result;
+        }
+        let mut y = 0usize;
+        for x in one {
+            while y < two.len() && (two[y].contig, two[y].pos - k32) < x.key() {
+                y += 1;
+            }
+            if y >= two.len() {
+                break;
+            }
+            if (two[y].contig, two[y].pos - k32) == x.key() {
+                result.push(*x);
+            }
+        }
+        result
     }
 }
 
 /// MergeSortFilter（KmerAlignCore.cc:287-340）：两指针线性交，保 one 的顺序。
-/// 任一侧为空 → 空结果。
+/// 任一侧为空 → 空结果。现仅测试直接调用（get_matches 已内联同构逻辑）。
+#[cfg(test)]
 fn merge_sort_filter(one: &[MatchRecord], two: &[MatchRecord]) -> Vec<MatchRecord> {
     let mut result = Vec::new();
     if one.is_empty() || two.is_empty() {

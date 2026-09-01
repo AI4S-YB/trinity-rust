@@ -110,6 +110,22 @@ impl KmerCounter {
         }
     }
 
+    /// 计数表直构（性能优化）: 计数表（trinity-kmer counter 的 CountMap）键在
+    /// 计数阶段已按同一 ds 语义折叠（canonical 幂等）且键唯一（add_kmer 的
+    /// wrapping_add 在唯一键下退化为赋值）——直接 move 全表与逐条 add_kmer
+    /// 全量等价, 省去大表上的二次 rehash 与 canonical 重算。
+    pub fn from_count_map(
+        map: FxHashMap<KmerId, u32>,
+        kmer_length: usize,
+        ds_mode: bool,
+    ) -> Self {
+        KmerCounter {
+            kmer_length,
+            ds_mode,
+            counter: map,
+        }
+    }
+
     /// DS canonical（KC:369-372 的 find_kmer 前置折叠，add/clear 同）
     fn canonical(&self, kmer: KmerId) -> KmerId {
         if self.ds_mode {

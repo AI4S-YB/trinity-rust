@@ -131,85 +131,124 @@ pub fn run_support_pass(
 /// 从 graphs.pack 读全部 comp 的 graph.out → (k2v, 边集, K, 分支窗口)。
 /// K = 首个 kmer 的长度（原型恒 24; 图内 kmer 长度一致由 butterfly 解析保证）。
 /// 分支窗口只被 pair pass 消费, 但与图解析同源, 一并构建以免重读 pack。
+///
+/// 并行（性能）: listing 按连续同 bin 分组, 组内开一次 pack/idx 句柄,
+/// rayon 组建局部表; 合并严格按组序（= listing 升序）→ k2v"先写先赢"
+/// 语义与串行版逐点等价。
 fn build_k2v(
     listing: &[(u64, PathBuf)],
 ) -> Result<(K2V, EdgeSets, usize, BranchWindows), CommonError> {
+    use rayon::prelude::*;
+    /// build_k2v 并行组的局部产物类型（clippy type_complexity 拆分）。
+    type K2vPart = Result<(K2V, EdgeSets, BranchWindows, Option<usize>), CommonError>;
+    // 连续同 dir 分组（listing 按 id 升序 → 同 Cbin 连续）
+    let mut groups: Vec<&[(u64, PathBuf)]> = Vec::new();
+    let mut start = 0;
+    for i in 1..=listing.len() {
+        let boundary = i == listing.len()
+            || listing[i].1.parent() != listing[start].1.parent();
+        if boundary {
+            groups.push(&listing[start..i]);
+            start = i;
+        }
+    }
+    let parts: Vec<K2vPart> = groups
+            .par_iter()
+            .map(|grp| -> Result<(K2V, EdgeSets, BranchWindows, Option<usize>), CommonError> {
+                let dir = grp[0]
+                    .1
+                    .parent()
+                    .map(|d| d.to_path_buf())
+                    .unwrap_or_default();
+                let idx = PackIndex::load(&dir.join(format!("{GRAPHS_PACK}.idx")))?;
+                let file = fs::File::open(dir.join(format!("{GRAPHS_PACK}.pack")))?;
+                let mut k2v: K2V = FxHashMap::default();
+                let mut edge_sets: EdgeSets = FxHashMap::default();
+                let mut windows: BranchWindows = FxHashMap::default();
+                let mut k_len: Option<usize> = None;
+                for (id, _base) in *grp {
+                    let (offset, len) = idx.find(*id, KIND_GRAPH_OUT).ok_or_else(|| {
+                        CommonError::Parse(format!(
+                            "graphs pack {} 缺记录 (id={id}, kind=GRAPH_OUT)",
+                            dir.display()
+                        ))
+                    })?;
+                    let bytes = read_at(&file, offset, len)?;
+                    let text = String::from_utf8(bytes).map_err(|e| {
+                        CommonError::Parse(format!("comp {id} graph.out 非 UTF-8: {e}"))
+                    })?;
+                    let g = parse_component_graph(&text).map_err(|e| {
+                        CommonError::Parse(format!("comp {id} graph.out 解析失败: {e}"))
+                    })?;
+                    // k2v: 全部 names（含无边 comp——python 同; 先写先赢）
+                    for (&vid, kmer) in &g.names {
+                        let k = kmer.len();
+                        let val = kmer_to_intval(kmer.as_bytes()).map_err(|e| {
+                            CommonError::Parse(format!("comp {id} kmer 编码失败: {e}"))
+                        })?;
+                        k2v.entry((val, k as u32)).or_insert((*id, vid));
+                        let rc = revcomp_val(val, k);
+                        k2v.entry((rc, k as u32)).or_insert((*id, vid));
+                        k_len = k_len.or(Some(k));
+                    }
+                    // 真实图边集
+                    let set = edge_sets.entry(*id).or_default();
+                    for ei in 0..g.n_edges() {
+                        set.insert(trinity_butterfly::gtdecode::pack_uv(
+                            g.vids[g.src[ei]],
+                            g.vids[g.dst[ei]],
+                        ));
+                    }
+                    // 分支点上游窗口（pair pass 用）: 去重后继 ≥2 的节点 v →
+                    // 反向 BFS ≤ PAIR_WINDOW_EDGES 边的节点集
+                    let mut succ: FxHashMap<i32, Vec<i32>> = FxHashMap::default();
+                    let mut pred: FxHashMap<i32, Vec<i32>> = FxHashMap::default();
+                    for ei in 0..g.n_edges() {
+                        let (s, d) = (g.vids[g.src[ei]], g.vids[g.dst[ei]]);
+                        if d < 0 {
+                            continue; // 防御: 哨兵不作路径节点
+                        }
+                        let e = succ.entry(s).or_default();
+                        if !e.contains(&d) {
+                            e.push(d);
+                        }
+                        if s >= 0 {
+                            let p = pred.entry(d).or_default();
+                            if !p.contains(&s) {
+                                p.push(s);
+                            }
+                        }
+                    }
+                    for (v, nexts) in &succ {
+                        if nexts.len() >= 2 {
+                            windows.insert(
+                                (*id, *v),
+                                upstream_window(
+                                    &pred,
+                                    *v,
+                                    PAIR_WINDOW_EDGES,
+                                    PAIR_WINDOW_MAX_NODES,
+                                ),
+                            );
+                        }
+                    }
+                }
+                Ok((k2v, edge_sets, windows, k_len))
+            })
+            .collect();
+    // 按组序（= listing 升序）合并 → k2v 先写先赢
     let mut k2v: K2V = FxHashMap::default();
     let mut edge_sets: EdgeSets = FxHashMap::default();
     let mut windows: BranchWindows = FxHashMap::default();
     let mut k_len: Option<usize> = None;
-    // listing 按 id 升序 → 同 Cbin 连续; 每 bin 的索引与句柄各开一次
-    let mut cur_bin: Option<(PathBuf, PackIndex, fs::File)> = None;
-    for (id, base) in listing {
-        let dir = base.parent().map(|d| d.to_path_buf()).unwrap_or_default();
-        if cur_bin
-            .as_ref()
-            .map(|(d, _, _)| d != &dir)
-            .unwrap_or(true)
-        {
-            let idx = PackIndex::load(&dir.join(format!("{GRAPHS_PACK}.idx")))?;
-            let file = fs::File::open(dir.join(format!("{GRAPHS_PACK}.pack")))?;
-            cur_bin = Some((dir.clone(), idx, file));
+    for part in parts {
+        let (lk, le, lw, llen) = part?;
+        for (key, val) in lk {
+            k2v.entry(key).or_insert(val);
         }
-        let (_, idx, file) = cur_bin.as_ref().unwrap();
-        let (offset, len) = idx.find(*id, KIND_GRAPH_OUT).ok_or_else(|| {
-            CommonError::Parse(format!(
-                "graphs pack {} 缺记录 (id={id}, kind=GRAPH_OUT)",
-                dir.display()
-            ))
-        })?;
-        let bytes = read_at(file, offset, len)?;
-        let text = String::from_utf8(bytes)
-            .map_err(|e| CommonError::Parse(format!("comp {id} graph.out 非 UTF-8: {e}")))?;
-        let g = parse_component_graph(&text)
-            .map_err(|e| CommonError::Parse(format!("comp {id} graph.out 解析失败: {e}")))?;
-        // k2v: 全部 names（含无边 comp——python 同; 先写先赢）
-        for (&vid, kmer) in &g.names {
-            let k = kmer.len();
-            let val = kmer_to_intval(kmer.as_bytes()).map_err(|e| {
-                CommonError::Parse(format!("comp {id} kmer 编码失败: {e}"))
-            })?;
-            k2v.entry((val, k as u32)).or_insert((*id, vid));
-            let rc = revcomp_val(val, k);
-            k2v.entry((rc, k as u32)).or_insert((*id, vid));
-            k_len = k_len.or(Some(k));
-        }
-        // 真实图边集
-        let set = edge_sets.entry(*id).or_default();
-        for ei in 0..g.n_edges() {
-            set.insert(trinity_butterfly::gtdecode::pack_uv(
-                g.vids[g.src[ei]],
-                g.vids[g.dst[ei]],
-            ));
-        }
-        // 分支点上游窗口（pair pass 用）: 去重后继 ≥2 的节点 v → 反向 BFS
-        // ≤ PAIR_WINDOW_EDGES 边的节点集
-        let mut succ: FxHashMap<i32, Vec<i32>> = FxHashMap::default();
-        let mut pred: FxHashMap<i32, Vec<i32>> = FxHashMap::default();
-        for ei in 0..g.n_edges() {
-            let (s, d) = (g.vids[g.src[ei]], g.vids[g.dst[ei]]);
-            if d < 0 {
-                continue; // 防御: 哨兵不作路径节点
-            }
-            let e = succ.entry(s).or_default();
-            if !e.contains(&d) {
-                e.push(d);
-            }
-            if s >= 0 {
-                let p = pred.entry(d).or_default();
-                if !p.contains(&s) {
-                    p.push(s);
-                }
-            }
-        }
-        for (v, nexts) in &succ {
-            if nexts.len() >= 2 {
-                windows.insert(
-                    (*id, *v),
-                    upstream_window(&pred, *v, PAIR_WINDOW_EDGES, PAIR_WINDOW_MAX_NODES),
-                );
-            }
-        }
+        edge_sets.extend(le);
+        windows.extend(lw);
+        k_len = k_len.or(llen);
     }
     Ok((k2v, edge_sets, k_len.unwrap_or(24), windows))
 }
@@ -249,6 +288,9 @@ fn upstream_window(
 }
 
 /// 单序列窗口扫描（python `process` 语义, 含"不含最后一窗"quirk）。
+/// 滚动 2-bit 编码（性能）: 与逐窗 `kmer_to_intval` 逐位等价——
+/// 编码表 G=0,A=1,T=2,C=3（base_to_int 同表, 小写同受）, 窗口含非 GATC 时
+/// 原版 Err→未命中, 此处 run<k 不查表; 两条路径的 prev 重置行为一致。
 fn process_seq(
     seq: &[u8],
     k: usize,
@@ -261,12 +303,31 @@ fn process_seq(
         return;
     }
     let k32 = k as u32;
+    let mask: KmerId = if k >= 64 { KmerId::MAX } else { (1 << (2 * k)) - 1 };
+    let mut val: KmerId = 0;
+    let mut run = 0usize; // 连续 GATC 长度（>=k 时当前窗有效）
     let mut prev: Option<(u64, i32)> = None;
-    // python: for i in range(len(seq) - K)——最后一个合法窗 [len-K, len) 不查
-    for i in 0..(seq.len() - k) {
-        let hit = kmer_to_intval(&seq[i..i + k])
-            .ok()
-            .and_then(|val| k2v.get(&(val, k32)));
+    // python: for i in range(len(seq) - K)——窗起点 i ∈ [0, len-k-1];
+    // 滚动指针 j = i+k-1（窗末字符）, j ∈ [k-1, len-2], 末字符不进循环
+    for (j, &c) in seq[..seq.len() - 1].iter().enumerate() {
+        match trinity_common::kmer::base_to_int(c) {
+            Some(v) => {
+                val = ((val << 2) | v as KmerId) & mask;
+                run += 1;
+            }
+            None => {
+                val = 0;
+                run = 0;
+            }
+        }
+        if j + 1 < k {
+            continue;
+        }
+        let hit = if run >= k {
+            k2v.get(&(val, k32))
+        } else {
+            None
+        };
         match hit {
             None => prev = None,
             Some(&(cid, vid)) => {
@@ -287,6 +348,9 @@ fn process_seq(
 }
 
 /// 扫单个 reads 文件（fq: line%4 语义; fa: FASTA 记录）。
+/// 流水线并行（性能）: 读取线程按原语义逐条产出完整序列（含 fq 多行收集/
+/// 尾 flush quirk）打包入 channel; 消费端 rayon 批内并行 process_seq,
+/// EdgeSupport::merge 计数可交换可结合, 合并序无关。
 fn scan_reads_file(
     path: &Path,
     seq_type: SeqType,
@@ -294,69 +358,99 @@ fn scan_reads_file(
     k2v: &K2V,
     edge_sets: &EdgeSets,
 ) -> Result<(EdgeSupport, SupportStats), CommonError> {
-    let mut sup = EdgeSupport::new();
-    let mut stats = SupportStats::default();
-    let mut reader = open_maybe_gz(path)?;
-    match seq_type {
-        SeqType::Fq => {
-            // python calc_edge_support2 的 line_no%4 流式（含多行序列收集与
-            // 文件尾 flush; 空行也计数行号, 不跳过）
-            let mut line = String::new();
-            let mut seq_buf = String::new();
-            let mut line_no = 0u64;
-            loop {
-                line.clear();
-                let n = reader.read_line(&mut line)?;
-                if n == 0 {
-                    break;
-                }
-                match line_no % 4 {
-                    0 => {
-                        if !seq_buf.is_empty() {
-                            process_seq(
-                                seq_buf.as_bytes(),
-                                k,
-                                k2v,
-                                edge_sets,
-                                &mut sup,
-                                &mut stats.pairs,
-                            );
-                            seq_buf.clear();
-                        }
-                        stats.reads += 1;
+    const BATCH: usize = 8192;
+    let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<Vec<u8>>>(8);
+    let path_owned = path.to_path_buf();
+    let reader_handle = std::thread::spawn(move || -> Result<u64, CommonError> {
+        let mut n_reads = 0u64;
+        let mut batch: Vec<Vec<u8>> = Vec::with_capacity(BATCH);
+        let mut reader = open_maybe_gz(&path_owned)?;
+        match seq_type {
+            SeqType::Fq => {
+                // python calc_edge_support2 的 line_no%4 流式（含多行序列收集与
+                // 文件尾 flush; 空行也计数行号, 不跳过）
+                let mut line = String::new();
+                let mut seq_buf: Vec<u8> = Vec::new();
+                let mut line_no = 0u64;
+                loop {
+                    line.clear();
+                    let n = reader.read_line(&mut line)?;
+                    if n == 0 {
+                        break;
                     }
-                    1 => seq_buf.push_str(line.trim()),
-                    _ => {}
+                    match line_no % 4 {
+                        0 => {
+                            if !seq_buf.is_empty() {
+                                batch.push(std::mem::take(&mut seq_buf));
+                                if batch.len() >= BATCH
+                                    && tx.send(std::mem::take(&mut batch)).is_err()
+                                {
+                                    return Ok(n_reads); // 消费端已挂
+                                }
+                            }
+                            n_reads += 1;
+                        }
+                        1 => seq_buf.extend_from_slice(line.trim().as_bytes()),
+                        _ => {}
+                    }
+                    line_no += 1;
                 }
-                line_no += 1;
+                if !seq_buf.is_empty() {
+                    batch.push(seq_buf);
+                }
             }
-            if !seq_buf.is_empty() {
-                process_seq(
-                    seq_buf.as_bytes(),
-                    k,
-                    k2v,
-                    edge_sets,
-                    &mut sup,
-                    &mut stats.pairs,
-                );
-            }
-        }
-        SeqType::Fa => {
-            let mut fr = FastaReader::new(reader);
-            while let Some(rec) = fr.next_record()? {
-                stats.reads += 1;
-                process_seq(
-                    rec.sequence.as_bytes(),
-                    k,
-                    k2v,
-                    edge_sets,
-                    &mut sup,
-                    &mut stats.pairs,
-                );
+            SeqType::Fa => {
+                let mut fr = FastaReader::new(reader);
+                while let Some(rec) = fr.next_record()? {
+                    n_reads += 1;
+                    batch.push(rec.sequence.into_bytes());
+                    if batch.len() >= BATCH && tx.send(std::mem::take(&mut batch)).is_err() {
+                        return Ok(n_reads);
+                    }
+                }
             }
         }
+        if !batch.is_empty() {
+            let _ = tx.send(batch);
+        }
+        Ok(n_reads)
+    });
+
+    let mut sup = EdgeSupport::new();
+    let mut pairs = 0u64;
+    use rayon::prelude::*;
+    while let Ok(batch) = rx.recv() {
+        let (part_sup, part_pairs) = batch
+            .par_iter()
+            .fold(
+                || (EdgeSupport::new(), 0u64),
+                |mut acc, seq| {
+                    process_seq(seq, k, k2v, edge_sets, &mut acc.0, &mut acc.1);
+                    acc
+                },
+            )
+            .reduce(
+                || (EdgeSupport::new(), 0u64),
+                |mut a, b| {
+                    a.0.merge(&b.0);
+                    a.1 += b.1;
+                    a
+                },
+            );
+        sup.merge(&part_sup);
+        pairs += part_pairs;
     }
-    Ok((sup, stats))
+    let reads = reader_handle
+        .join()
+        .unwrap_or_else(|_| Err(CommonError::Parse("gtasm support 读取线程 panic".into())))?;
+    Ok((
+        sup,
+        SupportStats {
+            reads,
+            pairs,
+            edges_with_support: 0, // 由调用方以 merged.len() 回填
+        },
+    ))
 }
 
 // ---------------------------------------------------------------------------
