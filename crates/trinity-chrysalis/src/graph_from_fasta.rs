@@ -320,8 +320,12 @@ pub fn graph_from_fasta(
     }
 
     // :1282-1287 KmerAlignCore 解码
+    let __t = std::time::Instant::now();
     let core = KmerAlignCore::build(iworm_seqs);
     let n = iworm_seqs.len();
+    if std::env::var_os("GFF_PROFILE").is_some() {
+        eprintln!("[gff] build_core: {:?}", __t.elapsed());
+    }
 
     // ---- Phase 1（:1304-1403）：收集候选 weldmers ----
     // 原版 omp critical push_back——本版 per-contig 局部收集 + 按索引序合并
@@ -393,8 +397,17 @@ pub fn graph_from_fasta(
     };
 
     // ---- weldmer 计数（:1412-1427）----
+    if std::env::var_os("GFF_PROFILE").is_some() {
+        eprintln!("[gff] phase1_crossover: {:?}", __t.elapsed());
+    }
     let table = NonRedKmerTable::set_up_templates(&crossover, kk, false);
+    if std::env::var_os("GFF_PROFILE").is_some() {
+        eprintln!("[gff] weldmer_templates: {:?}", __t.elapsed());
+    }
     let table = table.with_read_counts(reads);
+    if std::env::var_os("GFF_PROFILE").is_some() {
+        eprintln!("[gff] weldmer_read_counts: {:?}", __t.elapsed());
+    }
 
     // ---- Phase 2（:1435-1754）：并行收集 + 串行有序应用 ----
     // 性能重构（2026-09-01）: 原版刻意单线程保确定性; 现拆为两段——
@@ -532,6 +545,9 @@ pub fn graph_from_fasta(
             evs
         })
         .collect();
+    if std::env::var_os("GFF_PROFILE").is_some() {
+        eprintln!("[gff] phase2_collect: {:?}", __t.elapsed());
+    }
 
     // 串行应用（严格按收集序 = 原迭代序）
     for (i, evs) in events.iter().enumerate() {
@@ -552,14 +568,16 @@ pub fn graph_from_fasta(
             }
         }
     }
+    if std::env::var_os("GFF_PROFILE").is_some() {
+        eprintln!("[gff] phase2_apply: {:?}", __t.elapsed());
+    }
 
     // ---- report（:672-747）----
-    Ok(report_iworm_graph(
-        &pools,
-        &toasted,
-        &iworm_lengths,
-        &weld_support,
-    ))
+    let out = report_iworm_graph(&pools, &toasted, &iworm_lengths, &weld_support);
+    if std::env::var_os("GFF_PROFILE").is_some() {
+        eprintln!("[gff] report+total: {:?}", __t.elapsed());
+    }
+    Ok(out)
 }
 
 /// `add_iworm_link`（:998-1014）+ `add_reciprocal_iworm_link`（:1036-1058）：

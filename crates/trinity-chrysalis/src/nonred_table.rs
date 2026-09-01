@@ -12,18 +12,34 @@
 //! `d.size()-m_k` 越界读（UB），本版安全跳过。
 
 /// 排序字符串数组 + 二分的非冗余 k-mer 表。
+use rustc_hash::FxHashMap;
+use trinity_common::kmer::{base_to_int, kmer_to_intval, KmerId};
+
+/// NonRedKmerTable（NonRedKmerTable.h/.cc 直译）。
+/// 表 = 排序去重的 k-mer 集（字节序）+ 同长计数; 查询 = 二分（`index`）。
+/// 性能扩展（2026-09-01）: 纯 GATC k-mer 懒建 2bit 哈希索引（`hash_index`），
+/// `add_counts_from_reads_par` 的逐窗查询从 O(log n)+memcmp 降为 O(1)；
+/// 含非 GATC 的 kmer 不进索引（编码无定义）, 查询侧含非 GATC 的窗走
+/// 字节二分回退——与原版逐字节语义完全一致（原版对 N 也做字节相等匹配）。
 pub struct NonRedKmerTable {
     k: usize,
     data: Vec<Vec<u8>>,
     counts: Vec<i32>,
+    /// 懒建哈希索引: 纯 GATC kmer 的 2bit 值 → data 下标（OnceLock 一次建成）。
+    hash_idx: std::sync::OnceLock<FxHashMap<KmerId, u32>>,
 }
 
 impl NonRedKmerTable {
     /// 镜像 `SetUp(templ, noNs)`（NonRedKmerTable.cc:12-96）：
     /// 收集全部 k-mer 窗口（noNs=true 时跳过含非**大写** ACGT 的窗口——
     /// `Regular()` 只认大写），字典序排序 + 原地去重，counts 清零。
+    ///
+    /// 性能（2026-09-01）: 窗口平铺收集（大 Vec + 偏移表, 免逐窗堆分配）,
+    /// 对偏移表按窗口字节序排序（移动 u32 而非 Vec）, dedup 后重建——
+    /// 与逐 Vec 排序的产出逐字节一致（同排序键, 同去重）。
     pub fn set_up_templates(templ: &[Vec<u8>], k: usize, no_ns: bool) -> Self {
-        let mut data: Vec<Vec<u8>> = Vec::new();
+        let mut flat: Vec<u8> = Vec::new();
+        let mut offs: Vec<u32> = Vec::new();
         for d in templ {
             if d.len() < k {
                 continue; // 原版 size_t 下溢越界读（见模块文档）
@@ -33,13 +49,42 @@ impl NonRedKmerTable {
                 if no_ns && w.iter().any(|&c| !matches!(c, b'A' | b'C' | b'G' | b'T')) {
                     continue;
                 }
-                data.push(w.to_vec());
+                offs.push(flat.len() as u32);
+                flat.extend_from_slice(w);
             }
         }
-        data.sort_unstable();
-        data.dedup();
+        offs.sort_unstable_by(|&a, &b| {
+            flat[a as usize..a as usize + k].cmp(&flat[b as usize..b as usize + k])
+        });
+        let mut data: Vec<Vec<u8>> = Vec::with_capacity(offs.len());
+        let mut prev: Option<&[u8]> = None;
+        for &o in &offs {
+            let w = &flat[o as usize..o as usize + k];
+            if Some(w) == prev {
+                continue;
+            }
+            data.push(w.to_vec());
+            prev = Some(w);
+        }
         let counts = vec![0i32; data.len()];
-        NonRedKmerTable { k, data, counts }
+        NonRedKmerTable {
+            k,
+            data,
+            counts,
+            hash_idx: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// 懒建 2bit 哈希索引（纯 GATC kmer; 含非 GATC 者不进索引, 由 `index`
+    /// 字节二分兜底）。
+    fn hash_index(&self) -> &FxHashMap<KmerId, u32> {
+        self.hash_idx.get_or_init(|| {
+            self.data
+                .iter()
+                .enumerate()
+                .filter_map(|(i, w)| kmer_to_intval(w).ok().map(|v| (v, i as u32)))
+                .collect()
+        })
     }
 
     pub fn k(&self) -> usize {
@@ -92,25 +137,58 @@ impl NonRedKmerTable {
     /// `AddData(DNAStringStreamFast&)` 的 omp atomic 语义）：分块局部计数 +
     /// 按块序合并——整数累加，与原版原子累加/与单线程版结果完全一致。
     /// 消费方（`graph_from_fasta`）等价于原版 `#pragma omp parallel` 抢读。
+    ///
+    /// 性能（2026-09-01）: 滚动 2-bit 编码 + 哈希查询（`hash_index`）替换
+    /// 逐窗二分+整段大写拷贝; 含非 GATC 的窗走字节二分回退（原版 toupper
+    /// 后字节匹配语义）。read 长度 < k 的跳过语义不变。
     pub fn add_counts_from_reads_par(&mut self, reads: &[Vec<u8>]) {
         use rayon::prelude::*;
         let n = self.data.len();
         if n == 0 || reads.is_empty() {
             return;
         }
+        let hidx = self.hash_index(); // 先建索引（OnceLock, 一次）
+        let k = self.k;
+        let mask: KmerId = if k >= 64 { KmerId::MAX } else { (1 << (2 * k)) - 1 };
+        let data = &self.data;
         let chunk = (reads.len() / (rayon::current_num_threads() * 4)).max(1);
         let partials: Vec<Vec<i32>> = reads
             .par_chunks(chunk)
             .map(|ch| {
                 let mut local = vec![0i32; n];
                 for r in ch {
-                    if r.len() < self.k {
+                    if r.len() < k {
                         continue;
                     }
-                    let upper: Vec<u8> = r.iter().map(|&c| c.to_ascii_uppercase()).collect();
-                    for j in 0..=upper.len() - self.k {
-                        if let Some(i) = self.index(&upper, j) {
-                            local[i] += 1;
+                    let mut val: KmerId = 0;
+                    let mut run = 0usize;
+                    for j in 0..r.len() {
+                        match base_to_int(r[j]) {
+                            Some(v) => {
+                                val = ((val << 2) | v as KmerId) & mask;
+                                run += 1;
+                            }
+                            None => {
+                                val = 0;
+                                run = 0;
+                            }
+                        }
+                        if j + 1 < k {
+                            continue;
+                        }
+                        if run >= k {
+                            if let Some(&i) = hidx.get(&val) {
+                                local[i as usize] += 1;
+                            }
+                        } else {
+                            // 含非 GATC 窗: 大写后字节二分回退（原版语义）
+                            let ws = j + 1 - k;
+                            let w: Vec<u8> =
+                                r[ws..ws + k].iter().map(|c| c.to_ascii_uppercase()).collect();
+                            let i = data.partition_point(|x| x.as_slice() < w.as_slice());
+                            if i < data.len() && data[i].as_slice() == w.as_slice() {
+                                local[i] += 1;
+                            }
                         }
                     }
                 }

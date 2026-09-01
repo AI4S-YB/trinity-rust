@@ -2166,3 +2166,28 @@ QM4（2135 万对 150bp）全程 137min 的 profile 后, 四处热点逐一落�
 **QM4 全程 137→63min**: normalize 3127→749s（4.2×）, inchworm 两轮
 26.5→6.2min（4.3×, 线程数）, kmer_load 全消, butterfly 289→77s。
 （QM4 系列 bench 行由 bench 自动登记于上表。）
+| 2026-09-01 | dev1 | R=15.4% P=80.6% **F1=25.8%** | N50=1875 n=8559 | --CPU 8 --max_memory 8G |
+| 2026-09-01 | qm4-opt2 | R=44.0% P=51.6% **F1=47.5%** | N50=1784 n=117633 | --multi-k auto --inchworm_cpu 32 --CPU 32 --max_memory 64G |
+| 2026-09-01 | dev1 | R=15.4% P=80.0% **F1=25.8%** | N50=1913 n=8552 | --CPU 8 --max_memory 8G |
+| 2026-09-01 | qm4-opt3 | R=44.0% P=51.5% **F1=47.5%** | N50=1792 n=117692 | --multi-k auto --inchworm_cpu 32 --CPU 32 --max_memory 64G |
+
+## GraphFromFasta 深挖: weldmer 计数哈希化 + Phase 2 并行（gff 1199→196s, 全程 46→39min）（2026-09-01, bench 71f83f9f44f9a038）
+
+Phase 2 并行化后 gff 仍 600s, GFF_PROFILE 插桩分解（examples/gff_profile.rs,
+QM4 中间产物直跑）定位真凶:
+- **weldmer_read_counts 314s（64%）**: add_counts_from_reads_par 对 2150 万
+  reads × 127 窗逐窗"排序 Vec 二分 + 24B memcmp"。改 NonRedKmerTable 懒建
+  2bit 哈希索引（纯 GATC kmer; 含 N 走字节二分回退保原版语义）+ reads 侧
+  滚动编码 → 74s（−76%）。
+- **weldmer_templates 80s**: set_up_templates 逐窗 Vec 分配+排序大 Vec。
+  改平铺收集（大 Vec+u32 偏移表, 排序移动偏移）→ 62s（−25%）。
+- 其余段实测: build_core 27-35s（KmerAlignCore 单线程建索引, 可再并行,
+  收益小暂缓）, Phase2_collect 10.5s, Phase2_apply 18s, phase1 15s。
+
+**QM4 全程: 137→39min（3.5×）**; gff 1199→196s（6.1×）。
+指标等价: dev1 R=15.4%/P=80.0%, QM4 R=44.0%/P=51.5%（波动带内）;
+黄金对拍 edge_multiset_matches_original 逐字节等价。
+注: Phase 2 并行化首版曾引入 rc_cache 串味 bug（单槽缓存在多个 RC 命中
+对象间串序列）, 被黄金对拍当场拦截（weldmers 4 vs 5）, 修为按 contig 键
+的 FxHashMap 缓存。
+| 2026-09-01 | qm4-opt3 | R=44.0% P=51.5% **F1=47.5%** | N50=1792 n=117692 | --multi-k auto --inchworm_cpu 32 --CPU 32 --max_memory 64G |
