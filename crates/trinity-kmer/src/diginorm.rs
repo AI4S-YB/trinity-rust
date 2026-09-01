@@ -163,6 +163,15 @@ pub fn run(
     out_dir: &Path,
 ) -> Result<DigiNormOutputs, CommonError> {
     std::fs::create_dir_all(out_dir)?;
+    // DN_PROFILE=1 时分段计时（性能调优用, 不对外承诺格式）
+    macro_rules! lap {
+        ($tag:expr, $start:expr) => {
+            if std::env::var_os("DN_PROFILE").is_some() {
+                eprintln!("[dn] {}: {:?}", $tag, $start.elapsed());
+            }
+        };
+    }
+    let __t = std::time::Instant::now();
     match reads {
         ReadsInput::Paired(left_paths, right_paths) => {
             // 两侧解压并行（IO 密集; 各侧独立, 汇合后语义不变）
@@ -176,6 +185,7 @@ pub fn run(
             });
             let (left_raw, lf) = l?;
             let (right_raw, rf) = r?;
+            lap!("read_side", __t);
             let fmt = if lf != rf {
                 return Err(CommonError::FastqFormat(format!(
                     "Error, left is {lf:?} but right is {rf:?}; seqType must agree"
@@ -193,19 +203,34 @@ pub fn run(
             });
             let left_fa = l?;
             let right_fa = r?;
+            lap!("prep_side", __t);
             // both.fa 拼接语义 → 两侧分别计数再合并（计数多重集等价: ds 路径
             // 键已 canonical, 非 ds 的 canonical_merge_sum 是线性计数相加——
-            // 分侧合并 = 拼接合并; 省全量拷贝与一次性大分配）
-            let mut table = stats_query_table(&left_fa, params);
-            for (k2, c) in stats_query_table(&right_fa, params) {
+            // 分侧合并 = 拼接合并; 省全量拷贝与一次性大分配）。
+            // 两侧计数并行（各占 rayon 池一半, 中间表内存峰值 ~2× 单侧）:
+            // stats_query_table 是归一化最大段（QM4 663s/82%）。
+            let (tl, tr) = std::thread::scope(|s| {
+                let hl = s.spawn(|| stats_query_table(&left_fa, params));
+                let hr = s.spawn(|| stats_query_table(&right_fa, params));
+                (
+                    hl.join().expect("count left panic"),
+                    hr.join().expect("count right panic"),
+                )
+            });
+            let mut table = tl;
+            for (k2, c) in tr {
                 *table.entry(k2).or_insert(0) += c;
             }
+            lap!("stats_query_table", __t);
             let left_rows = sorted_stats_rows(&left_fa, &table, params)?;
             let right_rows = sorted_stats_rows(&right_fa, &table, params)?;
+            lap!("sorted_stats_rows", __t);
             let merged = merge_pairs(&left_rows, &right_rows);
             let final_rows = merged_to_stats_rows(&merged);
             let selected = select_rows(&final_rows, params)?;
+            lap!("select_rows", __t);
             let index = index_keys(&selected);
+            lap!("index_keys", __t);
             // 两侧输出并行（抽取+写盘, 各侧独立）
             let (l, r) = std::thread::scope(|s| {
                 let hl = s.spawn(|| {
@@ -240,6 +265,7 @@ pub fn run(
             });
             let (out_left, out_fmt) = l?;
             let (out_right, _) = r?;
+            lap!("emit_side", __t);
             Ok(DigiNormOutputs {
                 left: Some(out_left),
                 right: Some(out_right),
