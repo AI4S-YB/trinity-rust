@@ -22,7 +22,9 @@ target/release/trinity-cli \
 | `--left/--right` | PE reads（逗号分隔多文件）；`--single` 为 SE |
 | `--SS_lib_type F\|R\|RF\|FR` | 链特异性库（RF/FR = PE） |
 | `--CPU/--max_memory` | 线程数 / 内存上限护栏 |
-| `--KMER_SIZE`（别名 `__KMER_SIZE`，默认 25） | inchworm k-mer 大小 |
+| `--KMER_SIZE`（别名 `__KMER_SIZE`，默认 25） | inchworm k-mer 大小（**multi-k 开启时不生效**） |
+| `--multi-k auto\|k1,k2,...`（默认 auto） | **多 k 迭代组装**：小 k 轮次产出 trusted contig 注入大 k 轮次（rnaSPAdes 公式选 k，支持域 k≤63）；`--no-multi-k` 回退单 k |
+| `--inchworm_cpu`（默认 min(6,CPU)） | inchworm 并行线程（忠实原版默认；大数据集建议显式调大） |
 | `--min_kmer_cov`（别名 `--min_kmer_count`） | k-mer 计数下限 |
 | `--normalize_max_read_cov` / `--no_normalize_reads` | 归一化上限 / 跳过归一化 |
 | `--bfly_stack_mb` | Butterfly 线程栈（本实现扩展，默认对齐原版 JVM 栈行为） |
@@ -59,6 +61,21 @@ target/release/trinity-cli \
                        drand48 / seqtk 读名改写 等底层原语
 ```
 
+## 多 k 迭代组装（v0.5.0 起默认开启）
+
+原版 Trinity 用单一 k-mer（k=25）构图：低覆盖转录本的 k-mer 深度不足被剪枝丢弃，高覆盖区又被过度分支困住。本实现移植 rnaSPAdes 的多 k 策略：`--multi-k auto` 按读长自动选 k 序列（公式 `lower=int(RL/3)`, `upper=int(RL/2)-1`，向下取奇，支持域钳制到 k≤63），先跑小 k 轮次（只构图不出转录本），将其 inchworm contig 的全部 k-mer 以 presence-only 方式注入（count=1，不污染深度剪枝语义）下一轮计数表，逐轮把低 k 捕获的弱区带进高 k 的精确图。`--no-multi-k` 回退原版单 k 行为；显式 `--multi-k 29,49,63` 可指定任意序列（2-3 个为宜）。
+
+配套扩容：k-mer 键从 u64 扩到 u128（`KmerId`），支持 k≤63（原上限 32）；counts_bin 缓存格式升版 TRM2（旧 TRMC 格式直接报错重算，勿混用 workdir）。
+
+实测增益（R_full = 参考转录本 ≥95% 覆盖+≥95% 一致的召回率，详见 `docs/opt-log.md`）：
+
+| 数据 | 单 k=25 | 双 k | 三 k |
+|---|---|---|---|
+| 拟南芥模拟（76bp，多组数据集交叉） | 基线 | +1.3~2.0pp，P −0.1~−2.2pp | — |
+| 真实 RNA-seq（150bp，2135 万对 PE，436Mb 基因组物种） | 31.5% | **43.9%**（[49,63]，+12.4pp） | **45.3%**（[29,49,63]，再 +1.4pp） |
+
+读长越长、转录组越复杂，multi-k 增益越大；150bp 真实数据上召回率相对提升 44%。
+
 ## 与原版的差异（既定清单）
 
 **未移植（明确不支持）**：salmon 表达定量、bowtie（`--no_bowtie` 语义恒成立）、jaccard 剪枝读聚类、长读（`--long_read`）、DNA 模式（`--genome_guided` 之外的 DNA 组装）。以上入口直接报错或忽略并警告。
@@ -87,7 +104,23 @@ target/release/trinity-cli \
 |---|---|---|---|
 | v0.0.1（直移植版） | ~54 min | 未测 | 移植基线，指标锚定原版 |
 | v0.3.0 | ~17 min | 12:29 | 算法级优化（见下） |
-| **v0.4.0** | **11:20（-79%）** | **7:37** | IO/系统开销优化 |
+| v0.4.0 | 11:20（-79%） | 7:37 | IO/系统开销优化 |
+| **v0.5.0** | 见下注 | — | multi-k 默认开启 + 计算热点优化 |
+
+**v0.5.0 端到端（更大真实数据：2135 万对 150bp PE，436Mb 基因组物种，32 线程）**：
+
+| 版本 | 全程 wall | 关键变化 |
+|---|---|---|
+| v0.4.0 口径 | ~137 min | — |
+| **v0.5.0** | **~31 min（4.2×）** | multi-k [49,63] 迭代 + 下述热点优化 |
+
+v0.5.0 计算热点优化（全部带逐字节/黄金对拍等价验证，组装指标不变）：
+
+- **kmer_load 消除**：inchworm 计数表内存直传 + move 直构（跳过 4GB 级 counts_bin 读回与二次建表，每轮 ~10 min → ~0）。
+- **GraphFromFasta**：候选查询零克隆两指针交；Phase 2 刻意单线程段拆为"并行收集纯函数事件 + 串行按序应用"（toasted/pools 序敏感语义保持）；weldmer 计数改 2-bit 哈希索引（27 亿次二分 → 哈希，314 s → 74 s）；模板平铺收集。gff 合计 20 min → 2.9 min。
+- **FastaToDeBruijn**：每 bundle 独立建图并行化（95 s → 5 s）。
+- **归一化**：左右侧解压/prep/输出三处并行 + 计数免拷贝（both.fa 全量拷贝消除 + merge 小并入大），52 min → 12.5 min。
+- **inchworm 线程**：`--inchworm_cpu`（默认 min(6,CPU)，忠实原版）在大核数机器上建议显式调大，两轮延伸 26.5 → 6 min。
 
 端到端小集（原版 sample_data 全量 30575 PE reads，8 线程）：本实现 ~9 s vs 原版（含 Perl/JVM）~26 s。
 
@@ -136,7 +169,7 @@ target/release/trinity-cli \
 
 ## 验证
 
-- `cargo test --workspace`：543 项单测/组件对拍全绿。
+- `cargo test --workspace`：566 项单测/组件对拍全绿。
 - 三层交叉验证（`cargo xtask`）：
   - `xcheck-kmer / xcheck-inchworm / xcheck-chrysalis / xcheck-butterfly`——第 1、2 层（单元/管线级，对拍原版二进制或黄金）；
   - `xcheck-trinity [--full]`——第 3 层端到端：截断（默认 50000 PE reads）/全量双侧全管线对拍 + eval 统计 + both.fa 互喂抽查 + SS(RF) 合成小集；判定阈值与校准依据见 `docs/xcheck-trinity-report.md`。

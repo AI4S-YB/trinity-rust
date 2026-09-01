@@ -537,10 +537,10 @@ fn cli_validation_exit_2() {
     // -K 非法
     let (code, _, err) = run_cli(&["count", "--reads", reads_str, "-K", "abc"]);
     assert_eq!(code, 2, "{err}");
-    // -K 越界（>32）
-    let (code, _, err) = run_cli(&["count", "--reads", reads_str, "-K", "33"]);
+    // -K 越界（>64, u128 扩容后上限）
+    let (code, _, err) = run_cli(&["count", "--reads", reads_str, "-K", "65"]);
     assert_eq!(code, 2, "{err}");
-    assert!(err.contains("32"), "{err}");
+    assert!(err.contains("64"), "{err}");
     let (code, _, _) = run_cli(&["count", "--reads", reads_str, "-K", "0"]);
     assert_eq!(code, 2);
     // coverage-stats 缺 --kmers

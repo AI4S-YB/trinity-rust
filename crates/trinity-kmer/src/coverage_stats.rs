@@ -76,16 +76,17 @@ pub fn kmer_coverage_vector(seq: &[u8], counts: &CountMap, k: usize, ds: bool) -
         );
         return Vec::new();
     }
-    let mask: KmerId = if k >= 32 {
-        u64::MAX
+    let mask: KmerId = if k >= trinity_common::kmer::MAX_KMER_LENGTH {
+        KmerId::MAX
     } else {
-        (1u64 << (2 * k as u32)) - 1
+        (1u128 << (2 * k as u32)) - 1
     };
     let mut coverage = Vec::with_capacity(seq.len() - k + 1);
     let mut kmer: KmerId = 0;
     let mut valid = 0usize; // 当前位置为止连续 gatc 计数; < k ⇒ 窗口含非 gatc
                             // M7-norm: 滚动 revcomp（数值恒等见 counter::for_each_kmer 注记）。
-    let use_rolling = ds && k <= 32;
+                            // u128 扩容: rev_shift = 2k-2 ≤ 126（k≤64）恒安全, 不再限 k≤32。
+    let use_rolling = ds && k <= trinity_common::kmer::MAX_KMER_LENGTH;
     let rev_shift: u32 = (2 * k - 2) as u32;
     let mut rev: KmerId = 0;
     for (i, &c) in seq.iter().enumerate() {

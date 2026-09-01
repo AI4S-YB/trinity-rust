@@ -24,7 +24,7 @@ const A_MASK: u8 = 4;
 const T_MASK: u8 = 2;
 const C_MASK: u8 = 1;
 
-fn base_mask(code: u64) -> u8 {
+fn base_mask(code: KmerId) -> u8 {
     match code {
         0 => G_MASK, // G
         1 => A_MASK, // A
@@ -88,10 +88,11 @@ impl DeBruijnKmer {
 
     /// DeBruijnGraph.cpp:105 get_prev_kmers — 候选 = 首碱基拼上 k 的后缀
     /// （k >> 2）；序 G,A,T,C（只产掩码位非零者）。
+    /// u128 扩容: 位移量 2k-2 ≤ 126（k≤64）恒安全。
     pub fn get_prev_kmers(&self, kmer_length: usize) -> Vec<KmerId> {
         let reverse_suffix = self.kmer >> 2;
         let mut prev_kmers = Vec::new();
-        for (mask, code) in [(G_MASK, 0u64), (A_MASK, 1), (T_MASK, 2), (C_MASK, 3)] {
+        for (mask, code) in [(G_MASK, 0u128), (A_MASK, 1), (T_MASK, 2), (C_MASK, 3)] {
             if self.prev & mask != 0 {
                 prev_kmers.push((code << (kmer_length * 2 - 2)) | reverse_suffix);
             }
@@ -103,10 +104,10 @@ impl DeBruijnKmer {
     /// 首碱基）拼上末碱基；序 G,A,T,C。
     pub fn get_next_kmers(&self, kmer_length: usize) -> Vec<KmerId> {
         // 原版 (k << (33-K)*2) >> (32-K)*2 == (k & 低 2K-2 位) << 2
-        // （截掉首碱基的高 2 位后整体左移一个碱基）
-        let forward_prefix = (self.kmer & ((1u64 << (kmer_length * 2 - 2)) - 1)) << 2;
+        // （截掉首碱基的高 2 位后整体左移一个碱基; u128 下 2K-2 ≤ 126 恒安全）
+        let forward_prefix = (self.kmer & ((1u128 << (kmer_length * 2 - 2)) - 1)) << 2;
         let mut next_kmers = Vec::new();
-        for (mask, code) in [(G_MASK, 0u64), (A_MASK, 1), (T_MASK, 2), (C_MASK, 3)] {
+        for (mask, code) in [(G_MASK, 0u128), (A_MASK, 1), (T_MASK, 2), (C_MASK, 3)] {
             if self.next & mask != 0 {
                 next_kmers.push(forward_prefix | code);
             }
@@ -457,15 +458,33 @@ fn replace_non_gatc_with_a(seq: &[u8]) -> Vec<u8> {
 ///
 /// 原版 omp 并行 + critical 输出（块序不定）；这里顺序处理、按输入序输出
 /// ——块序非契约，对拍按每 Component 块的行多重集比较。
+///
+/// 性能（2026-09-01）: 每 bundle 独立建图（DeBruijnGraph 无共享状态）,
+/// rayon 并行生成块文本、按索引序拼接——与串行版输出逐字节一致。
 pub fn graph_per_record(
     bundles: &[FastaRecord],
     kmer_length: usize,
     s_strand: bool,
 ) -> Result<String, CommonError> {
+    use rayon::prelude::*;
+    let parts: Vec<Result<String, CommonError>> = bundles
+        .par_iter()
+        .map(|fe| graph_one_bundle(fe, kmer_length, s_strand))
+        .collect();
     let mut out = String::new();
+    for p in parts {
+        out += &p?;
+    }
+    Ok(out)
+}
 
-    for fe in bundles {
-        let accession = fe.accession.as_str();
+/// 单 bundle 建图（`graph_per_record` 的循环体原样抽出; 逐字节同构）。
+fn graph_one_bundle(
+    fe: &FastaRecord,
+    kmer_length: usize,
+    s_strand: bool,
+) -> Result<String, CommonError> {
+    let accession = fe.accession.as_str();
 
         // component value: tokenize(accession, "_")[1] → atoi
         let acc_pts = tokenize(accession, '_');
@@ -503,10 +522,7 @@ pub fn graph_per_record(
             g.add_sequence(&s_acc_val, &seq_region, s_strand, cov_val as u32)?;
         }
 
-        out += &g.to_chrysalis_format(component_id, s_strand);
-    }
-
-    Ok(out)
+        Ok(g.to_chrysalis_format(component_id, s_strand))
 }
 
 #[cfg(test)]

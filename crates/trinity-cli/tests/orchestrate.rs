@@ -51,6 +51,9 @@ fn write_synthetic_reads(dir: &Path) -> PathBuf {
 }
 
 fn synth_args(fa: &Path, outdir: &Path) -> trinity_cli::TrinityArgs {
+    // --no-multi-k: 钉住 classic 单 k（k=25）——本文件的断点名/清理断言均是
+    // k=25 产物（.jellyfish_count.25...）; 默认 multi-k auto 的 e2e 覆盖见
+    // multi_k_default_auto_e2e。
     let argv: Vec<String> = [
         "--seqType",
         "fa",
@@ -61,6 +64,7 @@ fn synth_args(fa: &Path, outdir: &Path) -> trinity_cli::TrinityArgs {
         "--output",
         outdir.to_str().unwrap(),
         "--no_normalize_reads",
+        "--no-multi-k",
         "--CPU",
         "2",
         "--min_contig_length",
@@ -287,4 +291,68 @@ fn resume_works_after_cleanup() {
     assert!(!outdir.join("single.fa").exists());
     let final_fa = run_trinity(&synth_args(&fa, &outdir)).unwrap();
     assert!(final_fa.exists());
+}
+
+/// multi-k 迭代端到端（rnaSPAdes 式）: 中间轮 iter_k15/ 只构图（计数+inchworm,
+/// 无 chrysalis/butterfly）, 最终轮 iter_k17/ 跑完整管线（注入上轮 trusted）,
+/// 最终 Trinity.fasta 仍落主 out 目录旁。
+#[test]
+fn multi_k_end_to_end_iter_dirs() {
+    let dir = tmpdir("multik");
+    let fa = write_synthetic_reads(&dir);
+    let outdir = dir.join("trinity_out");
+    let mut a = synth_args(&fa, &outdir); // 默认收尾清理开启
+    a.multi_k = Some(trinity_cli::MultiK::List(vec![15, 17]));
+    let final_fa = run_trinity(&a).unwrap();
+    assert!(final_fa.ends_with("trinity_out.Trinity.fasta"), "{final_fa:?}");
+    assert!(fa_record_count(&final_fa) >= 1, "no transcripts in final fasta");
+
+    let work = trinity_cli::orchestrate::default_scratch_dir(&outdir);
+    // 中间轮: iter_k15/ 有计数/inchworm 断点与产物, 无 chrysalis/butterfly
+    let iter15 = work.join("iter_k15");
+    assert!(iter15.join(".jellyfish_count.15.mincov1.asm.ok").exists());
+    assert!(iter15.join(".iworm.15.asm.ok").exists());
+    assert!(iter15.join("inchworm.DS.fa").exists());
+    assert!(!iter15.join(".quantify_graph.ok").exists());
+    assert!(!iter15.join(".butterfly.ok").exists());
+    // 最终轮: iter_k17/ 完整管线断点
+    let iter17 = work.join("iter_k17");
+    assert!(iter17.join(".jellyfish_count.17.mincov1.asm.ok").exists());
+    assert!(iter17.join(".iworm.17.asm.ok").exists());
+    assert!(iter17.join(".quantify_graph.ok").exists());
+    assert!(iter17.join(".butterfly.ok").exists());
+    // 主 workdir 无最终轮断点（轮次隔离）; 共享 prep/归一化产物仍在主 workdir
+    assert!(!work.join(".quantify_graph.ok").exists());
+    assert!(work.join("single.fa.ok").exists());
+    // 每轮独立 .stage_timings（按目录区分轮次）
+    assert!(iter15.join(".stage_timings").exists());
+    assert!(iter17.join(".stage_timings").exists());
+    // 默认清理: 两轮 counts_bin 均删, 最终 fasta 保留
+    assert!(!iter15.join("mer_counts.15.asm.rs.bin").exists());
+    assert!(!iter17.join("mer_counts.17.asm.rs.bin").exists());
+    assert!(final_fa.exists());
+}
+
+/// 默认（无任何 k 相关 flag）= --multi-k auto（2026-08-30 转正）: 合成 100bp
+/// reads → RL=100 → rnaSPAdes 公式 [33,49] → iter_k33 中间轮 + iter_k49
+/// 完整轮, 最终 Trinity.fasta 照常产出。
+#[test]
+fn multi_k_default_auto_e2e() {
+    let dir = tmpdir("multik-default");
+    let fa = write_synthetic_reads(&dir);
+    let outdir = dir.join("trinity_out");
+    // synth_args 带 --no-multi-k（钉 classic）, 这里去掉以走默认路径
+    let mut a = synth_args(&fa, &outdir);
+    a.multi_k = Some(trinity_cli::MultiK::Auto);
+    let final_fa = run_trinity(&a).unwrap();
+    assert!(fa_record_count(&final_fa) >= 1, "no transcripts in final fasta");
+    let work = trinity_cli::orchestrate::default_scratch_dir(&outdir);
+    // 中间轮 k=33: 只构图; 最终轮 k=49: 完整管线
+    let iter33 = work.join("iter_k33");
+    assert!(iter33.join(".iworm.33.asm.ok").exists());
+    assert!(!iter33.join(".quantify_graph.ok").exists());
+    let iter49 = work.join("iter_k49");
+    assert!(iter49.join(".iworm.49.asm.ok").exists());
+    assert!(iter49.join(".quantify_graph.ok").exists());
+    assert!(iter49.join(".butterfly.ok").exists());
 }

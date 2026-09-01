@@ -289,7 +289,8 @@ mod tests {
     fn common_error_maps_to_run_class() {
         let e: CliError = CommonError::KmerTooLong { len: 40 }.into();
         assert!(!e.usage);
-        assert_eq!(e.msg, "error, kmer length exceeds 32: 40");
+        // 上限数字随 KmerId=u128 扩容同步（MAX_KMER_LENGTH=64）
+        assert_eq!(e.msg, "error, kmer length exceeds 64: 40");
     }
 
     #[test]

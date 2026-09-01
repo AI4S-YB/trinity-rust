@@ -48,7 +48,7 @@ Required
   --run_inchworm   :run inchworm assembly
 
 Common options
-  -K <int>          :kmer length (default 25, max 32)
+  -K <int>          :kmer length (default 25, max 64)
   --DS              :double stranded mode (default: strand-specific)
   --monitor <int>   :monitoring level (default 0)
   --num_threads <int>
@@ -142,9 +142,11 @@ fn run_inner(args: &[String]) -> Result<i32, CliError> {
             let k = v
                 .parse::<usize>()
                 .map_err(|_| CliError::usage(format!("invalid -K value: {v}")))?;
-            if !(1..=32).contains(&k) {
+            // u128 扩容: 上限随 KmerId 位宽升到 MAX_KMER_LENGTH=64（原版 u64 为 32）
+            if !(1..=trinity_common::kmer::MAX_KMER_LENGTH).contains(&k) {
                 return Err(CliError::usage(format!(
-                    "kmer length exceeds 32 or is zero: {k}"
+                    "kmer length exceeds {} or is zero: {k}",
+                    trinity_common::kmer::MAX_KMER_LENGTH
                 )));
             }
             eprintln!("Kmer length set to: {k}"); // IRKE_run.cpp:193

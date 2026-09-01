@@ -22,7 +22,9 @@ Common options (same names as the upstream `Trinity` script):
 | `--left/--right` | PE reads (comma-separated for multiple files); `--single` for SE |
 | `--SS_lib_type F\|R\|RF\|FR` | Strand-specific library (RF/FR = PE) |
 | `--CPU/--max_memory` | Thread count / memory guardrail |
-| `--KMER_SIZE` (alias `__KMER_SIZE`, default 25) | inchworm k-mer size |
+| `--KMER_SIZE` (alias `__KMER_SIZE`, default 25) | inchworm k-mer size (**ignored when multi-k is on**) |
+| `--multi-k auto\|k1,k2,...` (default auto) | **Multi-k iterative assembly**: trusted contigs from lower-k rounds are injected into higher-k rounds (k chosen by the rnaSPAdes formula, supported up to k≤63); `--no-multi-k` falls back to single-k |
+| `--inchworm_cpu` (default min(6,CPU)) | inchworm parallelism (upstream-faithful default; raise it on many-core machines) |
 | `--min_kmer_cov` (alias `--min_kmer_count`) | k-mer count cutoff |
 | `--normalize_max_read_cov` / `--no_normalize_reads` | Normalization cap / skip normalization |
 | `--bfly_stack_mb` | Butterfly thread stack (extension of this port; defaults to match upstream JVM stack behavior) |
@@ -64,6 +66,21 @@ Five crates plus an orchestrating CLI; the data flow mirrors the upstream pipeli
                        seqtk read renaming, etc.
 ```
 
+## Multi-k iterative assembly (default since v0.5.0)
+
+Upstream Trinity builds the graph with a single k-mer (k=25): k-mers of low-coverage transcripts fall below pruning thresholds and are lost, while high-coverage regions suffer from excessive branching. This port adopts the rnaSPAdes multi-k strategy: `--multi-k auto` picks the k sequence from the read length (`lower=int(RL/3)`, `upper=int(RL/2)-1`, rounded down to odd, clamped to the supported domain k≤63), runs the lower-k rounds first (graph building only, no transcript output), and injects all k-mers of their inchworm contigs into the next round's count table in presence-only form (count=1, leaving depth-pruning semantics untouched). `--no-multi-k` restores the upstream single-k behavior; an explicit `--multi-k 29,49,63` overrides the sequence (2–3 values recommended).
+
+Companion change: k-mer keys widened from u64 to u128 (`KmerId`), supporting k≤63 (was 32); the counts_bin cache format is versioned as TRM2 (old TRMC files are rejected and recomputed — do not reuse workdirs across versions).
+
+Measured recall gains (R_full = fraction of reference transcripts assembled at ≥95% coverage and ≥95% identity; see `docs/opt-log.md`):
+
+| Data | single k=25 | two-k | three-k |
+|---|---|---|---|
+| Arabidopsis simulated (76bp, cross-validated on multiple datasets) | baseline | +1.3~2.0pp, P −0.1~−2.2pp | — |
+| Real RNA-seq (150bp, 21.35M PE pairs, ~436Mb-genome species) | 31.5% | **43.9%** ([49,63], +12.4pp) | **45.3%** ([29,49,63], another +1.4pp) |
+
+Longer reads and more complex transcriptomes benefit more; on 150bp real data the recall gain is +44% relative.
+
 ## Differences from upstream (established list)
 
 **Not ported (explicitly unsupported)**: salmon abundance estimation, bowtie (`--no_bowtie` semantics always hold), jaccard-clip read clustering, long reads (`--long_read`), DNA mode (DNA assembly outside `--genome_guided`). These entry points either error out directly or are ignored with a warning.
@@ -92,7 +109,23 @@ See `docs/benchmarks.md` (per-stage cross-checks and thread scaling) and `docs/o
 |---|---|---|---|
 | v0.0.1 (straight port) | ~54 min | not measured | porting baseline, metrics anchored to upstream |
 | v0.3.0 | ~17 min | 12:29 | algorithmic optimizations (see below) |
-| **v0.4.0** | **11:20 (-79%)** | **7:37** | IO/system-overhead optimizations |
+| v0.4.0 | 11:20 (-79%) | 7:37 | IO/system-overhead optimizations |
+| **v0.5.0** | see note below | — | multi-k by default + hotspot optimizations |
+
+**v0.5.0 end-to-end (larger real data: 21.35M pairs of 150bp PE reads, ~436Mb-genome species, 32 threads):**
+
+| Version | wall | key changes |
+|---|---|---|
+| v0.4.0 basis | ~137 min | — |
+| **v0.5.0** | **~31 min (4.2×)** | multi-k [49,63] iteration + hotspot optimizations below |
+
+v0.5.0 hotspot optimizations (all verified byte-identical or golden-file equivalent; assembly metrics unchanged):
+
+- **kmer_load elimination**: the inchworm count table is passed in-memory and move-constructed (skipping the ~4 GB counts_bin read-back and a second hash-table build; ~10 min → ~0 per round).
+- **GraphFromFasta**: zero-clone two-pointer candidate intersection; the deliberately single-threaded Phase 2 split into "parallel collection of pure-function events + serial in-order application" (order-sensitive toasted/pools semantics preserved); weldmer counting via a 2-bit hash index (2.7 G binary searches → hash lookups, 314 s → 74 s); flattened template collection. Total 20 min → 2.9 min.
+- **FastaToDeBruijn**: per-bundle independent graph construction parallelized (95 s → 5 s).
+- **Normalization**: two-sided parallel decompress/prep/emit + copy-free counting (both.fa copy eliminated, smaller-into-larger merges), 52 min → 12.5 min.
+- **inchworm threads**: `--inchworm_cpu` (default min(6,CPU), upstream-faithful) should be raised on many-core machines — two extension rounds 26.5 → 6 min.
 
 Small-set end-to-end (upstream sample_data, full 30575 PE reads, 8 threads): this port ~9 s vs upstream (incl. Perl/JVM) ~26 s.
 
@@ -141,7 +174,7 @@ All optimizations carry oracle/byte-level equivalence verification; assembly met
 
 ## Validation
 
-- `cargo test --workspace`: 543 unit tests / component cross-checks, all green.
+- `cargo test --workspace`: 566 unit tests / component cross-checks, all green.
 - Three-layer cross-validation (`cargo xtask`):
   - `xcheck-kmer / xcheck-inchworm / xcheck-chrysalis / xcheck-butterfly` — layers 1 and 2 (unit/pipeline level, checked against upstream binaries or goldens);
   - `xcheck-trinity [--full]` — layer 3 end-to-end: truncated (default 50000 PE reads) / full-scale full-pipeline cross-checks in both directions + eval statistics + both.fa cross-feed spot checks + SS(RF) synthetic small set; decision thresholds and calibration rationale in `docs/xcheck-trinity-report.md`;
