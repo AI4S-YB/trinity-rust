@@ -2191,3 +2191,17 @@ QM4 中间产物直跑）定位真凶:
 对象间串序列）, 被黄金对拍当场拦截（weldmers 4 vs 5）, 修为按 contig 键
 的 FxHashMap 缓存。
 | 2026-09-01 | qm4-opt3 | R=44.0% P=51.5% **F1=47.5%** | N50=1792 n=117692 | --multi-k auto --inchworm_cpu 32 --CPU 32 --max_memory 64G |
+| 2026-09-01 | dev1 | R=15.4% P=79.0% **F1=25.8%** | N50=1906 n=8616 | --CPU 8 --max_memory 8G |
+| 2026-09-01 | qm4-opt4 | R=43.8% P=51.5% **F1=47.3%** | N50=1780 n=117888 | --multi-k auto --inchworm_cpu 32 --CPU 32 --max_memory 64G |
+
+## f2db 并行化 + 归一化计数并行（QM4 全程 39→32.5min）（2026-09-01, bench 32f3a1fc87228df5）
+
+- **graph_per_record 并行（debruijn.rs）**: 每 bundle 独立建图, rayon 并行
+  生成块文本按索引序拼接（逐字节同构）——f2db 95→4.9s（−95%）。
+- diginorm 两侧计数并行（diginorm.rs, DN_PROFILE 插桩分解: 计数 663s/82%
+  为大头）: 单跑 804→661s; bench 32 线程池下无收益（池已饱和）, 保留无害。
+- QM4 全程 32.5min。残段构成: normalize 748s（计数 523s 哈希插入 bound）
+  > kmer_count 两轮 417s > inchworm 356s > gff 171s > rtt 95s > butterfly 76s。
+  再压需动计数器内核（u128→u64 键 for k≤32 或分片表）, 风险收益比下降。
+- 指标等价: dev1 R=15.4%/P=79.0%; QM4 R=43.8%/P=51.5%（波动带内）。
+| 2026-09-01 | qm4-opt4 | R=43.8% P=51.5% **F1=47.3%** | N50=1780 n=117888 | --multi-k auto --inchworm_cpu 32 --CPU 32 --max_memory 64G |

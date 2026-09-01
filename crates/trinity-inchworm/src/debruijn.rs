@@ -458,15 +458,33 @@ fn replace_non_gatc_with_a(seq: &[u8]) -> Vec<u8> {
 ///
 /// 原版 omp 并行 + critical 输出（块序不定）；这里顺序处理、按输入序输出
 /// ——块序非契约，对拍按每 Component 块的行多重集比较。
+///
+/// 性能（2026-09-01）: 每 bundle 独立建图（DeBruijnGraph 无共享状态）,
+/// rayon 并行生成块文本、按索引序拼接——与串行版输出逐字节一致。
 pub fn graph_per_record(
     bundles: &[FastaRecord],
     kmer_length: usize,
     s_strand: bool,
 ) -> Result<String, CommonError> {
+    use rayon::prelude::*;
+    let parts: Vec<Result<String, CommonError>> = bundles
+        .par_iter()
+        .map(|fe| graph_one_bundle(fe, kmer_length, s_strand))
+        .collect();
     let mut out = String::new();
+    for p in parts {
+        out += &p?;
+    }
+    Ok(out)
+}
 
-    for fe in bundles {
-        let accession = fe.accession.as_str();
+/// 单 bundle 建图（`graph_per_record` 的循环体原样抽出; 逐字节同构）。
+fn graph_one_bundle(
+    fe: &FastaRecord,
+    kmer_length: usize,
+    s_strand: bool,
+) -> Result<String, CommonError> {
+    let accession = fe.accession.as_str();
 
         // component value: tokenize(accession, "_")[1] → atoi
         let acc_pts = tokenize(accession, '_');
@@ -504,10 +522,7 @@ pub fn graph_per_record(
             g.add_sequence(&s_acc_val, &seq_region, s_strand, cov_val as u32)?;
         }
 
-        out += &g.to_chrysalis_format(component_id, s_strand);
-    }
-
-    Ok(out)
+        Ok(g.to_chrysalis_format(component_id, s_strand))
 }
 
 #[cfg(test)]
