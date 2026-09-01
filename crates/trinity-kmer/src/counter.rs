@@ -109,6 +109,37 @@ pub fn split_fasta_sequences(data: &[u8]) -> Vec<Vec<u8>> {
     records
 }
 
+/// 借用视图版切分（性能）: 返回各记录的 (start, end) 区间 + "是否存在多行
+/// 序列段"标记。单行序列段（段内 \n 仅在末尾）下, 对区间切片直接喂
+/// for_each_kmer 与滤除 \n 后滑窗完全等价（段内无 \n 可断窗）;
+/// 多行段存在时调用方须回退 [`split_fasta_sequences`]（跨行拼接语义）。
+pub fn split_fasta_ranges(data: &[u8]) -> (Vec<(usize, usize)>, bool) {
+    let mut ranges = Vec::new();
+    let mut multiline = false;
+    let mut pos = 0;
+    while pos < data.len() && data[pos] == b'>' {
+        let Some(hdr_nl) = data[pos..].iter().position(|&b| b == b'\n') else {
+            break;
+        };
+        let seq_start = pos + hdr_nl + 1;
+        let end = data
+            .windows(2)
+            .skip(seq_start - 1)
+            .position(|w| w[0] == b'\n' && w[1] == b'>')
+            .map_or(data.len(), |p| seq_start + p);
+        // 段内换行仅允许出现在末尾（单行序列）; 段内 \r 一并滤除语义
+        // 由调用方判断——此处只报多行
+        let body = &data[seq_start..end];
+        let trimmed = body.strip_suffix(b"\n").unwrap_or(body);
+        if trimmed.contains(&b'\n') || trimmed.contains(&b'\r') {
+            multiline = true;
+        }
+        ranges.push((seq_start, end));
+        pos = end;
+    }
+    (ranges, multiline)
+}
+
 pub struct KmerCountTable;
 
 impl KmerCountTable {
@@ -122,6 +153,10 @@ impl KmerCountTable {
     /// `per_thread_capacity` 为每线程局部 HashMap 的初始容量（0 = 不预分配,
     /// 即旧行为）。调用方需保证 capacity 总量（× 线程数 × 每项 ~20B）在
     /// max_memory 预算内——orchestrate 侧按 estimate/18/threads 截断。
+    ///
+    /// 性能（2026-09-01）: 单行序列走借用 range 视图（免逐记录拷贝,
+    /// 切片无内部 \n 时 for_each_kmer 断窗行为与滤除版逐字节等价）;
+    /// 检测到多行序列段自动回退 owned 拷贝路径（跨行拼接语义）。
     pub fn count_fasta_data_with_capacity(
         data: &[u8],
         k: usize,
@@ -129,12 +164,27 @@ impl KmerCountTable {
         per_thread_capacity: usize,
     ) -> CountMap {
         let cap = per_thread_capacity.min(1 << 22); // 单线程上限 ~4M 槽，防 rehash 峰值即可
-        split_fasta_sequences(data)
+        let (ranges, multiline) = split_fasta_ranges(data);
+        if multiline {
+            return split_fasta_sequences(data)
+                .par_iter()
+                .fold(
+                    || CountMap::with_capacity_and_hasher(cap, Default::default()),
+                    |mut local, rec| {
+                        for_each_kmer(rec, k, ds, |key| {
+                            *local.entry(key).or_insert(0) += 1;
+                        });
+                        local
+                    },
+                )
+                .reduce(CountMap::default, merge_counts);
+        }
+        ranges
             .par_iter()
             .fold(
                 || CountMap::with_capacity_and_hasher(cap, Default::default()),
-                |mut local, rec| {
-                    for_each_kmer(rec, k, ds, |key| {
+                |mut local, &(s, e)| {
+                    for_each_kmer(&data[s..e], k, ds, |key| {
                         *local.entry(key).or_insert(0) += 1;
                     });
                     local
@@ -144,8 +194,11 @@ impl KmerCountTable {
     }
 }
 
-/// reduce 合并: b 并入 a（计数累加）。
-fn merge_counts(mut a: CountMap, b: CountMap) -> CountMap {
+/// reduce 合并: b 并入 a（计数累加）。小表并入大表（rehash 次数最少化）。
+fn merge_counts(mut a: CountMap, mut b: CountMap) -> CountMap {
+    if a.len() < b.len() {
+        std::mem::swap(&mut a, &mut b);
+    }
     for (key, cnt) in b {
         *a.entry(key).or_insert(0) += cnt;
     }
