@@ -119,6 +119,11 @@ pub struct TrinityArgs {
     /// `--gtasm-frag-merge` 开启。仅 gtasm 引擎、双端 reads（--left/--right）
     /// 生效。
     pub gtasm_frag_merge: bool,
+    /// **Rust 版扩展**: 输出层 split-read 缝合（harvest 之后、Trinity.fasta
+    /// 落盘前: contig 末端锚 × 首端锚在同一条 read 内共现 ≥2 → 链式缝合,
+    /// 锚唯一性 + 端唯一化 + 并查集禁环防误连, 机制见 stitch 模块文档）。
+    /// **默认关**; `--stitch` 开启。
+    pub stitch: bool,
     /// **Rust 版扩展**: rnaSPAdes 式多 k 迭代的生效值（`--multi-k auto|k1,...` /
     /// `--no-multi-k` 经 [`resolve_multi_k`] 解析后的结果）。None = 单 k classic
     /// （k = --KMER_SIZE）; 缺省（无任何相关 flag）= Some(Auto)（2026-08-30 转正）。
@@ -332,6 +337,8 @@ pub fn parse_args(argv: &[String]) -> Result<TrinityArgs, CliError> {
     let gtasm_pair_support = cli.bool_flag("--gtasm-pair-support");
     // --gtasm-frag-merge（Rust 版扩展, 默认关）: 组件产出碎片 pair-guided 合并
     let gtasm_frag_merge = cli.bool_flag("--gtasm-frag-merge");
+    // --stitch（Rust 版扩展, 默认关）: 输出层 split-read 缝合
+    let stitch = cli.bool_flag("--stitch");
     // --multi-k auto | k1,k2,...（Rust 版扩展, rnaSPAdes 式多 k 迭代; 显式值）
     let multi_k_explicit = match cli.value_flag("--multi-k")?.as_deref() {
         None => None,
@@ -511,6 +518,7 @@ pub fn parse_args(argv: &[String]) -> Result<TrinityArgs, CliError> {
         gtasm_bulge_dual,
         gtasm_pair_support,
         gtasm_frag_merge,
+        stitch,
         multi_k,
         graph_clean_rnaspades,
         gap_close_spades,

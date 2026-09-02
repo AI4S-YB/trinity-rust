@@ -700,6 +700,50 @@ pub fn run_trinity(args: &TrinityArgs) -> Result<PathBuf, CommonError> {
         ));
     }
 
+    // ---- 7.5 输出层 split-read 缝合（Rust 版扩展, --stitch 开启）----
+    // reads 用管线当前持有的（fq 输入时为归一化 fa——断点处桥 read 深度被
+    // cap 到 ~max_cov 仍远超阈值; 与 frag_merge 用原始 reads 的取舍不同,
+    // 此处判据是同 read 共现, 稀释不伤特异性）。统计行落 .stage_timings。
+    if args.stitch {
+        let read_files: Vec<std::path::PathBuf> = args
+            .left
+            .iter()
+            .chain(&args.right)
+            .cloned()
+            .collect();
+        let st = trinity_common::timer::timed(&round_dir, "stitch", || {
+            crate::stitch::stitch_fasta(
+                &trinity_tmp,
+                &read_files,
+                args.seq_type,
+                &crate::stitch::StitchParams::default(),
+            )
+        })?;
+        eprintln!(
+            "-stitch: contigs {} → {}（桥 {} 达标 {}/采纳 {}, 链 {}, 存活锚 {}）",
+            st.contigs_in,
+            st.contigs_out,
+            st.bridges_total,
+            st.bridges_kept,
+            st.bridges_applied,
+            st.chains,
+            st.anchors_live
+        );
+        if let Ok(mut fh) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(round_dir.join(".stage_timings"))
+        {
+            use std::io::Write;
+            let _ = writeln!(
+                fh,
+                "stitch_detail\tbridges={} kept={} applied={} chains={} contigs={}->{}",
+                st.bridges_total, st.bridges_kept, st.bridges_applied, st.chains,
+                st.contigs_in, st.contigs_out
+            );
+        }
+    }
+
     // 最终命名: `<outdir 绝对路径>.Trinity.fasta`（L1512）+ gene_trans_map。
     // scratch 模式下 tmp 在 workdir（可能跨设备）→ rename 失败回落 copy+remove。
     let final_fa = PathBuf::from(format!("{}.Trinity.fasta", outdir.display()));

@@ -15,5 +15,6 @@ pub mod multik;
 pub mod orchestrate;
 pub mod prep;
 pub mod recursive;
+pub mod stitch;
 
 pub use args::{parse_args, MultiK, PathEngine, SeqType, TrinityArgs};
