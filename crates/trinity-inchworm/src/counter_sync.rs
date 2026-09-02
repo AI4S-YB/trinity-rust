@@ -157,13 +157,13 @@ mod tests {
     #[test]
     fn clear_kmer_zeroes_existing_and_never_inserts() {
         let mut kc = KmerCounter::new(2, false);
-        kc.add_kmer(7, 5);
+        kc.add_kmer(KmerId::from(7), 5);
         let sync = SyncKmerCounter::from_counter(kc);
-        sync.clear_kmer(9); // 缺键 → 无操作（不插入！）
+        sync.clear_kmer(KmerId::from(9)); // 缺键 → 无操作（不插入！）
         assert_eq!(sync.size(), 1);
-        assert_eq!(sync.get_kmer_count(9), 0);
-        sync.clear_kmer(7);
-        assert_eq!(sync.get_kmer_count(7), 0);
+        assert_eq!(sync.get_kmer_count(KmerId::from(9)), 0);
+        sync.clear_kmer(KmerId::from(7));
+        assert_eq!(sync.get_kmer_count(KmerId::from(7)), 0);
         assert_eq!(sync.size(), 1); // 惰性删除: 键仍在
     }
 
@@ -183,7 +183,7 @@ mod tests {
     #[test]
     fn concurrent_clear_and_get_no_panic_final_state_zero() {
         let mut kc = KmerCounter::new(4, false);
-        let keys: Vec<KmerId> = (0..200).map(|i| 1000 + i as KmerId).collect();
+        let keys: Vec<KmerId> = (0..200).map(|i| KmerId::from(1000 + i)).collect();
         for &k in &keys {
             kc.add_kmer(k, 7);
         }

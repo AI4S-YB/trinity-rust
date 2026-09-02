@@ -303,8 +303,8 @@ fn process_seq(
         return;
     }
     let k32 = k as u32;
-    let mask: KmerId = if k >= 64 { KmerId::MAX } else { (1 << (2 * k)) - 1 };
-    let mut val: KmerId = 0;
+    let mask: KmerId = KmerId::low_bits(2 * k32);
+    let mut val: KmerId = KmerId::ZERO;
     let mut run = 0usize; // 连续 GATC 长度（>=k 时当前窗有效）
     let mut prev: Option<(u64, i32)> = None;
     // python: for i in range(len(seq) - K)——窗起点 i ∈ [0, len-k-1];
@@ -312,11 +312,11 @@ fn process_seq(
     for (j, &c) in seq[..seq.len() - 1].iter().enumerate() {
         match trinity_common::kmer::base_to_int(c) {
             Some(v) => {
-                val = ((val << 2) | v as KmerId) & mask;
+                val = ((val << 2) | KmerId::from(v)) & mask;
                 run += 1;
             }
             None => {
-                val = 0;
+                val = KmerId::ZERO;
                 run = 0;
             }
         }

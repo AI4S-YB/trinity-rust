@@ -149,7 +149,7 @@ impl NonRedKmerTable {
         }
         let hidx = self.hash_index(); // 先建索引（OnceLock, 一次）
         let k = self.k;
-        let mask: KmerId = if k >= 64 { KmerId::MAX } else { (1 << (2 * k)) - 1 };
+        let mask: KmerId = KmerId::low_bits(2 * k as u32);
         let data = &self.data;
         let chunk = (reads.len() / (rayon::current_num_threads() * 4)).max(1);
         let partials: Vec<Vec<i32>> = reads
@@ -160,16 +160,16 @@ impl NonRedKmerTable {
                     if r.len() < k {
                         continue;
                     }
-                    let mut val: KmerId = 0;
+                    let mut val: KmerId = KmerId::ZERO;
                     let mut run = 0usize;
                     for j in 0..r.len() {
                         match base_to_int(r[j]) {
                             Some(v) => {
-                                val = ((val << 2) | v as KmerId) & mask;
+                                val = ((val << 2) | KmerId::from(v)) & mask;
                                 run += 1;
                             }
                             None => {
-                                val = 0;
+                                val = KmerId::ZERO;
                                 run = 0;
                             }
                         }

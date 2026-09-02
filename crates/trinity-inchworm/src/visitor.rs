@@ -100,14 +100,14 @@ mod tests {
     fn visitor_backtrack_semantics() {
         // inchworm_step 递归回溯依赖: erase 后同键可再次 add（KC:782-789 erase + 重入）
         let mut v = KmerVisitor::new(2, false);
-        v.add(7);
-        assert!(v.exists(7));
-        v.erase(7);
-        assert!(!v.exists(7));
-        v.add(7);
+        v.add(KmerId::from(7));
+        assert!(v.exists(KmerId::from(7)));
+        v.erase(KmerId::from(7));
+        assert!(!v.exists(KmerId::from(7)));
+        v.add(KmerId::from(7));
         assert_eq!(v.size(), 1);
         // erase 不存在的键无副作用
-        v.erase(9);
+        v.erase(KmerId::from(9));
         assert_eq!(v.size(), 1);
     }
 }

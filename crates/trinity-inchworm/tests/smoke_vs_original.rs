@@ -281,7 +281,7 @@ fn cli_validation_exit_2() {
     let (code, _, _) = run(&["--run_inchworm".to_string()]);
     assert_eq!(code, 2, "缺 --reads/--kmers");
 
-    for bad in ["0", "65", "abc"] {
+    for bad in ["0", "129", "abc"] {
         let (code, _, err) = run(&base(&["-K", bad]));
         assert_eq!(code, 2, "-K {bad}: {err}");
     }

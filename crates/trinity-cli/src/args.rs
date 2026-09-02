@@ -381,7 +381,7 @@ pub fn parse_args(argv: &[String]) -> Result<TrinityArgs, CliError> {
             "Error, need either options 'left' and 'right' or option 'single'",
         ));
     }
-    // u128 扩容: 支持域上限与 multik::MULTI_K_MAX 一致（63 = MAX_KMER_LENGTH-1,
+    // U256 扩容: 支持域上限与 multik::MULTI_K_MAX 一致（127 = MAX_KMER_LENGTH-1,
     // 见 multik.rs 注记; 原版 u64 时代为 1..=32）
     if !(1..=crate::multik::MULTI_K_MAX).contains(&kmer_size) {
         return Err(CliError::usage(format!(
@@ -827,9 +827,9 @@ mod tests {
     fn multi_k_list_validation() {
         // 越界: <15 或 >63 报错（u128 支持域 [15,63]; 33 扩容后合法）
         assert!(parse_args(&argv(&["--multi-k", "14,25"])).is_err());
-        assert!(parse_args(&argv(&["--multi-k", "25,64"])).is_err());
+        assert!(parse_args(&argv(&["--multi-k", "25,128"])).is_err());
         assert!(parse_args(&argv(&["--multi-k", "15,32"])).is_ok());
-        assert!(parse_args(&argv(&["--multi-k", "15,63"])).is_ok());
+        assert!(parse_args(&argv(&["--multi-k", "15,127"])).is_ok());
         // RL=76 公式原值 [29,37] 作为显式列表合法（扩容动机）
         assert!(parse_args(&argv(&["--multi-k", "29,37"])).is_ok());
         // 非数字 / 空段

@@ -7,44 +7,48 @@
 use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 
-use trinity_common::kmer::{get_ds_kmer_val, KmerId, MAX_KMER_LENGTH};
+use trinity_common::kmer::{KmerId, MAX_KMER_LENGTH, RollingKey};
 
 pub type CountMap = FxHashMap<KmerId, u32>;
 
 /// 对一条序列（原始字节）枚举有效 kmer，回调规范化后的键。
 /// 镜像 jellyfish: 非 gatc 字符使包含它的窗口失效，窗口继续前滑（不是重启）。
-pub fn for_each_kmer(seq: &[u8], k: usize, ds: bool, mut f: impl FnMut(KmerId)) {
-    // u128 扩容: k=64 时 2k=128, `(1 << 2k)` 溢出 u128 → 满宽掩码兜底
-    // （自限正确: 超窗高位随左移自然掉出）。
-    let mask: KmerId = if k >= MAX_KMER_LENGTH {
-        KmerId::MAX
-    } else {
-        (1u128 << (2 * k as u32)) - 1
-    };
-    let mut kmer: KmerId = 0;
+///
+/// 性能分层（2026-09-02）: 泛型核心 [`for_each_kmer_of`] 按键类型实例化——
+/// u128 紧凑键（k≤64, diginorm 热路径, 24B/槽 vs U256 40B/槽）与 KmerId 全宽。
+/// 本函数 = KmerId 实例化（管线对外签名不变）。
+pub fn for_each_kmer(seq: &[u8], k: usize, ds: bool, f: impl FnMut(KmerId)) {
+    for_each_kmer_of::<KmerId>(seq, k, ds, f)
+}
+
+/// 滚动枚举泛型核心; 语义与 jellyfish/原 for_each_kmer 全域一致
+/// （DS canonical = max(kmer, revcomp), 非滚动兜底走 K::revcomp 等价式）。
+pub fn for_each_kmer_of<K: RollingKey>(seq: &[u8], k: usize, ds: bool, mut f: impl FnMut(K)) {
+    // 满宽兜底自限正确（超窗高位随左移自然掉出）; u128 实例的 low_mask 自带 k≤64 断言。
+    let mask: K = K::low_mask(k);
+    let mut kmer: K = K::zero();
     let mut valid: usize = 0;
     // M7-norm: 滚动 revcomp（revcomp(km<<2|v) == (revcomp(km)>>2) | (v^3)<<(2k-2)），
-    // 免去每 kmer 的 25 迭代 revcomp_val 循环; 与 get_ds_kmer_val(kmer,k) 数值恒等。
-    // rev_shift = 2k-2 ≤ 126（k ≤ MAX_KMER_LENGTH=64）在 u128 内恒安全;
-    // k > 64 超出编码定义域，回落旧路径防御。
+    // 免去每 kmer 的 k 迭代 revcomp_val 循环; 与 canonical max 语义数值恒等。
+    // rev_shift = 2k-2 ≤ 254（k ≤ MAX_KMER_LENGTH=128）恒安全。
     if ds && k <= MAX_KMER_LENGTH {
         let rev_shift: u32 = (2 * k - 2) as u32;
-        let mut rev: KmerId = 0;
+        let mut rev: K = K::zero();
         for &c in seq {
             let v = match c {
-                b'G' | b'g' => 0u128,
+                b'G' | b'g' => 0u8,
                 b'A' | b'a' => 1,
                 b'T' | b't' => 2,
                 b'C' | b'c' => 3,
                 _ => {
                     valid = 0;
-                    kmer = 0;
-                    rev = 0;
+                    kmer = K::zero();
+                    rev = K::zero();
                     continue;
                 }
             };
-            kmer = ((kmer << 2) | v) & mask;
-            rev = ((rev >> 2) | ((v ^ 3) << rev_shift)) & mask;
+            kmer = kmer.roll_forward(v, mask);
+            rev = rev.roll_rev(v, rev_shift, mask);
             if valid < k {
                 valid += 1;
             }
@@ -56,22 +60,28 @@ pub fn for_each_kmer(seq: &[u8], k: usize, ds: bool, mut f: impl FnMut(KmerId)) 
     }
     for &c in seq {
         let v = match c {
-            b'G' | b'g' => 0u128,
+            b'G' | b'g' => 0u8,
             b'A' | b'a' => 1,
             b'T' | b't' => 2,
             b'C' | b'c' => 3,
             _ => {
                 valid = 0;
-                kmer = 0;
+                kmer = K::zero();
                 continue;
             }
         };
-        kmer = ((kmer << 2) | v) & mask;
+        kmer = kmer.roll_forward(v, mask);
         if valid < k {
             valid += 1;
         }
         if valid == k {
-            let key = if ds { get_ds_kmer_val(kmer, k) } else { kmer };
+            let key = if ds {
+                // get_ds_kmer_val 的 K 泛型等价式（非滚动兜底路径）
+                let rc = kmer.revcomp(k);
+                if rc > kmer { rc } else { kmer }
+            } else {
+                kmer
+            };
             f(key);
         }
     }
@@ -143,16 +153,16 @@ pub fn split_fasta_ranges(data: &[u8]) -> (Vec<(usize, usize)>, bool) {
 pub struct KmerCountTable;
 
 impl KmerCountTable {
-    /// 并行统计 FASTA 字节流的 k-mer 计数。
-    /// rayon 按记录分片 → 每线程局部 FxHashMap → reduce 合并（jellyfish 同型策略）。
+    /// 并行统计 FASTA 字节流的 k-mer 计数（KmerId 口径; 泛型核心见
+    /// [`count_fasta_data_of`]——diginorm 热路径用 u128 紧凑键实例化）。
     pub fn count_fasta_data(data: &[u8], k: usize, ds: bool) -> CountMap {
         Self::count_fasta_data_with_capacity(data, k, ds, 0)
     }
 
     /// 带每线程预 reserve 的计数（`estimate_hash_size` 接线）:
     /// `per_thread_capacity` 为每线程局部 HashMap 的初始容量（0 = 不预分配,
-    /// 即旧行为）。调用方需保证 capacity 总量（× 线程数 × 每项 ~20B）在
-    /// max_memory 预算内——orchestrate 侧按 estimate/18/threads 截断。
+    /// 即旧行为）。调用方需保证 capacity 总量（× 线程数 × 每项开销）在
+    /// max_memory 预算内——orchestrate 侧按 estimate/threads 截断。
     ///
     /// 性能（2026-09-01）: 单行序列走借用 range 视图（免逐记录拷贝,
     /// 切片无内部 \n 时 for_each_kmer 断窗行为与滤除版逐字节等价）;
@@ -163,39 +173,56 @@ impl KmerCountTable {
         ds: bool,
         per_thread_capacity: usize,
     ) -> CountMap {
-        let cap = per_thread_capacity.min(1 << 22); // 单线程上限 ~4M 槽，防 rehash 峰值即可
-        let (ranges, multiline) = split_fasta_ranges(data);
-        if multiline {
-            return split_fasta_sequences(data)
-                .par_iter()
-                .fold(
-                    || CountMap::with_capacity_and_hasher(cap, Default::default()),
-                    |mut local, rec| {
-                        for_each_kmer(rec, k, ds, |key| {
-                            *local.entry(key).or_insert(0) += 1;
-                        });
-                        local
-                    },
-                )
-                .reduce(CountMap::default, merge_counts);
-        }
-        ranges
+        count_fasta_data_of::<KmerId>(data, k, ds, per_thread_capacity)
+    }
+}
+
+/// 并行计数泛型核心: rayon 按记录分片 → 每线程局部 FxHashMap<K,u32> →
+/// reduce 合并（jellyfish 同型策略）。K = u128（k≤64 紧凑键）或 KmerId。
+pub fn count_fasta_data_of<K>(
+    data: &[u8],
+    k: usize,
+    ds: bool,
+    per_thread_capacity: usize,
+) -> FxHashMap<K, u32>
+where
+    K: RollingKey + Send,
+{
+    let cap = per_thread_capacity.min(1 << 22); // 单线程上限 ~4M 槽，防 rehash 峰值即可
+    let (ranges, multiline) = split_fasta_ranges(data);
+    if multiline {
+        return split_fasta_sequences(data)
             .par_iter()
             .fold(
-                || CountMap::with_capacity_and_hasher(cap, Default::default()),
-                |mut local, &(s, e)| {
-                    for_each_kmer(&data[s..e], k, ds, |key| {
+                || FxHashMap::<K, u32>::with_capacity_and_hasher(cap, Default::default()),
+                |mut local, rec| {
+                    for_each_kmer_of::<K>(rec, k, ds, |key| {
                         *local.entry(key).or_insert(0) += 1;
                     });
                     local
                 },
             )
-            .reduce(CountMap::default, merge_counts)
+            .reduce(FxHashMap::default, merge_counts);
     }
+    ranges
+        .par_iter()
+        .fold(
+            || FxHashMap::<K, u32>::with_capacity_and_hasher(cap, Default::default()),
+            |mut local, &(s, e)| {
+                for_each_kmer_of::<K>(&data[s..e], k, ds, |key| {
+                    *local.entry(key).or_insert(0) += 1;
+                });
+                local
+            },
+        )
+        .reduce(FxHashMap::default, merge_counts)
 }
 
 /// reduce 合并: b 并入 a（计数累加）。小表并入大表（rehash 次数最少化）。
-fn merge_counts(mut a: CountMap, mut b: CountMap) -> CountMap {
+pub fn merge_counts<K: RollingKey>(
+    mut a: FxHashMap<K, u32>,
+    mut b: FxHashMap<K, u32>,
+) -> FxHashMap<K, u32> {
     if a.len() < b.len() {
         std::mem::swap(&mut a, &mut b);
     }
@@ -228,13 +255,14 @@ pub fn inject_trusted_kmers(counts: &mut CountMap, trusted_fasta: &[u8], k: usiz
     inserted
 }
 
-/// mer_counts 二进制记录布局: `u128 key, u32 count`（小端, 20B/条）, 头部魔数
-/// `TRM2` + u32 k + u8 ds（读回时校验）。M7 消 dump 直桥的落盘格式,
+/// mer_counts 二进制记录布局: `U256 key, u32 count`（小端, 36B/条）, 头部魔数
+/// `TRM3` + u32 k + u8 ds（读回时校验）。M7 消 dump 直桥的落盘格式,
 /// 管线（orchestrate）与离线工具（xtask export-edges）共用。
 ///
-/// 格式沿革（u128 扩容, 2026-08-30）: KmerId u64→u128 前为魔数 `TRMC` +
-/// 8B key（12B/条）。键宽翻倍后旧文件静默错位解析的风险不可接受 → 魔数升版
-/// 硬拒绝（"bad header" 报错）, 不做双格式读（counts_bin 是易失缓存, 重算即可）。
+/// 格式沿革: u64 时代 `TRMC` + 8B key（12B/条）; u128 扩容（2026-08-30）升
+/// `TRM2` + 16B key（20B/条）; U256 扩容（2026-09-02）升 `TRM3` + 32B key。
+/// 键宽变化后旧文件静默错位解析的风险不可接受 → 每次魔数升版硬拒绝
+/// （"bad header" 报错）, 不做双格式读（counts_bin 是易失缓存, 重算即可）。
 pub fn save_counts_bin(
     path: &std::path::Path,
     counts: &CountMap,
@@ -242,7 +270,7 @@ pub fn save_counts_bin(
     ds: bool,
 ) -> Result<(), trinity_common::error::CommonError> {
     let mut buf: Vec<u8> = Vec::new();
-    buf.extend_from_slice(b"TRM2");
+    buf.extend_from_slice(b"TRM3");
     buf.extend_from_slice(&(k as u32).to_le_bytes());
     buf.push(ds as u8);
     for (&key, &c) in counts.iter() {
@@ -253,7 +281,7 @@ pub fn save_counts_bin(
     Ok(())
 }
 
-/// save_counts_bin 的读回侧; k/ds 不匹配或头损坏报错（u64 时代的 `TRMC`
+/// save_counts_bin 的读回侧; k/ds 不匹配或头损坏报错（`TRMC`/`TRM2` 等
 /// 旧格式同走 bad header 硬拒绝——见 save_counts_bin 的格式沿革注记）。
 pub fn load_counts_bin(
     path: &std::path::Path,
@@ -262,7 +290,7 @@ pub fn load_counts_bin(
 ) -> Result<CountMap, trinity_common::error::CommonError> {
     use trinity_common::error::CommonError;
     let data = std::fs::read(path)?;
-    if data.len() < 9 || &data[..4] != b"TRM2" {
+    if data.len() < 9 || &data[..4] != b"TRM3" {
         return Err(CommonError::Parse(format!(
             "corrupt k-mer table {}: bad header",
             path.display()
@@ -278,11 +306,11 @@ pub fn load_counts_bin(
     }
     let mut counts = CountMap::default();
     let mut i = 9;
-    while i + 20 <= data.len() {
-        let key = u128::from_le_bytes(data[i..i + 16].try_into().unwrap());
-        let c = u32::from_le_bytes(data[i + 16..i + 20].try_into().unwrap());
+    while i + 36 <= data.len() {
+        let key = KmerId::from_le_bytes(data[i..i + 32].try_into().unwrap());
+        let c = u32::from_le_bytes(data[i + 32..i + 36].try_into().unwrap());
         counts.insert(key, c);
-        i += 20;
+        i += 36;
     }
     Ok(counts)
 }
@@ -303,7 +331,7 @@ pub fn estimate_hash_size(max_memory: u64, read_file_size: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use trinity_common::kmer::{decode_kmer_from_intval, kmer_to_intval};
+    use trinity_common::kmer::{decode_kmer_from_intval, get_ds_kmer_val, kmer_to_intval};
 
     fn counts_of(seq: &str, k: usize, ds: bool) -> Vec<(String, u32)> {
         let mut m: CountMap = FxHashMap::default();
@@ -319,6 +347,23 @@ mod tests {
             .collect();
         v.sort();
         v
+    }
+
+    /// u128 紧凑键计数与 KmerId 全宽计数多重集等价（k≤64 域, hi 恒 0;
+    /// 性能分层 2026-09-02 的数值正确性锁）。
+    #[test]
+    fn u128_compact_counting_matches_kmerid() {
+        let seq = b">x\nACGTACGTNNAGGCACGTACGTACGTagct\n>y\nAAAAACCCCCGGGGGTTTTTACGTACGTA";
+        for k in [15usize, 25, 31, 63, 64] {
+            for ds in [true, false] {
+                let wide = KmerCountTable::count_fasta_data(seq, k, ds);
+                let narrow = count_fasta_data_of::<u128>(seq, k, ds, 0);
+                assert_eq!(wide.len(), narrow.len(), "k={k} ds={ds}");
+                for (key, c) in &narrow {
+                    assert_eq!(wide.get(&key.to_wide()), Some(c), "k={k} ds={ds}");
+                }
+            }
+        }
     }
 
     #[test]
@@ -455,7 +500,7 @@ mod tests {
         let bin = dir.join("m.bin");
         let mut m: CountMap = FxHashMap::default();
         let hi = kmer_to_intval(b"ACGTACGTACGTACGTACGTACGTACGTACGTACGTA").unwrap(); // 37-mer
-        assert!(hi > u64::MAX as u128); // 确为 u64 放不下的键
+        assert!(hi > KmerId::from(u64::MAX as u128)); // 确为 u64 放不下的键
         m.insert(hi, 7);
         m.insert(kmer_to_intval(b"AAAA").unwrap(), 3);
         save_counts_bin(&bin, &m, 37, true).unwrap();

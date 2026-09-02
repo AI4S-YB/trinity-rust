@@ -2217,3 +2217,86 @@ split_fasta_sequences 的逐记录 owned 拷贝 → split_fasta_ranges 借用视
 逐字节一致, dev1/QM4 bench 指标波动带内。
 （bench 行见上表 qm4-opt5; 全程 ~33.6min, 与 opt4 的 32.5min 差异为系统
 噪声——归一化的 −164s 收益部分被评测/负载波动吃掉。）
+
+## 新评估维度: 蛋白层重合度 + BUSCO（QM4, TransDecoder 口径, 2026-09-02）
+
+新增一条与核酸 P/R 互补的评估线: TransDecoder 5.7.1 翻译两组转录本
+（无同源提示, 默认单最优 ORF）, diamond 双向 blastp 算蛋白重合度,
+BUSCO 6.1.0 protein 模式（eudicots_odb10, n=2326）做非银标准锚点。
+对象: QM4 银标准 st_transcripts.fa（38,549 条）vs release_qm4_out.Trinity.fasta
+（multi-k auto, R=43.9% 那版）。脚本固化在 test_data/work/eval/
+（eval_protein.py + protein_eval.sh 一键端到端）, 产物在
+test_data/work/protein_eval/。
+
+| 组 | 转录本 | 蛋白(≥100aa) | BUSCO C | S | D | F | M |
+|---|---|---|---|---|---|---|---|
+| StringTie 银标准 | 38,549 | 37,629 (97.6%) | 93.9% | 64.5 | 29.4 | 1.8 | 4.2 |
+| trinity-rust multi-k | 117,592 | 72,947 (62.0%) | 89.1% | 54.0 | 35.2 | 4.5 | 6.4 |
+
+蛋白重合度（diamond, pident≥90）: pepR90=90.4%（银标准蛋白被覆盖,
+qcov≥50%）/ pepR90full=80.3%（qcov≥90 近全长）/ pepP90=89.9%（组装蛋白
+能对上银标准）/ geneR90=90.9%（18,817 个 STRG 基因至少一条蛋白被覆盖）。
+
+解读: 核酸全长口径 R=43.9% 与蛋白口径 90.4%/基因级 90.9% 的巨大落差,
+定位了当前短板——**编码区（CDS）广度已到九成, 缺的是全长完整性**
+（UTR 端截断+isoform 拼全）: 蛋白产出率 62% vs 银标准 97.6% 也指向同一处。
+BUSCO −4.8pp（89.1 vs 93.9）独立佐证: de novo 对 genome-guided 的真实
+差距远小于核酸 R 显示的水平。注意 pepR 口径含银标准循环性（StringTie
+没捕到的真实基因只惩罚 pepP 不奖励 pepR）, BUSCO 是唯一非循环锚点。
+| 2026-09-02 | u256-dev1 | R=15.4% P=79.5% **F1=25.8%** | N50=1907 n=8553 | --CPU 8 --max_memory 8G |
+| 2026-09-02 | u256-dev1 | R=15.4% P=79.6% **F1=25.8%** | N50=1912 n=8542 | --CPU 8 --max_memory 8G |
+| 2026-09-02 | qm4-k294973 | R=44.4% P=51.0% **F1=47.5%** | N50=1782 n=121356 | --multi-k 29,49,73 --inchworm_cpu 32 --CPU 32 --max_memory 64G |
+
+## KmerId u128→U256 扩容 + k=73 顶 k 实验: 63 仍是最优（2026-09-02, bench 6c437e1881b4221d/278c78f43926ebfd）
+
+动机: 用户要求三 k 落地 [29,49,73]（rnaSPAdes 公式给 RL=150 的原值 upper_k=73,
+此前被 u128 位宽钳成 63）。2bit×73=190bit > 128bit → 手写 U256（双 u128 limb,
+kmer.rs, 零新依赖: 移位/位运算/加减/回绕左移/FromStr/低 256 位序/与原生字面量
+比较全套; limb 序保证派生 Ord = 数值序）。MAX_KMER_LENGTH 64→128, MULTI_K_MAX
+63→127（对齐 SPAdes MAX_K）, auto 公式 RL=150 的 [49,73] / RL=250 的 [55,123]
+不再被钳。counts_bin 魔数 TRM2→TRM3（键 32B, 36B/条, 旧格式硬拒绝）。
+热路径四处滚动编码（counter/coverage_stats/nonred_table/gt_support）与
+kmer_counter 的 (65-K)/(64-K) 常数（→(129-K)/(128-K)）全部平移。
+KMER_ENTRY_BYTES 26→42（容量护栏口径随动）。
+
+验证: workspace 665 测试全绿（新增 k=33/37/55/64/73/127/128 编解码往返、
+TRM3 往返、TRM2 硬拒、129 越界）; dev1 真重组装 R=15.4%/P=79.6%/F1=25.8%
+（基线波动带内, 无回归）。**坑**: bench 缓存键含 target/release/trinity-cli
+内容——先 build release 再 bench, 否则命中旧 u128 缓存假回归。
+
+**QM4 [29,49,73] vs 锚点**: R=44.4%/P=51.0%/F1=47.5%/N50=1782/n=121356,
+对照 [29,49,63] R=45.3%/F1=47.8%/N50=1835/n=116816 与 [49,63] R=43.9%。
+**73 顶 k 被否**: R −0.9pp（超 ±0.3pp 波动带）, N50 −53, 碎片 +4.5k 条。
+机制自洽: kmer 深度 ∝ (RL−k+1), k=73 比 k=63 薄 ~12%, QM4 银标准低表达尾巴
+长, 大 k 的断图损失 > 重复解纠缠收益——rnaSPAdes 公式的 upper_k 假设的是
+"每轮图简化后进下一轮"的迭代架构, 我们的 trusted 注入 + 最终轮完整管线不
+共享该假设。**结论: 顶 k 维持 63, U256 扩容作为能力保留（RL≥200 长读数据
+的 [55,123] 现在可落地, 待未来数据验证）**。
+
+性能注记: U256 计数键翻倍, QM4 normalize 748→920s（+23%）; 本轮全程 ~65min
+（三轮计数 vs 两轮 + U256 开销）。若日后长读数据真用 k>63, 计数段可再压。
+| 2026-09-02 | qm4-u128dn | R=43.3% P=51.9% **F1=47.2%** | N50=1746 n=123003 | --multi-k auto --inchworm_cpu 32 --CPU 32 --max_memory 64G |
+| 2026-09-02 | qm4-u128dn2 | R=43.9% P=51.7% **F1=47.5%** | N50=1784 n=117879 | --multi-k auto --inchworm_cpu 32 --CPU 32 --max_memory 64G |
+
+## U256 性能回压: RollingKey 双键分层（diginorm 计数 798→380s）+ auto 顶 k 实测钳制（2026-09-02, bench 8116a0e01d7769fc）
+
+U256 扩容的代价是计数键 16→32B（QM4 normalize 748→920s）。本轮压回并反超:
+
+- **RollingKey trait**（trinity-common）: u128（k≤64 紧凑键, 24B/槽）与 U256
+  （全域 k≤128）双实现; counter/coverage_stats 的滚动枚举、计数、逐 read
+  查表全部泛型化; diginorm 的计数表收进 CountTable 双分派（k≤64 走 u128,
+  键不外泄管线）。**U256 手写 Hash**: hi==0 快路径只喂单 limb。
+- **A/B（QM4 全量 2135 万对, 同机同参数, DN_PROFILE 分段）**: 计数段
+  stats_query_table 798→380s（−52%）, diginorm 全程 930→513s; bench 内
+  normalize 920→542s（−41%, 机器负载波动带, 低载轮 441s）。计数段已低于
+  u128 时代免拷贝优化后的 410s。
+- **等价性**: u128/KmerId 计数多重集等价测试（k=15..64 × ds 双路）;
+  dev1 强制双分支全同; QM4 同二进制双跑（dev1+QM4）全产物逐字节一致;
+  主产物（.normalized fq）before/after 逐字节一致。（注: A/B 时曾报 norm.fq
+  DIFF, 与"norm.fq 是长名文件硬链接"不变量矛盾, 复跑不可再现, 判对拍假象。）
+- **auto 顶 k 钳制 AUTO_K_CAP=63**: U256 放宽后 auto 对 RL=150 一度给
+  [49,73], 而 73 已实测劣于 63（[49,73] R=43.3 vs [49,63] 43.9; [29,49,73]
+  44.4 vs [29,49,63] 45.3）→ 默认钳回 63, 显式 --multi-k 不受限（[15,127]）。
+  终验 bench: auto=[49,63] R=43.9/P=51.7/F1=47.5 与基线逐位一致。
+- 测试: 666→667 全绿（新增 u128 等价 + clamp_auto_k_list）; inchworm
+  并行竞态测试为已知闪失败（同二进制 5 连跑全过, 与本改动无关）。

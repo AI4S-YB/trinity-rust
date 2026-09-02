@@ -37,11 +37,12 @@ use std::path::{Path, PathBuf};
 
 use rayon::prelude::*;
 use trinity_common::error::CommonError;
+use rustc_hash::FxHashMap;
 use trinity_common::io_util::open_maybe_gz;
-use trinity_common::kmer::get_ds_kmer_val;
+use trinity_common::kmer::{KmerId, RollingKey};
 
 use crate::counter::{CountMap, KmerCountTable};
-use crate::coverage_stats::{coverage_stats_rows, CoverageStatsRow};
+use crate::coverage_stats::{coverage_stats_rows_of, CoverageStatsRow};
 use crate::drand48::Drand48;
 use crate::nbkc::{merge_pairs, select, MergedRow, NbkcParams, StatsRow};
 use crate::read_names::{core_read_name, fq_records_to_fa, ReadType};
@@ -218,9 +219,7 @@ pub fn run(
                 )
             });
             let mut table = tl;
-            for (k2, c) in tr {
-                *table.entry(k2).or_insert(0) += c;
-            }
+            table.merge_other(tr);
             lap!("stats_query_table", __t);
             let left_rows = sorted_stats_rows(&left_fa, &table, params)?;
             let right_rows = sorted_stats_rows(&right_fa, &table, params)?;
@@ -496,16 +495,117 @@ fn revcomp_fasta_mirror(data: &[u8]) -> Vec<u8> {
 
 // ---------------------------------------------------------------- 计数（dump -L 语义）
 
+/// 归一化计数表双分派（性能分层, 2026-09-02）: k≤64 走 u128 紧凑键
+/// （24B/槽 vs KmerId 表 40B/槽, 表 footprint 缩 40%）, k>64 落 KmerId 全宽。
+/// 表只活在 diginorm 内部（计数→过滤→canonical 合并→逐 read 查表）,
+/// 键不外泄到管线其他环节。
+#[derive(PartialEq, Debug)]
+enum CountTable {
+    N(FxHashMap<u128, u32>),
+    W(CountMap),
+}
+
+impl CountTable {
+    fn build(both_fa: &[u8], params: &DigiNormParams) -> Self {
+        if params.k <= 64 {
+            CountTable::N(crate::counter::count_fasta_data_of::<u128>(
+                both_fa,
+                params.k,
+                params.ds,
+                0,
+            ))
+        } else {
+            CountTable::W(KmerCountTable::count_fasta_data_with_capacity(
+                both_fa,
+                params.k,
+                params.ds,
+                0,
+            ))
+        }
+    }
+
+    /// 同 k 构建 → 变体恒同; 跨变体合并在此为编程错误（debug_assert 兜底丢弃）。
+    fn merge_other(&mut self, other: CountTable) {
+        match (self, other) {
+            (CountTable::N(a), CountTable::N(b)) => {
+                for (k2, c) in b {
+                    *a.entry(k2).or_insert(0) += c;
+                }
+            }
+            (CountTable::W(a), CountTable::W(b)) => {
+                for (k2, c) in b {
+                    *a.entry(k2).or_insert(0) += c;
+                }
+            }
+            (this, other) => {
+                debug_assert!(false, "CountTable 变体不一致（k 约定被破坏）");
+                let _ = (this, other);
+            }
+        }
+    }
+
+    fn retain_min(&mut self, min: u32) {
+        match self {
+            CountTable::N(m) => m.retain(|_, c| *c >= min),
+            CountTable::W(m) => m.retain(|_, c| *c >= min),
+        }
+    }
+
+    fn canonical_merge_sum(self, k: usize) -> Self {
+        match self {
+            CountTable::N(m) => CountTable::N(canonical_merge_sum_of(m, k)),
+            CountTable::W(m) => CountTable::W(canonical_merge_sum_of(m, k)),
+        }
+    }
+
+    /// stats 阶段恒 DS（见模块文档）
+    fn coverage_rows(
+        &self,
+        reads_fa: &[u8],
+        k: usize,
+    ) -> Result<Vec<CoverageStatsRow>, CommonError> {
+        match self {
+            CountTable::N(m) => coverage_stats_rows_of::<u128>(reads_fa, m, k, true),
+            CountTable::W(m) => coverage_stats_rows_of::<KmerId>(reads_fa, m, k, true),
+        }
+    }
+
+    /// 测试访问器: 以全宽键查计数（u128 分支要求 hi==0, k≤64 域内恒真）
+    #[cfg(test)]
+    fn get(&self, key: &KmerId) -> Option<u32> {
+        match self {
+            CountTable::N(m) => {
+                debug_assert!(key.hi == 0);
+                m.get(&key.lo).copied()
+            }
+            CountTable::W(m) => m.get(key).copied(),
+        }
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        match self {
+            CountTable::N(m) => m.len(),
+            CountTable::W(m) => m.len(),
+        }
+    }
+
+    #[cfg(test)]
+    fn contains_key(&self, key: &KmerId) -> bool {
+        self.get(key).is_some()
+    }
+}
+
 /// stats 查表（对齐原版管道 "jellyfish count → dump -L → fastaToKmerCoverageStats 装载" 三步）:
 /// 计数 → -L 过滤 → SS 模式再做 canonical 合并求和。DS 计数的表已 canonical，合并为
 /// 恒等映射，直接原样返回（等价于只对 literal 计数表做 [`canonical_merge_sum`]）。
-/// 时序推理见 [`canonical_merge_sum`] 的注记。
-fn stats_query_table(both_fa: &[u8], params: &DigiNormParams) -> CountMap {
+/// 时序推理见 [`canonical_merge_sum_of`] 的注记。
+fn stats_query_table(both_fa: &[u8], params: &DigiNormParams) -> CountTable {
     let filtered = filtered_counts(both_fa, params);
     if params.ds {
         filtered // 已是 canonical 键（jellyfish --canonical），add_kmer 合并为恒等映射
     } else {
-        canonical_merge_sum(filtered, params.k)
+        filtered.canonical_merge_sum(params.k)
     }
 }
 
@@ -517,24 +617,29 @@ fn stats_query_table(both_fa: &[u8], params: &DigiNormParams) -> CountMap {
 /// M7-norm: 过滤用 retain 原地删（避免重建第二张表）; 预留 per-thread 槽位
 /// （count_fasta_data_with_capacity）减少生长 rehash。两者与旧路径多重集等价
 /// （KmerCountTable::count_fasta_data_with_capacity 的等价测试）。
-fn filtered_counts(both_fa: &[u8], params: &DigiNormParams) -> CountMap {
-    let mut table = KmerCountTable::count_fasta_data_with_capacity(both_fa, params.k, params.ds, 0);
-    table.retain(|_, c| *c >= params.min_kmer_cov_const);
+fn filtered_counts(both_fa: &[u8], params: &DigiNormParams) -> CountTable {
+    let mut table = CountTable::build(both_fa, params);
+    table.retain_min(params.min_kmer_cov_const);
     table
 }
 
-/// KmerCounter.cpp:476-487 add_kmer 的 DS 装载语义: 键 canonical 化（get_DS_kmer_val）
-/// 后 `_kmer_counter[kmer_val] += count` 求和——两条互补链的计数在此合并。
+/// KmerCounter.cpp:476-487 add_kmer 的 DS 装载语义: 键 canonical 化（get_DS_kmer_val
+/// 等价式 max(key, revcomp)）后 `_kmer_counter[kmer_val] += count` 求和——两条互补
+/// 链的计数在此合并。
 ///
 /// **先 -L 过滤、后合并**（时序承重）: 原版管道序是 `dump -L` 过滤计数表 → stats 工具
 /// add_kmer 求和装载。DS 下 canonical 计数就是合并后的计数（jellyfish 计数时已合并），
 /// 两种时序等价; SS 下两条链各 literal 计数 1 的 kmer 先被 dump -L 丢弃、**不参与**合并
 /// （canonical 键缺失 → 查表侧 clamp 1）; 若先合并再过滤会错得计数 2。
 /// fixtures/p1/diginorm 的 ssB1（左 1 份 + 右 2 份互补，正确 median 2）锁定该序。
-fn canonical_merge_sum(table: CountMap, k: usize) -> CountMap {
-    let mut merged: CountMap = CountMap::default();
+fn canonical_merge_sum_of<K: RollingKey>(
+    table: FxHashMap<K, u32>,
+    k: usize,
+) -> FxHashMap<K, u32> {
+    let mut merged: FxHashMap<K, u32> = FxHashMap::default();
     for (key, count) in table {
-        let canon = get_ds_kmer_val(key, k);
+        let rc = key.revcomp(k);
+        let canon = if rc > key { rc } else { key };
         *merged.entry(canon).or_insert(0) += count;
     }
     merged
@@ -554,10 +659,10 @@ fn canonical_merge_sum(table: CountMap, k: usize) -> CountMap {
 /// stats 阶段恒 DS。SS 模式的 canonical 化已在 [`stats_query_table`] 的表侧完成。
 fn sorted_stats_rows(
     reads_fa: &[u8],
-    counts: &CountMap,
+    counts: &CountTable,
     params: &DigiNormParams,
 ) -> Result<Vec<StatsRow>, CommonError> {
-    let rows = coverage_stats_rows(reads_fa, counts, params.k, true)?;
+    let rows = counts.coverage_rows(reads_fa, params.k)?;
     let mut lines = stats_lines(&rows);
     // M7-norm: 并行排序 + 并行 parse 回（行序由比较器全序决定，acc 唯一 → 结果确定）。
     lines.par_sort_by(|a, b| {
@@ -1033,12 +1138,12 @@ mod tests {
         let fa = b">a\nAAAA\n>b\nAAAA\n>c\nCCCC\n";
         let t = filtered_counts(fa, &p);
         use trinity_common::kmer::kmer_to_intval;
-        assert_eq!(t[&kmer_to_intval(b"AAAA").unwrap()], 2);
+        assert_eq!(t.get(&kmer_to_intval(b"AAAA").unwrap()).unwrap(), 2);
         assert!(!t.contains_key(&kmer_to_intval(b"CCCC").unwrap()));
         // min_kmer_cov_const=1 → 全表（"count>=1 全在表 + 查表缺失按 1"的等价路径 sanity）
         p.min_kmer_cov_const = 1;
         assert_eq!(
-            filtered_counts(fa, &p)[&kmer_to_intval(b"CCCC").unwrap()],
+            filtered_counts(fa, &p).get(&kmer_to_intval(b"CCCC").unwrap()).unwrap(),
             1
         );
     }
@@ -1060,10 +1165,10 @@ mod tests {
         let fa = b">a\nACGA\n>b\nACGA\n>c\nTCGT\n";
         let table = stats_query_table(fa, &p);
         assert_eq!(table.len(), 1);
-        assert_eq!(table[&kmer_to_intval(b"TCGT").unwrap()], 2);
+        assert_eq!(table.get(&kmer_to_intval(b"TCGT").unwrap()).unwrap(), 2);
         // 对照: dump -L 表（未合并）仍是 literal 键
         let dump = filtered_counts(fa, &p);
-        assert_eq!(dump[&kmer_to_intval(b"ACGA").unwrap()], 2);
+        assert_eq!(dump.get(&kmer_to_intval(b"ACGA").unwrap()).unwrap(), 2);
         assert!(!dump.contains_key(&kmer_to_intval(b"TCGT").unwrap()));
         // DS 路径: 表已 canonical，stats_query_table 与 filtered_counts 恒等
         let pds = DigiNormParams {
@@ -1086,7 +1191,7 @@ mod tests {
         };
         let fa = b">r\nACGA\n>r2\nACGA\n>s\nTCGT\n>s2\nTCGT\n";
         let table = stats_query_table(fa, &p);
-        assert_eq!(table[&kmer_to_intval(b"TCGT").unwrap()], 4);
+        assert_eq!(table.get(&kmer_to_intval(b"TCGT").unwrap()).unwrap(), 4);
         let rows = sorted_stats_rows(fa, &table, &p).unwrap();
         // 两 read 的全部窗口查同一 canonical 键 → median 4（buggy 版: r 命中 literal 2、
         // s 查 literal 缺失 clamp 1）

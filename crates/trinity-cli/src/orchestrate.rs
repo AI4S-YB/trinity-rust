@@ -37,9 +37,9 @@ const SR_FLAG: &str = "asm";
 // --max_memory 护栏（P1 审查 I2）
 // ---------------------------------------------------------------------------
 
-/// k-mer 哈希单条目的保守字节下限（u128 key + u32 count + 槽位开销;
-/// KmerId u64→u128 扩容（2026-08-30）后由 18 调整为 26）。
-pub const KMER_ENTRY_BYTES: u64 = 26;
+/// k-mer 哈希单条目的保守字节下限（U256 key + u32 count + 槽位开销;
+/// KmerId u64→u128→U256 扩容沿革: 18 → 26 → 42）。
+pub const KMER_ENTRY_BYTES: u64 = 42;
 
 /// 归一化 / k-mer 计数阶段的**硬护栏**估算（保守代理公式）:
 /// 输入文件需整读进内存（`input_bytes`），计数哈希按"文件量级 distinct
@@ -300,9 +300,10 @@ pub fn run_trinity(args: &TrinityArgs) -> Result<PathBuf, CommonError> {
         Some(MultiK::Auto) => {
             let rl = crate::multik::detect_read_length(args)?;
             let raw = crate::multik::rna_k_values(rl);
-            let ks = crate::multik::clamp_k_list(raw.clone());
+            let ks = crate::multik::clamp_auto_k_list(raw.clone());
             eprintln!(
-                "multi-k: auto → {ks:?}（读长 RL={rl}, 各文件前 1000 条抽样取 max 跨文件取 min; rnaSPAdes 公式 {raw:?} 经支持域钳制）"
+                "multi-k: auto → {ks:?}（读长 RL={rl}, 各文件前 1000 条抽样取 max 跨文件取 min; rnaSPAdes 公式 {raw:?} 经实测钳制 AUTO_K_CAP={} + 支持域）",
+                crate::multik::AUTO_K_CAP
             );
             ks
         }
@@ -1095,7 +1096,7 @@ mod tests {
         let g = 1024 * 1024 * 1024u64;
         let msg = memory_guard_error(g, g, "k-mer counting").expect("should error");
         assert!(msg.contains("1.2x input"), "{msg}");
-        assert!(msg.contains("distinct k-mers x 26 B"), "{msg}");
+        assert!(msg.contains("distinct k-mers x 42 B"), "{msg}");
         assert!(msg.contains("increase --max_memory"), "{msg}");
         assert!(msg.contains("k-mer counting"), "{msg}");
     }

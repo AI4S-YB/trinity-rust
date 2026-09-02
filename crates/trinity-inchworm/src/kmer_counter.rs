@@ -52,14 +52,15 @@ pub trait KmerCatalog {
     /// KC:507-533 forward 候选（count>0 过滤 + count 降序稳定排序——默认实现）
     fn get_forward_kmer_candidates(&self, kmer: KmerId) -> Vec<(KmerId, u32)> {
         let kmer_length = self.get_kmer_length();
-        // 原版 u64 公式 (kmer << (33-K)*2) >> (32-K)*2 的 u128 平移: 常数随位宽
-        // 换成 (65-K)*2 / (64-K)*2（语义 = 丢弃首碱基后整体左移一个碱基;
-        // K=64 时 <<2 >>0; K=1 时左移 128 在原版是 UB（x86 硬件按移位量 mod 位宽
+        // 原版 u64 公式 (kmer << (33-K)*2) >> (32-K)*2 的位宽平移: 常数随位宽
+        // 换成 (129-K)*2 / (128-K)*2（语义 = 丢弃首碱基后整体左移一个碱基;
+        // K=128 时 <<2 >>0; K=1 时左移 256 在原版是 UB（x86 硬件按移位量 mod 位宽
         // 回绕），wrapping_shl 的回绕语义与之相同）。
-        let prefix = kmer.wrapping_shl(((65 - kmer_length) * 2) as u32) >> ((64 - kmer_length) * 2);
+        let prefix =
+            kmer.wrapping_shl(((129 - kmer_length) * 2) as u32) >> ((128 - kmer_length) * 2);
         let mut candidates = Vec::with_capacity(4);
-        for i in 0..4 {
-            let candidate = prefix | i;
+        for i in 0..4u8 {
+            let candidate = prefix | KmerId::from(i);
             let count = self.get_kmer_count(candidate);
             if count != 0 {
                 candidates.push((candidate, count));
@@ -75,8 +76,8 @@ pub trait KmerCatalog {
         let suffix = kmer >> 2;
         let top_shift = kmer_length * 2 - 2;
         let mut candidates = Vec::with_capacity(4);
-        for i in 0..4 {
-            let candidate = (i << top_shift) | suffix;
+        for i in 0..4u8 {
+            let candidate = (KmerId::from(i) << top_shift) | suffix;
             let count = self.get_kmer_count(candidate);
             if count != 0 {
                 candidates.push((candidate, count));
@@ -260,12 +261,12 @@ mod tests {
         // 候选 = 12|i（i=0..3）→ CG(12), CA(13), CT(14), CC(15)，恰为 G,A,T,C 序
         // 语义: "AC" 分别向 3' 延伸 G/A/T/C 后取最后 2 碱基
         let mut kc = KmerCounter::new(2, false);
-        kc.add_kmer(12, 5); // CG
-        kc.add_kmer(13, 5); // CA
-        kc.add_kmer(14, 1); // CT
+        kc.add_kmer(KmerId::from(12), 5); // CG
+        kc.add_kmer(KmerId::from(13), 5); // CA
+        kc.add_kmer(KmerId::from(14), 1); // CT
                             // CC 不存在 → count 0 → 被过滤
-        let cands = kc.get_forward_kmer_candidates(7);
-        assert_eq!(cands, vec![(12, 5), (13, 5), (14, 1)]);
+        let cands = kc.get_forward_kmer_candidates(KmerId::from(7));
+        assert_eq!(cands, vec![(KmerId::from(12), 5), (KmerId::from(13), 5), (KmerId::from(14), 1)]);
         // 平局 5:5 保持 GATC 收集序（CG 的 i=0 在 CA 的 i=1 前）
         assert_eq!(kc.get_kmer_string(cands[0].0), b"CG".to_vec());
         assert_eq!(kc.get_kmer_string(cands[1].0), b"CA".to_vec());
@@ -278,13 +279,13 @@ mod tests {
         // 候选 = (i << (2*2-2)) | 1 = (i<<2)|1 → GA(1), AA(5), TA(9), CA(13)
         // 语义: "AC" 分别向 5' 前置 G/A/T/C 后取最前 2 碱基
         let mut kc = KmerCounter::new(2, false);
-        kc.add_kmer(1, 2); // GA
-        kc.add_kmer(5, 7); // AA
-        kc.add_kmer(9, 7); // TA
+        kc.add_kmer(KmerId::from(1), 2); // GA
+        kc.add_kmer(KmerId::from(5), 7); // AA
+        kc.add_kmer(KmerId::from(9), 7); // TA
                            // CA 不存在 → 过滤
-        let cands = kc.get_reverse_kmer_candidates(7);
+        let cands = kc.get_reverse_kmer_candidates(KmerId::from(7));
         // 收集序 [GA:2, AA:7, TA:7] → count 降序稳定排序: AA, TA（平局 AA 的 i=1 在 TA 的 i=2 前）, GA
-        assert_eq!(cands, vec![(5, 7), (9, 7), (1, 2)]);
+        assert_eq!(cands, vec![(KmerId::from(5), 7), (KmerId::from(9), 7), (KmerId::from(1), 2)]);
         assert_eq!(kc.get_kmer_string(cands[0].0), b"AA".to_vec());
         assert_eq!(kc.get_kmer_string(cands[1].0), b"TA".to_vec());
     }
@@ -298,9 +299,9 @@ mod tests {
         let mut kc = KmerCounter::new(2, true);
         kc.add_kmer(enc(b"CA"), 7); // canonical 13
         kc.add_kmer(enc(b"TA"), 2); // canonical 9（回文）
-        let cands = kc.get_forward_kmer_candidates(2);
+        let cands = kc.get_forward_kmer_candidates(KmerId::from(2));
         // TG(8) 查到 canonical CA 的 7；TA(9) 查到 2；TT/TC 为 0 被过滤
-        assert_eq!(cands, vec![(8, 7), (9, 2)]);
+        assert_eq!(cands, vec![(KmerId::from(8), 7), (KmerId::from(9), 2)]);
     }
 
     // ---- K=32 边界 -------------------------------------------------------
@@ -309,18 +310,18 @@ mod tests {
     fn k32_forward_boundary_no_panic() {
         // K=32: (65-32)*2 = 66，(64-32)*2 = 64 —— 等价于"弃首碱基后 <<2"（掩码写法）
         let seed = enc(&[b'A'; 32]); // 0x5555_5555_5555_5555
-        assert_eq!(seed, 0x5555_5555_5555_5555);
-        // u64 时代 seed << 2 顶 2 位（首个 A）自然掉出 64 位; u128 下不会掉——
+        assert_eq!(seed, 0x5555_5555_5555_5555u64);
+        // u64 时代 seed << 2 顶 2 位（首个 A）自然掉出 64 位; u128/U256 下不会掉——
         // 这里按实现同式的掩码推导预期值（低 62 位 <<2）
-        let prefix = (seed & ((1u128 << 62) - 1)) << 2;
-        assert_eq!(prefix, 0x5555_5555_5555_5554);
+        let prefix = (seed & KmerId::low_bits(62)) << 2;
+        assert_eq!(prefix, 0x5555_5555_5555_5554u64);
         let mut kc = KmerCounter::new(32, false);
         kc.add_kmer(prefix, 4); // A*31 + G
-        kc.add_kmer(prefix | 1, 9); // A*31 + A
-        kc.add_kmer(prefix | 2, 4); // A*31 + T
+        kc.add_kmer(prefix | KmerId::from(1), 9); // A*31 + A
+        kc.add_kmer(prefix | KmerId::from(2), 4); // A*31 + T
                                     // prefix|3（A*31+C）不存在 → 过滤
         let fwd = kc.get_forward_kmer_candidates(seed);
-        assert_eq!(fwd, vec![(prefix | 1, 9), (prefix, 4), (prefix | 2, 4)]);
+        assert_eq!(fwd, vec![(prefix | KmerId::from(1), 9), (prefix, 4), (prefix | KmerId::from(2), 4)]);
         // 平局 4:4 → GATC 序（|0 在 |2 前）
         assert_eq!(kc.get_kmer_string(fwd[1].0), vec![b'A'; 32].with_last(b'G'));
     }
@@ -333,12 +334,10 @@ mod tests {
         let mut kc = KmerCounter::new(32, false);
         kc.add_kmer(seed, 9); // A*32（前置 A）
         kc.add_kmer(suffix, 2); // G + A*31（前置 G，i=0）
-        kc.add_kmer((2u128 << 62) | suffix, 2); // T + A*31（前置 T，i=2）
+        let t_prefix = KmerId::from(2u128) << 62;
+        kc.add_kmer(t_prefix | suffix, 2); // T + A*31（前置 T，i=2）
         let rev = kc.get_reverse_kmer_candidates(seed);
-        assert_eq!(
-            rev,
-            vec![(seed, 9), (suffix, 2), ((2u128 << 62) | suffix, 2)]
-        );
+        assert_eq!(rev, vec![(seed, 9), (suffix, 2), (t_prefix | suffix, 2)]);
         // 平局 2:2 → GATC 序（前置 G 在前置 T 前）
         let mut expected = vec![b'G'];
         expected.extend(vec![b'A'; 31]);
@@ -396,9 +395,9 @@ mod tests {
     #[test]
     fn add_accumulates_and_wraps() {
         let mut kc = KmerCounter::new(2, false);
-        kc.add_kmer(7, u32::MAX);
-        kc.add_kmer(7, 1); // 原版 unsigned int += 溢出回绕 → 0
-        assert_eq!(kc.get_kmer_count(7), 0);
+        kc.add_kmer(KmerId::from(7), u32::MAX);
+        kc.add_kmer(KmerId::from(7), 1); // 原版 unsigned int += 溢出回绕 → 0
+        assert_eq!(kc.get_kmer_count(KmerId::from(7)), 0);
         assert_eq!(kc.size(), 1); // 回绕后键仍占位
     }
 
@@ -407,14 +406,14 @@ mod tests {
     #[test]
     fn clear_kmer_is_lazy_and_size_stable() {
         let mut kc = KmerCounter::new(2, false);
-        kc.add_kmer(7, 3);
+        kc.add_kmer(KmerId::from(7), 3);
         // 不存在的键: KC:428 find==end → 什么都不做（不插入！）
-        kc.clear_kmer(9);
+        kc.clear_kmer(KmerId::from(9));
         assert_eq!(kc.size(), 1);
-        assert_eq!(kc.get_kmer_count(9), 0);
+        assert_eq!(kc.get_kmer_count(KmerId::from(9)), 0);
         // 存在的键: 置 0，size 不变（不 erase）
-        kc.clear_kmer(7);
-        assert_eq!(kc.get_kmer_count(7), 0);
+        kc.clear_kmer(KmerId::from(7));
+        assert_eq!(kc.get_kmer_count(KmerId::from(7)), 0);
         assert_eq!(kc.size(), 1);
         assert_eq!(kc.iter_nonzero().count(), 0);
     }
@@ -422,14 +421,14 @@ mod tests {
     #[test]
     fn iter_nonzero_skips_zero_counts() {
         let mut kc = KmerCounter::new(2, false);
-        kc.add_kmer(7, 3);
-        kc.add_kmer(9, 0); // add 0 → 键存在值为 0
-        kc.add_kmer(12, 2);
-        kc.clear_kmer(12); // 置 0 后不再出现
-        kc.add_kmer(13, 1);
+        kc.add_kmer(KmerId::from(7), 3);
+        kc.add_kmer(KmerId::from(9), 0); // add 0 → 键存在值为 0
+        kc.add_kmer(KmerId::from(12), 2);
+        kc.clear_kmer(KmerId::from(12)); // 置 0 后不再出现
+        kc.add_kmer(KmerId::from(13), 1);
         let mut v: Vec<_> = kc.iter_nonzero().collect();
         v.sort_unstable();
-        assert_eq!(v, vec![(7, 3), (13, 1)]);
+        assert_eq!(v, vec![(KmerId::from(7), 3), (KmerId::from(13), 1)]);
         assert_eq!(kc.size(), 4); // 7, 9, 12, 13 全部在表（含 0 值）
     }
 
@@ -451,20 +450,20 @@ mod tests {
     #[test]
     fn iter_all_includes_zero_counts() {
         let mut kc = KmerCounter::new(2, false);
-        kc.add_kmer(7, 3);
-        kc.add_kmer(9, 0);
-        kc.clear_kmer(7);
+        kc.add_kmer(KmerId::from(7), 3);
+        kc.add_kmer(KmerId::from(9), 0);
+        kc.clear_kmer(KmerId::from(7));
         assert_eq!(kc.size(), 2);
         let mut v: Vec<_> = kc.iter_all().collect();
         v.sort_unstable();
-        assert_eq!(v, vec![(7, 0), (9, 0)]); // 含 0 值键
+        assert_eq!(v, vec![(KmerId::from(7), 0), (KmerId::from(9), 0)]); // 含 0 值键
         assert_eq!(kc.iter_nonzero().count(), 0);
     }
 
     #[test]
-    #[should_panic(expected = "Kmer length exceeds max of 64")]
-    fn kmer_length_over_64_rejected() {
-        // u128 上限 64: 65 拒绝（原 u64 时代 33 即拒）
-        let _ = KmerCounter::new(65, false);
+    #[should_panic(expected = "Kmer length exceeds max of 128")]
+    fn kmer_length_over_128_rejected() {
+        // U256 上限 128: 129 拒绝（u64 时代 33 / u128 时代 65 即拒）
+        let _ = KmerCounter::new(129, false);
     }
 }

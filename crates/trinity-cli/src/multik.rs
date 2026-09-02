@@ -20,14 +20,28 @@ use crate::args::{SeqType, TrinityArgs};
 pub const RNA_MIN_K: usize = 29;
 /// rnaSPAdes RNA_MAX_LOWER_K（options_storage.py:78）。
 pub const RNA_MAX_LOWER_K: usize = 55;
-/// `--multi-k` 合法下界（KmerId 位宽上限见上界 MAX_KMER_LENGTH=64）。
+/// `--multi-k` 合法下界（KmerId 位宽上限见上界 MAX_KMER_LENGTH=128）。
 pub const MULTI_K_MIN: usize = 15;
-/// `--multi-k` 合法上界: 63 = MAX_KMER_LENGTH(64) - 1（KmerId=u128 / 2bit,
-/// 2026-08-30 扩容后由 32 放宽）。保守留 1 碱基余量: k=64 物理可编码
-/// （编码层 MAX_KMER_LENGTH 允许）, 但 CLI 支持域取 63——让 `(1 << 2k)` 族
-/// 表达式恒落在位宽内（2k ≤ 126）, 不依赖满宽边界的自限回绕。
-/// rnaSPAdes 公式域内已覆盖 RL=76 的 [29,37] 原值。
+/// `--multi-k` 合法上界: 127 = MAX_KMER_LENGTH(128) - 1（KmerId=U256 / 2bit,
+/// 2026-09-02 扩容后由 63 放宽, 对齐 SPAdes MAX_K=127）。保守留 1 碱基余量:
+/// k=128 物理可编码（编码层 MAX_KMER_LENGTH 允许）, 但 CLI 支持域取 127——
+/// 让 `(1 << 2k)` 族表达式恒落在位宽内（2k ≤ 254）, 不依赖满宽边界的自限回绕。
+/// rnaSPAdes 公式域内 RL=150 的 [49,73] 与 RL=250 的 [55,123] 均原值落地。
 pub const MULTI_K_MAX: usize = MAX_KMER_LENGTH - 1;
+
+/// auto 模式的顶 k 钳制（默认不回退护栏, 2026-09-02）: RL=150 的公式值
+/// upper_k=73 在 QM4 实测**劣于** 63——[29,49,73] R=44.4% vs [29,49,63]
+/// R=45.3%（−0.9pp, 超波动带）, [49,73] R=43.3% vs [49,63] R=43.9%（−0.6pp）。
+/// 机制: kmer 深度 ∝ (RL−k+1), 大 k 对低表达尾巴的断图损失 > 解纠缠收益
+/// （rnaSPAdes 公式的迭代简化假设与我们 trusted 注入 + 末轮完整管线的架构
+/// 不共享）。长读（RL≥200）公式值 [55,123] 未实测, 默认同样钳到 63;
+/// 显式 `--multi-k` 列表不受此限（支持域 [15,127]）。
+pub const AUTO_K_CAP: usize = 63;
+
+/// auto 公式的实测钳制: 各公式值 min AUTO_K_CAP 后走支持域钳制。
+pub fn clamp_auto_k_list(ks: Vec<usize>) -> Vec<usize> {
+    clamp_k_list(ks.into_iter().map(|k| k.min(AUTO_K_CAP)).collect())
+}
 
 /// rnaSPAdes auto k 公式（spades_stage.py `rna_k_values` 直译）:
 /// - `upper_k = int(RL/2) - 1`
@@ -35,9 +49,9 @@ pub const MULTI_K_MAX: usize = MAX_KMER_LENGTH - 1;
 /// - 两者均向下取奇（偶则 -1）
 /// - `upper_k <= lower_k` 时单 k = `[upper_k]`, 否则 `[lower_k, upper_k]`
 ///
-/// 忠实保留公式原值——可能超出本实现支持域 [15, 63]（如 RL=250 → [55,123]）,
+/// 忠实保留公式原值——可能超出本实现支持域 [15, 127]（如 RL=300 → [55,149]）,
 /// 支持域钳制归 [`clamp_k_list`]（对应 SPAdes 公式内的 MAX_K=127 钳制步骤,
-/// 我们的位宽上限经 u128 扩容后为 63）。u64 时代的 [29,37]→[29,32] 钳制已解除。
+/// 我们的位宽上限经 U256 扩容后为 127）。u64 时代的 [29,37]→[29,32] 钳制已解除。
 pub fn rna_k_values(rl: usize) -> Vec<usize> {
     // int(RL/2) - 1: usize 除法即截断（正数 = floor）; saturating 防极小 RL 下溢
     let mut upper_k = (rl / 2).saturating_sub(1);
@@ -58,8 +72,8 @@ pub fn rna_k_values(rl: usize) -> Vec<usize> {
 
 /// 公式值 → 支持域 [MULTI_K_MIN, MULTI_K_MAX] 钳制 + 保序去重。
 /// 输入递升 → 钳制后仍递升（可能出相邻重复）, `dedup` 收敛; 结果恒非空。
-/// 例: RL=76 公式 [29,37] → **原值落地**（u128 扩容后不再钳）;
-/// RL=150 公式 [49,73] → [49,63]; RL=250 [55,123] → [55,63]。
+/// 例: RL=76 公式 [29,37] 原值落地; RL=150 公式 [49,73] **U256 扩容后原值
+/// 落地**（u128 时代被钳到 [49,63]）; RL=250 [55,123] 同样原值落地。
 pub fn clamp_k_list(ks: Vec<usize>) -> Vec<usize> {
     let mut out: Vec<usize> = ks
         .into_iter()
@@ -149,18 +163,29 @@ mod tests {
 
     #[test]
     fn clamp_k_list_to_supported_domain() {
-        // u128 扩容（[15,63]）: RL=76 的公式值 [29,37] 原值落地, 不再被钳
+        // U256 扩容（[15,127]）: RL=76/150/250 的公式值全部原值落地, 不再被钳
         assert_eq!(clamp_k_list(vec![29, 37]), vec![29, 37]);
-        // RL=150: [49,73] → 73 超支持域上限 → 钳到 63
-        assert_eq!(clamp_k_list(vec![49, 73]), vec![49, 63]);
-        // 双双触顶去重成单 k（RL=250: [55,123] → [55,63] 不触顶去重;
-        // 构造双侧触顶: [70,80] → [63]）
-        assert_eq!(clamp_k_list(vec![70, 80]), vec![63]);
+        assert_eq!(clamp_k_list(vec![49, 73]), vec![49, 73]);
+        assert_eq!(clamp_k_list(vec![55, 123]), vec![55, 123]);
+        // 双侧触顶去重成单 k（构造超出 [15,127]: [130,140] → [127]）
+        assert_eq!(clamp_k_list(vec![130, 140]), vec![127]);
         // 下界: 公式给出 <15 的（短读长）→ 钳到 15
         assert_eq!(clamp_k_list(vec![11]), vec![15]);
-        // 域内不变（含新边界 63 与旧上界 32 以上区域）
+        // 域内不变（含旧上界 63 以上区域与新上界 127）
         assert_eq!(clamp_k_list(vec![21, 25]), vec![21, 25]);
         assert_eq!(clamp_k_list(vec![29, 55, 63]), vec![29, 55, 63]);
+        assert_eq!(clamp_k_list(vec![29, 49, 73]), vec![29, 49, 73]);
+    }
+
+    /// auto 实测钳制: 公式值超 AUTO_K_CAP 的部分压到 63（RL=150 → [49,63];
+    /// RL=250 [55,123] → [55,63]）; ≤63 的公式值（RL=76 [29,37]）原值落地;
+    /// 双双压到 63 时去重成单 k。
+    #[test]
+    fn clamp_auto_k_list_caps_top() {
+        assert_eq!(clamp_auto_k_list(vec![49, 73]), vec![49, 63]);
+        assert_eq!(clamp_auto_k_list(vec![29, 37]), vec![29, 37]);
+        assert_eq!(clamp_auto_k_list(vec![55, 123]), vec![55, 63]);
+        assert_eq!(clamp_auto_k_list(vec![73, 123]), vec![63]);
     }
 
     fn write(p: &Path, bytes: &[u8]) {

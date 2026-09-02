@@ -1140,7 +1140,7 @@ fn parallel_assemble_seed(
 /// 调用方随后自查 get_kmer_count(new_seed)==0 的 zapped 分支，IRKE.cpp:552-556）。
 pub fn extract_best_seed<C: KmerCatalog>(path: &[KmerId], counter: &C, p: &IrkeParams) -> KmerId {
     let mut best_kmer_count: u32 = 0;
-    let mut best_seed: KmerId = 0;
+    let mut best_seed: KmerId = KmerId::ZERO;
 
     for &kmer in path {
         let count = counter.get_kmer_count(kmer);
@@ -1349,14 +1349,14 @@ mod tests {
     fn prune_min_count_strict_less() {
         // count == min_count 不剪（严格 <）；count < min 即时置 0
         let mut kc = KmerCounter::new(2, false);
-        kc.add_kmer(7, 5);
-        kc.add_kmer(12, 1);
-        kc.add_kmer(13, 2); // 恰好等于 min_count → 保留
+        kc.add_kmer(KmerId::from(7), 5);
+        kc.add_kmer(KmerId::from(12), 1);
+        kc.add_kmer(KmerId::from(13), 2); // 恰好等于 min_count → 保留
         let pruned = prune_some_kmers(&mut kc, 2, 0.0, false, 0.0);
         assert_eq!(pruned, 1);
-        assert_eq!(kc.get_kmer_count(12), 0);
-        assert_eq!(kc.get_kmer_count(7), 5);
-        assert_eq!(kc.get_kmer_count(13), 2);
+        assert_eq!(kc.get_kmer_count(KmerId::from(12)), 0);
+        assert_eq!(kc.get_kmer_count(KmerId::from(7)), 5);
+        assert_eq!(kc.get_kmer_count(KmerId::from(13)), 2);
         assert_eq!(kc.size(), 3); // 惰性删除: 键仍占位
     }
 
@@ -1438,11 +1438,11 @@ mod tests {
     fn prune_second_pass_zero_keys_not_reprocessed() {
         // 已置 0 的键在下一趟跳过（count==0 continue）→ 返回 0
         let mut kc = KmerCounter::new(2, false);
-        kc.add_kmer(7, 5);
-        kc.add_kmer(12, 1);
+        kc.add_kmer(KmerId::from(7), 5);
+        kc.add_kmer(KmerId::from(12), 1);
         assert_eq!(prune_some_kmers(&mut kc, 2, 0.0, false, 0.0), 1);
         assert_eq!(prune_some_kmers(&mut kc, 2, 0.0, false, 0.0), 0);
-        assert_eq!(kc.get_kmer_count(12), 0);
+        assert_eq!(kc.get_kmer_count(KmerId::from(12)), 0);
     }
 
     // ---- sorted_seed_list ---------------------------------------------------
@@ -1451,21 +1451,21 @@ mod tests {
     fn seed_list_sorted_count_desc_kmer_value_desc_tiebreak() {
         // 7:5 与 12:5 平局 → kmer 值降序（12 在前）; 13:9 最前
         let mut kc = KmerCounter::new(2, false);
-        kc.add_kmer(7, 5);
-        kc.add_kmer(12, 5);
-        kc.add_kmer(13, 9);
-        assert_eq!(sorted_seed_list(&kc, true), vec![(13, 9), (12, 5), (7, 5)]);
+        kc.add_kmer(KmerId::from(7), 5);
+        kc.add_kmer(KmerId::from(12), 5);
+        kc.add_kmer(KmerId::from(13), 9);
+        assert_eq!(sorted_seed_list(&kc, true), vec![(KmerId::from(13), 9), (KmerId::from(12), 5), (KmerId::from(7), 5)]);
     }
 
     #[test]
     fn seed_list_excludes_zero_counts() {
         let mut kc = KmerCounter::new(2, false);
-        kc.add_kmer(7, 5);
-        kc.add_kmer(12, 3);
-        kc.clear_kmer(12); // 惰性删除: 键在表中但 count=0
+        kc.add_kmer(KmerId::from(7), 5);
+        kc.add_kmer(KmerId::from(12), 3);
+        kc.clear_kmer(KmerId::from(12)); // 惰性删除: 键在表中但 count=0
         assert_eq!(kc.size(), 2);
-        assert_eq!(sorted_seed_list(&kc, true), vec![(7, 5)]);
-        assert_eq!(sorted_seed_list(&kc, false), vec![(7, 5)]);
+        assert_eq!(sorted_seed_list(&kc, true), vec![(KmerId::from(7), 5)]);
+        assert_eq!(sorted_seed_list(&kc, false), vec![(KmerId::from(7), 5)]);
     }
 
     #[test]
@@ -1473,9 +1473,9 @@ mod tests {
         // sort=false（PARALLEL）: 保持容器迭代序 = iter_nonzero 快照
         let mut kc = KmerCounter::new(4, false);
         for i in 0..8 {
-            kc.add_kmer(100 + i as KmerId, (i % 3) as u32 + 1);
+            kc.add_kmer(KmerId::from(100 + i), (i % 3) as u32 + 1);
         }
-        kc.clear_kmer(103);
+        kc.clear_kmer(KmerId::from(103));
         let snapshot: Vec<(KmerId, u32)> = kc.iter_nonzero().collect();
         let unsorted = sorted_seed_list(&kc, false);
         assert_eq!(unsorted, snapshot);
@@ -1812,7 +1812,7 @@ mod tests {
         };
         // 回文: "AT" K=2 → 6, revcomp(6) = 6（精确等值）
         assert_eq!(enc(b"AT"), 6);
-        assert_eq!(revcomp_val(6, 2), 6);
+        assert_eq!(revcomp_val(KmerId::from(6), 2), 6);
         assert!(!is_good_seed_kmer(&kc2, enc(b"AT"), 5, &loose));
         // K=4 回文 "ACGT"（熵 2.0 也拦）
         assert_eq!(revcomp_val(enc(b"ACGT"), 4), enc(b"ACGT"));
@@ -2372,10 +2372,10 @@ mod tests {
             kc.add_kmer(enc(b"CG"), 1);
             kc.add_kmer(enc(b"GT"), 1);
             // count=1 干扰键撑过 chunk 边界（避开 K=2 低值区防与链撞键）
-            let mut i: KmerId = 0;
+            let mut i: u32 = 0;
             while kc.size() < 1200 {
                 if !matches!(i, 0..=15) {
-                    kc.add_kmer(1u128 << 40 | i, 1);
+                    kc.add_kmer(KmerId::from(1u128 << 40) | KmerId::from(i), 1);
                 }
                 i += 1;
             }
