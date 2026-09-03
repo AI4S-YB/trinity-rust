@@ -8,3 +8,6 @@ trinity-common = { path = "../trinity-common" }
 rustc-hash = { workspace = true }
 thiserror = { workspace = true }
 mimalloc = { workspace = true }
+
+[dev-dependencies]
+rayon = { workspace = true }

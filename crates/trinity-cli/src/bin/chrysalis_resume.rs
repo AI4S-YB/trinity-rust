@@ -94,6 +94,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             gtasm_bulge_dual: false,
             gtasm_pair_support: false,
             no_path_merging,
+            min_read_support: 2,
         },
     )?;
     let n = harvest(&listing, 200, Path::new(&out))?;

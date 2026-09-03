@@ -2557,3 +2557,80 @@ funnel_audit / miss_attribution / bfly_autopsy / frag_bridge_v2 等
   R 仅 +0.1）——去冗余删的路径在 76bp 模拟图上是噪声、在 150bp 真实图上
   是真 isoform, **数据依赖强, 不转正**, 保持实验旗标。自适应（按 read
   长度/图复杂度调节去冗余阈值）留作后续课题。
+
+## threading 桥接排查: 断图档证伪——B4_partial 死因统一聚焦 POG/搜索层（2026-09-03）
+
+**排查链**（探针 examples/split_bridge_probe + 评估侧 frag_severity/b4_kmer_adj/
+bridge_pair_check/cross_member_jumps）:
+1. threading 只在图 successors 边上延伸; POG overlap 是节点 id 级;
+   跨 X 口输出的机制 = read path（含 PE pair path 拼接）经 POG 展开建边——
+   全链**没有独立的"图桥接"步骤**。
+2. QM4 输出实测 530,791 个跨成员相邻对（18,371/26,928 多成员组件 = 68%）——
+   跨口输出大量存在（read path 跨口即出）。
+3. **断图档证伪**: 886"断图"tx 里 844（95%）主根占比>90% 且孤节点 ≤2——
+   伪断（tx 的 1-2 个错误/散在 kmer 落在图外孤节点）; semi_frag 仅 1、
+   true_frag 0。**B4_partial 2,131 条 99.95% 图连通**。
+   （教训: roots>=2 的集合判据对孤 kmer 噪声不鲁棒, 需主根占比分层。）
+4. 179"桥 read 在没桥成"组件: 178 个无 PE pair 横跨（两半锚不同分量）;
+   抽样 comp 1960: 图连通（剪枝后仅 5 节点）但组件 reads 仅 8 条、
+   read path 仅 3 种——**read 供给/read path 覆盖不足才是该档真死因**,
+   非穿线拒绝。
+5. probe 实证穿线路径 [426,895,540] 合法跨"断口"（prev 边传递闭包连通）。
+
+**修正后的 B4_partial 死因结构**: 图连通但输出未覆盖 = read path 覆盖缺失
+（RTT 供给/POG containment）+ 路径搜索层（triplet 锁定/PRD=25/25 上限/
+去冗余）。"threading 跨口桥接"修复方向**证伪**（图不断, 无需桥）。
+
+下一步: 大样本 dump read paths vs tx 期望路径, 分层"read path 缺失 vs
+搜索没走"; read 供给缺失（如 comp 1960 仅 8 reads）追 RTT/diginorm 层。
+
+## search 档 POG 命运定位: 贯通 read path 95% 成孤立节点（2026-09-03）
+
+批量探针（examples/batch_readpaths + batch_pogprobe, 1392 组件零失败）把
+B4_partial 2,131 条按 read path 覆盖分层:
+- fragment_readpath 1,578（74%）: 碎片齐（union>=0.9）无单条贯通——POG 拼接
+  力/数据物理限制（150bp read vs 长差异区）
+- search_layer 542（25%）: 有贯通 read path（>=0.8）且支持充分
+  （PRD 单 read 门槛假设排除: med 单 read 节点占比 0.00）
+- missing_readpath 11（0.5%）: read 供给基本不是问题
+
+**search 档 542 的 POG 命运**（batch_pogprobe: 非包含集/containment/
+overlap 边/破环删除）:
+- pog_node 497（92%）: 贯通 path 成功进入非包含路径集
+  - **isolated_no_overlap 474（95%）: 孤立——零 overlap 边**（连破环删的
+    边都没有, 根本没建出边）。机制: 碎片被贯通 path containment 吃掉,
+    剩余路径（其他 isoform 等）与它无"pathB 前缀=pathA 后缀"关系。
+  - has_live_edges 23
+- contained_by_longer 34 / 未入集 11
+
+死点收窄: POG 展开成 SeqVertex 后, 孤立链分量在 convert/zip/
+reorganize/分量 reads 判定（comp_reads.is_empty continue, paths.rs:1087）/
+路径搜索的链条内消失。原版 v2.15.2 的 PE pair POG 边是死代码
+（add_pair_paths_to_overlap_graph if(true)return）, POG 边全靠单端 overlap。
+
+修复方向候选: 孤立 POG 节点（入=出=0 的长路径）直接保送输出层;
+或 containment 后对孤立节点补图边拼接。
+
+## bp 级修正: B4_partial 责任分层终判（2026-09-03, batch_iso_trace + iso_search_probe）
+
+**节点级判定的粒度失真**: 合并图节点是粗粒度大节点, 节点覆盖 >=0.8 !=
+碱基覆盖。实证: comp 29451"孤立链"实际被完整输出（c29451_g1_i1 206bp）,
+但其 tx 主体 1000bp+ 根本不在图里——read path 穿过 tx 命中的 2-3 个粗
+节点给出"贯通"假象。前节 474 孤立链/911 分量通过等结论受此污染。
+
+**bp 级重判（tx kmer 位置命中 best-comp 图的比例）**:
+- graph_bp_cov>=0.9: 381（18%）——图含 tx 主体, 输出没出 → **真 butterfly 责任**
+- 0.5-0.9: 1,120 / 0.3-0.5: 552 / <0.3: 78——图只覆盖 tx 30-90%,
+  缺失主体在图外 → **前期构图层（inchworm/weld/聚类割裂）**
+
+**3,487 缺失 tx 的最终责任分层**:
+- E1 输出>=0.9: 969（蛋白/ORF 层）
+- 前期构图层（图外缺失）: ~2,050+（A 328 + B4 的 78%）—— **大头**
+- butterfly 层（图>=0.9 没输出）: **381（11%）**——含搜索/过滤/去冗余/
+  POG 各层, 需 bp 化重做死因分析
+
+旧"57% 进图未输出"口径（paf 对齐块）把部分对齐当进图, 高估了 butterfly
+责任。下一战役: ① 381 档 bp 化死因; ② 前期构图层（weld 聚类割裂——
+comp 9 型: 断口侧序列在别的组件; bundle 只覆盖 tx 一半的成因）。
+探针资产: batch_readpaths / batch_pogprobe / batch_iso_trace /
+iso_search_probe（crates/trinity-butterfly/examples/）。

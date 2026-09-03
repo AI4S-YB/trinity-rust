@@ -211,6 +211,7 @@ fn butterfly_pool_isolates_failures() {
             gtasm_bulge_dual: false,
             gtasm_pair_support: false,
             no_path_merging: false,
+            min_read_support: 2,
         },
     )
     .unwrap_err();

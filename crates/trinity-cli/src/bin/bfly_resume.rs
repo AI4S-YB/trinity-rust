@@ -20,11 +20,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let iter_dir = PathBuf::from(args.remove(0));
     let mut no_path_merging = false;
     let mut cpu = 32usize;
+    let mut min_read_support = 2i64;
+    let mut min_contig_length = 200usize;
     let mut out = iter_dir.join("bfly_resume.Trinity.fasta");
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
             "--no-path-merging" => no_path_merging = true,
+            "--min-read-support" | "-R" => {
+                i += 1;
+                min_read_support = args[i].parse()?;
+            }
+            "--min-contig-length" | "-L" => {
+                i += 1;
+                min_contig_length = args[i].parse()?;
+            }
             "--cpu" => {
                 i += 1;
                 cpu = args[i].parse()?;
@@ -66,7 +76,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &iter_dir,
         &ButterflyPoolParams {
             cpu,
-            min_contig_length: 200,
+            min_contig_length,
             group_pairs_distance: 500,
             stack_size_mb: 256,
             path_engine: PathEngine::Classic,
@@ -75,9 +85,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             gtasm_bulge_dual: false,
             gtasm_pair_support: false,
             no_path_merging,
+            min_read_support,
         },
     )?;
-    let n = harvest(&listing, 200, Path::new(&out))?;
+    let n = harvest(&listing, min_contig_length, Path::new(&out))?;
     eprintln!("bfly-resume: harvested {n} transcripts -> {}", out.display());
     Ok(())
 }

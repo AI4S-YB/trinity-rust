@@ -340,6 +340,7 @@ name = "trinity-butterfly"
 version = "0.3.0"
 dependencies = [
  "mimalloc",
+ "rayon",
  "rustc-hash",
  "thiserror",
  "trinity-common",

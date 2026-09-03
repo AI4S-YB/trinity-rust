@@ -71,6 +71,9 @@ pub struct ButterflyPoolParams {
     /// 跳过两处 twoPathsAreTooSimilar 去冗余; 默认关 = 原版语义）。
     /// 实验旗标: QM4 缺失解剖显示 1,245 条缺失转录本死在搜索/去冗余层。
     pub no_path_merging: bool,
+    /// `-R`：最小 read 支持（默认 2 = 原版）。实验: 381 档死因之一——
+    /// 低 read 分量分叉处 support<2 全拒（QM4 案例验证 R=1 可救）。
+    pub min_read_support: i64,
 }
 
 /// 原版 butterfly 命令实参（L2363-2388）:
@@ -91,6 +94,7 @@ fn component_params(base: &Path, p: &ButterflyPoolParams) -> ComponentParams {
             .unwrap_or_else(|| "component".to_string()),
         stack_size: p.stack_size_mb.saturating_mul(1024 * 1024),
         no_path_merging: p.no_path_merging,
+        min_read_support: p.min_read_support,
         ..Default::default()
     }
 }

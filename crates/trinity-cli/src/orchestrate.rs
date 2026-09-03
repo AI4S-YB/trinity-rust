@@ -640,6 +640,7 @@ pub fn run_trinity(args: &TrinityArgs) -> Result<PathBuf, CommonError> {
                         gtasm_bulge_dual: args.gtasm_bulge_dual,
                         gtasm_pair_support: args.gtasm_pair_support,
                         no_path_merging: args.bfly_no_path_merging,
+                        min_read_support: 2,
                     },
                 )
             },
