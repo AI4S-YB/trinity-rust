@@ -67,6 +67,10 @@ pub struct ButterflyPoolParams {
     /// gtasm 解码的 read pair 分支证据乘性消费（--gtasm-pair-support 开;
     /// 默认关）。仅 gtasm 引擎消费。
     pub gtasm_pair_support: bool,
+    /// classic 引擎的 cd-hit 式去冗余开关（--bfly-no-path-merging 开 =
+    /// 跳过两处 twoPathsAreTooSimilar 去冗余; 默认关 = 原版语义）。
+    /// 实验旗标: QM4 缺失解剖显示 1,245 条缺失转录本死在搜索/去冗余层。
+    pub no_path_merging: bool,
 }
 
 /// 原版 butterfly 命令实参（L2363-2388）:
@@ -86,6 +90,7 @@ fn component_params(base: &Path, p: &ButterflyPoolParams) -> ComponentParams {
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| "component".to_string()),
         stack_size: p.stack_size_mb.saturating_mul(1024 * 1024),
+        no_path_merging: p.no_path_merging,
         ..Default::default()
     }
 }

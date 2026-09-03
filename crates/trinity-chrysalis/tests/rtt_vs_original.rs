@@ -33,6 +33,7 @@ fn rtt_matches_original_on_real_bundle() {
             min_kmer_entropy: 1.5,
             max_mem_reads: usize::MAX,
             threads: 4,
+            multi_kmer: false,
         },
     )
     .unwrap();

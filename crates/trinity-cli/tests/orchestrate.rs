@@ -210,6 +210,7 @@ fn butterfly_pool_isolates_failures() {
             gtasm_visited_walk: true,
             gtasm_bulge_dual: false,
             gtasm_pair_support: false,
+            no_path_merging: false,
         },
     )
     .unwrap_err();

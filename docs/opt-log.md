@@ -2493,3 +2493,67 @@ oracle 的 +4.9pp 覆盖未兑现——桥判据对 oracle 全量的三重折损
 处置: v2 工程保留（--stitch 默认关, 7 单测全绿, dev1 无回退）; 端部截断
 的剩余 oracle 空间留给"≥200 图/蝶丢失档"的深挖（57% 大头, 需进 Chrysalis
 /Bfly 内部——下一战役级工程）。
+
+## Chrysalis/Bfly 丢失档深挖 + RTT multi-kmer + butterfly 去冗余实验（2026-09-03, resume 于 iter_k63 中间产物）
+
+**丢失档解剖（57% 档的再归因, 3,487 条缺失 tx 口径）**: E1 输出 cov≥0.9（纯
+蛋白/ORF 层）969 / A 无 bundle 覆盖（前期）328 / **B4_partial 2,131 = 大头**。
+组件级出局几乎不含金——bundle 52,061 → listing 50,232 的 1,829 丢失中
+A2 无 read 1,661 + A1 partition 长度闸 168, 零路径组件 2,433, 合计只沾
+~62 条缺失 tx。B4_partial = 序列在组件 bundle 里、组件有输出、但输出路径
+只覆盖 tx 的一部分。
+
+**B4_partial 死因（2131 条）**: 图断 886（41.6%）+ 连通未走 1,245（58.4%）。
+- 图断: bundle 成员 X 口天然无边, 跨口桥靠 butterfly threading 的 read
+  穿线——这些组件**一条输出路径都没跨过断口**。桥证据检测: 179 组件横跨
+  read 在（同一条 read 含断口两侧）但 threading 没桥成; ~323 组件 read
+  供给缺失——**12 断口抽样 5 个在 diginorm 数据里有 4-70 条单 read 横跨**,
+  机制锁定 RTT: build_kmer_index 共享 25-mer 后写者赢（单组件）, 跨口 read
+  另一侧被其他组件抢占 → pct<50 整条丢弃（67% 断口 tx 在其他组件也有
+  bundle 对齐块, 佐证共享普遍）; 另有聚类割裂型（断口侧序列在其他组件,
+  multi-kmer 不可救, 需 weld/bubble-up 层）。
+- 连通未走: 边权不低（排除 remove_light/avgCov 剪枝）, 死在 POG/搜索层。
+
+**实验一 --bfly-no-path-merging（跳过两处 cd-hit 式去冗余, 143s 重跑）**:
+n 117,879→226,292（翻倍）, R 43.9→**46.3（+2.4pp）**, P 51.7→51.6, F1
+47.5→**48.8**, N50 1784→2165。**原版 twoPathsAreTooSimilar 删掉的一半路径
+基本是真 isoform**。但缺失 tx 只召回 26 条——去冗余不是 B4 档死因。
+
+**实验二 --rtt-multi-kmer（25-mer 索引多值化: 主表首写者赢+冲突副表记
+全部组件; 默认关=原版逐字节, 对拍单测保持）**: listing 50,232→50,462
+（230 个原无 read 组件拿到 read）, n→118,441, R 43.9→**44.2（+0.3pp）**,
+P −0.2。**缺失 tx 召回 99 条**（+150 partial）——与解剖预期一致
+（neither_side 可救比例 ~25%）。耗时: RTT 91→120s, quantify 39→311s
+（组件 reads 变多, 穿线变重）。
+
+**组合（rttmk 图 + no-path-merging）**: R=**46.6**（+2.7pp）, P=51.3,
+F1=**48.8**, n=228,243, 缺失召回 111 + partial 180。两改动近似独立叠加。
+
+工具沉淀: bfly_resume / chrysalis_resume 两个一次性实验 bin（对既有 run
+目录只重跑 butterfly / chrysalis 后半段+harvest, 不碰原产物）; 评估侧
+funnel_audit / miss_attribution / bfly_autopsy / frag_bridge_v2 等
+（test_data/work/eval/, 仓库外资产）。全 workspace 测试绿（含 RTT 对拍）。
+下一步候选: threading 跨口桥接排查（179 组件）/ POG 搜索层 1,245 档 /
+两个旗标的 dev1 泛化验证。
+| 2026-09-03 | dev1-mk-base | R=15.4% P=80.7% **F1=25.8%** | N50=1878 n=8522 | --CPU 32 --max_memory 32G |
+| 2026-09-03 | dev1-mk-combo | R=15.5% P=66.0% **F1=25.1%** | N50=2145 n=10683 | --CPU 32 --max_memory 32G --rtt-multi-kmer --bfly-no-path-merging |
+| 2026-09-03 | dev1-rttmk | R=15.4% P=80.7% **F1=25.9%** | N50=1877 n=8523 | --CPU 32 --max_memory 32G --rtt-multi-kmer |
+| 2026-09-03 | dev3-mk-base | R=13.8% P=79.4% **F1=23.5%** | N50=1897 n=6978 | --CPU 32 --max_memory 32G |
+| 2026-09-03 | dev3-rttmk | R=13.8% P=79.4% **F1=23.4%** | N50=1902 n=6991 | --CPU 32 --max_memory 32G --rtt-multi-kmer |
+
+## 两旗标泛化验证: dev1/dev3（2026-09-03, bench 27ad71e0941203de/4c6f051b00ec0bd7/3c43526f154e5248/4485145520acf1e8/54b5913c5b0e5a4c）
+
+| 配置 | dev1 (76bp 模拟) R/P/F1/n | dev3 (76bp 模拟) R/P/F1/n | QM4 (150bp 真实) |
+|---|---|---|---|
+| 基线 | 15.4 / 80.7 / 25.8 / 8522 | 13.8 / 79.4 / 23.5 / 6978 | 43.9 / 51.7 / 47.5 / 117879 |
+| --rtt-multi-kmer | 15.4 / 80.7 / 25.9 / 8523 | 13.8 / 79.4 / 23.4 / 6991 | 44.2 / 51.5 / 47.6 / 118441 |
+| 组合(+no-path-merging) | 15.5 / **66.0** / 25.1 / 10683 | — | 46.6 / 51.3 / 48.8 / 228243 |
+
+**判定**:
+- `--rtt-multi-kmer`: dev1/dev3 零回退（n 仅 +1/+13, P 不动）, QM4 +0.3R/
+  缺失召回 99。**保持默认关**（保守: 收益限真实数据, 且 quantify 耗时
+  39→311s 的成本在模拟数据上无回报）; QM4 类真实数据建议开启。
+- `--bfly-no-path-merging`: dev1 **P −14.7pp 净负**（n +25% 全是噪声路径,
+  R 仅 +0.1）——去冗余删的路径在 76bp 模拟图上是噪声、在 150bp 真实图上
+  是真 isoform, **数据依赖强, 不转正**, 保持实验旗标。自适应（按 read
+  长度/图复杂度调节去冗余阈值）留作后续课题。

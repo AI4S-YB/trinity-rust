@@ -113,6 +113,10 @@ pub struct TrinityArgs {
     /// gt_support/gtdecode 模块文档）。**默认关**; `--gtasm-pair-support`
     /// 开启。仅 gtasm 引擎、双端 reads（--left/--right）生效。
     pub gtasm_pair_support: bool,
+    /// **Rust 版扩展**: butterfly classic 引擎的 cd-hit 式去冗余开关
+    /// （**默认关** = 原版语义; `--bfly-no-path-merging` 开启则跳过两处
+    /// twoPathsAreTooSimilar 去冗余——同基因高相似 isoform 不再被删）。
+    pub bfly_no_path_merging: bool,
     /// **Rust 版扩展**: gtasm 组件产出的碎片 pair-guided 合并（组件产出
     /// contigs 后、入 harvest 前, 同组件内 contig 末端 × 末端的 mate 链接
     /// ≥2 对 → OLC/N 保守拼接, 机制见 frag_merge 模块文档）。**默认关**;
@@ -134,6 +138,10 @@ pub struct TrinityArgs {
     /// 后对 c*.graph.out 做 tip/EC/rcc 删除, 见 trinity-chrysalis::graph_clean）。
     /// 默认关 = 现有行为逐字节不变。--recursive 下暂不生效（迷你管线未接线）。
     pub graph_clean_rnaspades: bool,
+    /// **Rust 版扩展**: ReadsToTranscripts 的 25-mer 索引多值化（共享 kmer
+    /// 记全部组件, 默认关 = 原版后写者赢单值语义）。救跨 weld 口 read 被
+    /// 其他组件抢占 → 组件图断口无桥（QM4 缺失解剖 2026-09-03）。
+    pub rtt_multi_kmer: bool,
     /// **Rust 版扩展**: SPAdes 式 gap closer（chrysalis QuantifyGraph/清理后
     /// 对 c*.graph.out 做 tip 对 tip overlap 缝合, PE 证据排序候选, 见
     /// trinity-chrysalis::gap_close）。默认关 = 现有行为逐字节不变。
@@ -335,6 +343,9 @@ pub fn parse_args(argv: &[String]) -> Result<TrinityArgs, CliError> {
     let gtasm_bulge_dual = cli.bool_flag("--gtasm-bulge-dual");
     // --gtasm-pair-support（Rust 版扩展, 默认关）: read pair 分支证据乘性消费
     let gtasm_pair_support = cli.bool_flag("--gtasm-pair-support");
+    // --bfly-no-path-merging（Rust 版扩展, 默认关）: 跳过 butterfly 两处
+    // cd-hit 式去冗余（twoPathsAreTooSimilar）
+    let bfly_no_path_merging = cli.bool_flag("--bfly-no-path-merging");
     // --gtasm-frag-merge（Rust 版扩展, 默认关）: 组件产出碎片 pair-guided 合并
     let gtasm_frag_merge = cli.bool_flag("--gtasm-frag-merge");
     // --stitch（Rust 版扩展, 默认关）: 输出层 split-read 缝合
@@ -350,6 +361,8 @@ pub fn parse_args(argv: &[String]) -> Result<TrinityArgs, CliError> {
     let kmer_given = cli.was_given("--KMER_SIZE") || cli.was_given("__KMER_SIZE");
     // --graph-clean-rnaspades（Rust 版扩展, 默认关）
     let graph_clean_rnaspades = cli.bool_flag("--graph-clean-rnaspades");
+    // --rtt-multi-kmer（Rust 版扩展, 默认关）: RTT 25-mer 索引多值化
+    let rtt_multi_kmer = cli.bool_flag("--rtt-multi-kmer");
     // --gap-close-spades（Rust 版扩展, 默认关）
     let gap_close_spades = cli.bool_flag("--gap-close-spades");
 
@@ -517,10 +530,12 @@ pub fn parse_args(argv: &[String]) -> Result<TrinityArgs, CliError> {
         gtasm_visited_walk,
         gtasm_bulge_dual,
         gtasm_pair_support,
+        bfly_no_path_merging,
         gtasm_frag_merge,
         stitch,
         multi_k,
         graph_clean_rnaspades,
+        rtt_multi_kmer,
         gap_close_spades,
     })
 }

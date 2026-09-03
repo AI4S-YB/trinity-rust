@@ -51,6 +51,10 @@ pub struct ChrysalisParams {
     /// `--graph-clean-rnaspades`：QuantifyGraph 之后对 graph.out 做 rnaSPAdes
     /// 式相对覆盖清理（tip/EC/rcc, 见 graph_clean 模块）。默认 false = 逐字节不变。
     pub graph_clean_rnaspades: bool,
+    /// `--rtt-multi-kmer`（Rust 版扩展, 默认 false = 原版语义）：ReadsToTranscripts
+    /// 的 25-mer 索引多值化——共享 kmer 记全部组件。救跨 weld 口 read 被
+    /// 其他组件抢占导致的断口无桥（见 RttParams::multi_kmer 文档）。
+    pub rtt_multi_kmer: bool,
     /// `--gap-close-spades`：清理之后对 graph.out 做 SPAdes 式 tip 对 tip
     /// overlap 缝合（PE 证据排序候选, 见 gap_close 模块）。默认 false = 逐字节不变。
     pub gap_close_spades: bool,
@@ -67,6 +71,7 @@ impl Default for ChrysalisParams {
             threads: 1,
             skip_quantify: false,
             graph_clean_rnaspades: false,
+            rtt_multi_kmer: false,
             gap_close_spades: false,
         }
     }
@@ -139,6 +144,7 @@ pub fn run_chrysalis_pipeline(
                 strand: p.strand,
                 pct_required: p.pct_required,
                 threads: p.threads.max(1),
+                multi_kmer: p.rtt_multi_kmer,
                 ..Default::default()
             },
         )?;

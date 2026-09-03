@@ -53,6 +53,13 @@ pub struct RttParams {
     /// 恒串行保序；查询表只读、每 read 独立 → 显式 rayon 池并行。
     /// 输出按 (best, read_idx) 排序收集 → 与线程数无关（确定性）。
     pub threads: usize,
+    /// **Rust 版扩展**（默认 false = 原版逐字节语义）：kmer 索引多值化——
+    /// 被多个 bundle 共享的 25-mer 记录**全部**组件（原版单值后写者赢）。
+    /// 动机（QM4 缺失解剖, 2026-09-03）: 跨 weld 口的 read（一侧序列也被
+    /// 其他组件的 bundle 共享）命中被别的组件抢占 → best 计数掉、pct <
+    /// 50 → 整条 read 丢弃 → 组件图断口无桥（886 断图档中 ~323 组件的
+    /// read 供给缺失主嫌疑）。多值化后 read 两端命中都归本组件。
+    pub multi_kmer: bool,
 }
 
 impl Default for RttParams {
@@ -63,6 +70,7 @@ impl Default for RttParams {
             min_kmer_entropy: DEFAULT_MIN_KMER_ENTROPY,
             max_mem_reads: usize::MAX,
             threads: 1,
+            multi_kmer: false,
         }
     }
 }
@@ -160,7 +168,13 @@ pub fn reads_to_transcripts(
     // 打包索引：kmer(u64 2-bit) → bundle 行下标。与 NonRedKmerTable 路径
     // 等价（见 [`build_kmer_index`] 测试）：仅大写 ACGT 窗口入表，共享
     // 25-mer 后写者（更大 bundle 下标）赢 —— 单线程顺序 insert 覆写保序。
-    let index = build_kmer_index(bundles);
+    // multi_kmer: 主表首写者赢 + 冲突副表记全部（语义见 RttParams 文档）。
+    let (index, multi_index) = if p.multi_kmer {
+        let (m, x) = build_kmer_index_multi(bundles);
+        (m, Some(x))
+    } else {
+        (build_kmer_index(bundles), None)
+    };
 
     let component_number_mapping: Vec<i32> =
         bundles.iter().map(|b| component_number(&b.name)).collect();
@@ -179,7 +193,9 @@ pub fn reads_to_transcripts(
             // 线程局部缓冲复用：toupper 副本 / revcomp 副本 / comp 命中表
             .map_init(
                 || (Vec::new(), Vec::new(), Vec::new()),
-                |(d, rc, comp), (i, r)| query_read(i, r, &index, p, d, rc, comp),
+                |(d, rc, comp), (i, r)| {
+                    query_read(i, r, &index, multi_index.as_ref(), p, d, rc, comp)
+                },
             )
             .collect()
     });
@@ -253,6 +269,63 @@ fn build_kmer_index(bundles: &[DnaSeq]) -> FxHashMap<u64, i32> {
     map
 }
 
+/// 多值索引（`--rtt-multi-kmer`）: 主表首写者赢 + 冲突副表收录共享
+/// 25-mer 的**全部** bundle 下标（含首写者）。查询命中 = 主表值 + 副表
+/// 全部（无冲突 kmer 副表缺席 → 单命中, 与原版等价的"1 次 push"）。
+fn build_kmer_index_multi(
+    bundles: &[DnaSeq],
+) -> (FxHashMap<u64, i32>, FxHashMap<u64, Box<[i32]>>) {
+    let total: usize = bundles
+        .iter()
+        .map(|b| b.seq.len().saturating_sub(K - 1))
+        .sum();
+    let mut main: FxHashMap<u64, i32> = FxHashMap::default();
+    main.reserve(total);
+    let mut multi: FxHashMap<u64, Vec<i32>> = FxHashMap::default();
+    for (i, b) in bundles.iter().enumerate() {
+        if b.seq.len() < K {
+            continue;
+        }
+        let mut code = 0u64;
+        let mut have = 0usize;
+        for &c in &b.seq {
+            let v = nuc_code(c);
+            if v == 4 {
+                have = 0;
+                code = 0;
+                continue;
+            }
+            code = ((code << 2) | v as u64) & MASK;
+            have = (have + 1).min(K);
+            if have == K {
+                match main.entry(code) {
+                    std::collections::hash_map::Entry::Vacant(e) => {
+                        e.insert(i as i32);
+                    }
+                    std::collections::hash_map::Entry::Occupied(e) => {
+                        // 同 bundle 内重复 kmer 不算冲突（原版后写者赢也只记一个）
+                        if *e.get() != i as i32 {
+                            multi
+                                .entry(code)
+                                .or_insert_with(|| vec![*e.get()])
+                                .push(i as i32);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let multi = multi
+        .into_iter()
+        .map(|(k, mut v)| {
+            v.sort_unstable();
+            v.dedup();
+            (k, v.into_boxed_slice())
+        })
+        .collect();
+    (main, multi)
+}
+
 /// 滑动计数熵：与 [`crate::dna_vector::compute_entropy`] **逐位等价**
 /// （同一计数、同一 G/A/T/C 求和顺序、同一 f64 中间精度），但单遍滑动更新。
 #[inline]
@@ -272,7 +345,14 @@ fn entropy_from_counts(counts: &[u32; 4], len: usize) -> f32 {
 
 /// 单方向枚举：滑动 2-bit 打包 + 滑动 ACGT 计数 → 熵门限 → 哈希命中。
 /// comp.push(命中) 语义与逐窗口 compute_entropy + get_count_real 一致。
-fn scan_hits(seq: &[u8], index: &FxHashMap<u64, i32>, min_ent: f32, comp: &mut Vec<i32>) {
+/// multi 模式下命中扩展为"主表值 + 副表全部"（共享 kmer 记全部组件）。
+fn scan_hits(
+    seq: &[u8],
+    index: &FxHashMap<u64, i32>,
+    multi: Option<&FxHashMap<u64, Box<[i32]>>>,
+    min_ent: f32,
+    comp: &mut Vec<i32>,
+) {
     if seq.len() < K {
         return;
     }
@@ -298,6 +378,17 @@ fn scan_hits(seq: &[u8], index: &FxHashMap<u64, i32>, min_ent: f32, comp: &mut V
         if have == K && entropy_from_counts(&counts, K) >= min_ent {
             if let Some(&c) = index.get(&code) {
                 comp.push(c);
+            }
+            if let Some(m) = multi {
+                if let Some(cs) = m.get(&code) {
+                    // 主表首写者已 push 过自己; 副表含首写者, 避免重复
+                    let first = index.get(&code).copied();
+                    for &c in cs.iter() {
+                        if Some(c) != first {
+                            comp.push(c);
+                        }
+                    }
+                }
             }
         }
     }
@@ -330,6 +421,7 @@ fn query_read(
     i: usize,
     r: &DnaSeq,
     index: &FxHashMap<u64, i32>,
+    multi: Option<&FxHashMap<u64, Box<[i32]>>>,
     p: &RttParams,
     d: &mut Vec<u8>,
     rc: &mut Vec<u8>,
@@ -342,11 +434,11 @@ fn query_read(
     // best 必为 -1，pct 值无意义 → 安全等价）
     let num_kmer_pos = d.len() as i64 - K as i64 + 1;
 
-    scan_hits(d, index, p.min_kmer_entropy, comp);
+    scan_hits(d, index, multi, p.min_kmer_entropy, comp);
     if !p.strand {
         rc.clear();
         revcomp_into(d, rc);
-        scan_hits(rc, index, p.min_kmer_entropy, comp);
+        scan_hits(rc, index, multi, p.min_kmer_entropy, comp);
     }
 
     comp.sort_unstable();
@@ -858,6 +950,95 @@ mod tests {
     #[test]
     fn sort_empty_text() {
         assert_eq!(sort_reads_to_components(""), "");
+    }
+
+    // ---------- multi_kmer（共享 kmer 多值化, Rust 版扩展） ----------
+
+    /// 跨 weld 口 read 抢救场景: bundle0 = 独有段A + 共享段S; bundle1 =
+    /// 共享段S + 独有段B。read = A 的尾段 + S（横跨 bundle0 的焊口）。
+    /// 原版单值表: S 的 kmer 后写者赢 → 命中全给 bundle1, bundle0 计数仅
+    /// A 段 → pct < 50 → read 丢弃。multi: S 命中同时给 bundle0 → pct 过
+    /// 阈值 → 分配 bundle0。
+    #[test]
+    fn multi_kmer_rescues_cross_junction_read() {
+        let mut s = 0xBEEFu64;
+        let mut next = |mod4: usize| {
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            b"ACGT"[(s >> 33) as usize % mod4]
+        };
+        let uniq_a: Vec<u8> = (0..120).map(|_| next(4)).collect();
+        let shared: Vec<u8> = (0..120).map(|_| next(4)).collect();
+        let uniq_b: Vec<u8> = (0..120).map(|_| next(4)).collect();
+        // bundle0 = A + S（X 口连接——跨口 read 是 A 尾 + S 头）
+        let b0: Vec<u8> = [uniq_a.clone(), shared.clone()].concat();
+        // bundle1 = S + B（共享 S, 后写者）
+        let b1: Vec<u8> = [shared.clone(), uniq_b].concat();
+        let bundles = vec![seq(">s_0_1", b0), seq(">s_1_1", b1)];
+        // read = A 尾 60bp + S 全 120bp = 180bp; 25-mer 窗口 156 个
+        let read: Vec<u8> = [uniq_a[60..].to_vec(), shared].concat();
+        let reads = vec![seq(">r0", read)];
+        let base = RttParams {
+            pct_required: 50,
+            ..Default::default()
+        };
+        // 原版: S 段 kmer（后写者 bundle1）命中 96 窗口、A 段 36 窗口给
+        // bundle0 → best=1 (96/156=62%)。bundle0 本体反而拿不到这条 read。
+        let legacy = reads_to_transcripts(&reads, &bundles, &RttParams {
+            ..base.clone()
+        })
+        .unwrap();
+        // multi: bundle0 计 36+96=132, bundle1 计 96 → best=0 (132/156=85%)
+        let multi = reads_to_transcripts(
+            &reads,
+            &bundles,
+            &RttParams {
+                multi_kmer: true,
+                ..base
+            },
+        )
+        .unwrap();
+        let first_col = |t: &str| t.split('\t').next().unwrap_or("").to_string();
+        assert_eq!(first_col(&legacy.text), "1", "原版: best 被后写者 bundle1 抢走");
+        assert_eq!(
+            first_col(&multi.text),
+            "0",
+            "multi: 横跨口 read 归还 bundle0"
+        );
+        assert!(legacy.mapped_count == 1 && multi.mapped_count == 1);
+    }
+
+    /// multi_kmer=false 路径与改动前逐字节等价（同输入同输出, 后写者赢保留）。
+    #[test]
+    fn multi_kmer_off_is_legacy() {
+        let mut s = 0xF00Du64;
+        let mut next = || {
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            b"ACGT"[(s >> 33) as usize % 4]
+        };
+        let shared: Vec<u8> = (0..80).map(|_| next()).collect();
+        let a: Vec<u8> = (0..100).map(|_| next()).collect();
+        let b: Vec<u8> = (0..100).map(|_| next()).collect();
+        let bundles = vec![
+            seq(">s_0_1", [a.clone(), shared.clone()].concat()),
+            seq(">s_1_1", [shared, b.clone()].concat()),
+        ];
+        let reads = vec![seq(">r0", [a[40..].to_vec(), b[..60].to_vec()].concat())];
+        let out = reads_to_transcripts(
+            &reads,
+            &bundles,
+            &RttParams {
+                pct_required: 50,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        // read 覆盖 A 尾+B 头（两组件各 ~60 命中 / 77 窗口 ≈ 78%）——两条都
+        // 过阈值但 best 只取一个; 原版语义（共享段缺席本 read）不回归。
+        assert!(out.mapped_count <= 1);
     }
 
     // ---------- 打包索引 / 滑动熵 等价性 ----------

@@ -505,6 +505,7 @@ pub fn run_trinity(args: &TrinityArgs) -> Result<PathBuf, CommonError> {
                         max_reads: args.max_reads_per_graph,
                         threads: args.cpu.max(1),
                         graph_clean_rnaspades: args.graph_clean_rnaspades,
+                        rtt_multi_kmer: args.rtt_multi_kmer,
                         gap_close_spades: args.gap_close_spades,
                         ..Default::default()
                     },
@@ -638,6 +639,7 @@ pub fn run_trinity(args: &TrinityArgs) -> Result<PathBuf, CommonError> {
                         gtasm_visited_walk: args.gtasm_visited_walk,
                         gtasm_bulge_dual: args.gtasm_bulge_dual,
                         gtasm_pair_support: args.gtasm_pair_support,
+                        no_path_merging: args.bfly_no_path_merging,
                     },
                 )
             },
@@ -1006,6 +1008,7 @@ fn run_recursive(
                     threads: args.cpu.max(1),
                     graphs_per_partition: 1000,
                     graph_clean_rnaspades: false, // 递归 phase-1 跳过 quantify, 清理不生效
+                    rtt_multi_kmer: args.rtt_multi_kmer,
                     gap_close_spades: false,      // 递归 phase-1 跳过 quantify, 缝合不生效
                 },
             )?;

@@ -175,6 +175,7 @@ fn cmd_reads_to_transcripts(cli: &mut Cli) -> Result<(), CliError> {
         min_kmer_entropy: cli.float_flag("-min_kmer_entropy", 1.5f32)?,
         max_mem_reads: cli.uint_flag("-max_mem_reads", usize::MAX)?,
         threads: cli.uint_flag("-t", 1usize)?.max(1),
+        multi_kmer: cli.bool_flag("-multi_kmer"),
     };
     cli.finish()?;
     let r = read_fasta_short_names(&reads)?;
@@ -298,6 +299,7 @@ fn cmd_chrysalis_all(cli: &mut Cli) -> Result<(), CliError> {
             threads: threads as usize,
             skip_quantify: false,
             graph_clean_rnaspades: false, // 子命令工具不暴露清理开关（默认关）
+            rtt_multi_kmer: cli.bool_flag("-multi_kmer"),
             gap_close_spades: false,      // 子命令工具不暴露缝合开关（默认关）
         },
     )?;
