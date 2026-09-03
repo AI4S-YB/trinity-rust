@@ -715,23 +715,31 @@ pub fn run_trinity(args: &TrinityArgs) -> Result<PathBuf, CommonError> {
     // 阈值边缘）; 整文件读入 + rayon 分块并行扫描（stitch_reads/stitch_seq_type
     // 在归一化前快照）。统计行落 .stage_timings。
     if args.stitch {
+        // v2 端部延伸候选: 最终轮 chrysalis 入口的 min100 集（bundle 闸丢弃的
+        // 孤立短组件在此复活为延伸片段——进图已证净负, 只在输出层消费）
+        let iworm_name = format!("inchworm.DS.fa");
+        let extra = chrysalis_dir.join(format!("{iworm_name}.min100"));
         let st = trinity_common::timer::timed(&round_dir, "stitch", || {
             crate::stitch::stitch_fasta(
                 &trinity_tmp,
+                Some(&extra),
                 &stitch_reads,
                 stitch_seq_type,
                 &crate::stitch::StitchParams::default(),
             )
         })?;
         eprintln!(
-            "-stitch: contigs {} → {}（桥 {} 达标 {}/采纳 {}, 链 {}, 存活锚 {}）",
+            "-stitch: contigs {} → {}（桥 {} 达标 {}/采纳 {}, 链 {}, 存活锚 {}; 延伸候选 {}（含于主 {}）/延伸链 {}）",
             st.contigs_in,
             st.contigs_out,
             st.bridges_total,
             st.bridges_kept,
             st.bridges_applied,
             st.chains,
-            st.anchors_live
+            st.anchors_live,
+            st.ext_candidates,
+            st.ext_contained,
+            st.extended
         );
         if let Ok(mut fh) = std::fs::OpenOptions::new()
             .create(true)

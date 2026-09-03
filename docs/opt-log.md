@@ -2461,3 +2461,35 @@ P −0.9 可用接缝一致性投票（桥 read 在接缝区的多数表决定 o
 （Predict 是外部工具的保守选框, 不计入组装质量）; pepR90all=91.4% 与
 BUSCO 89.3%、核酸 hcR 在 90±1% 收敛——多口径一致锁定"CDS 广度九成,
 全长完整性缺"的同一诊断。ORF 层线收口。
+| 2026-09-03 | qm4-minlen100 | R=43.8% P=51.3% **F1=47.2%** | N50=1757 n=132229 | --multi-k auto --inchworm_cpu 32 --CPU 32 --max_memory 64G --min_contig_length 100 |
+| 2026-09-03 | qm4-bundle100 | R=41.8% P=47.9% **F1=44.7%** | N50=1517 n=240155 | --multi-k auto --inchworm_cpu 32 --CPU 32 --max_memory 64G --min_contig_length 100 |
+| 2026-09-03 | dev1-stitch2 | R=15.4% P=80.1% **F1=25.8%** | N50=1907 n=8504 | --CPU 8 --max_memory 8G --stitch |
+| 2026-09-03 | qm4-stitch2 | R=44.4% P=50.9% **F1=47.4%** | N50=1794 n=115394 | --multi-k auto --inchworm_cpu 32 --CPU 32 --max_memory 64G --stitch |
+
+## 端部截断战役: 全景诊断 + bundle 闸实验 + stitch v2 端部延伸（2026-09-03, bench 4041141c088286ba/7d06d1c627ab6f71）
+
+**全景（36,933 条有对齐 ST tx）**: 全覆盖 63.9% / 仅3'截断 13.0% / 仅5'截断
+10.7% / 中间缺口 8.1% / 双端 4.3%（无对齐 1,616 另计）。全覆盖率随 TPM 单调
+（<1 44.5% → ≥20 83.5%）。高表达截断的缺口区 53-60% 有 reads（dep≥3）——
+**可修**, 另 ~40% 无 reads（数据上限, de novo 固有）。
+
+**丢失归因（TPM≥20 的 343 个已覆盖缺口）**: 42% 主力 contig 100-200bp
+（bundle 闸: create_iworm_fasta_bundle 硬编码 200 丢弃孤立短组件）+
+57% ≥200bp（进图但 Chrysalis/Butterfly 未输出——漏斗: min100 351,647 条
+→ bundled 52,061 组件 → 输出 118,230 路径）。
+
+**实验一（bundle 闸参数化 + min_contig_length 100 全联动）: 净负**——
+组件 51,672→162,006, R 43.9→41.8（−2.1pp）, P −3.8。孤立短组件进图扰动
+RTT read 分配与蝶路径选择——原版 200 闸的存在有理。
+
+**stitch v2（输出层端部延伸）**: 延伸候选（min100 的 100-199bp 短 contig）
+不进图, 输出层缝到主 contig 端部; **containment 护栏**（候选锚被主
+contig 窗口包含即剔——QM4 268,955 候选中 208,099 即 77% 被包含, 不剔则
+主 contig 普通 read 造成海量误桥）。QM4: 桥 32,365/链 4,500/延伸链 2,117,
+R=44.4% vs v1 44.5——**持平**; adjacent_201 单contig 117（v1 114）。
+oracle 的 +4.9pp 覆盖未兑现——桥判据对 oracle 全量的三重折损（锚歧义×
+桥阈值×95% 全长门槛）, 与碎片延长线收档时的"oracle 三重折损"教训同构。
+
+处置: v2 工程保留（--stitch 默认关, 7 单测全绿, dev1 无回退）; 端部截断
+的剩余 oracle 空间留给"≥200 图/蝶丢失档"的深挖（57% 大头, 需进 Chrysalis
+/Bfly 内部——下一战役级工程）。

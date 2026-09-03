@@ -37,11 +37,21 @@ pub struct StitchParams {
     pub max_gap: usize,
     /// 接缝去重检查的最大重叠（bp）
     pub max_seam_overlap: usize,
+    /// v2 端部延伸: 额外候选（bundle 闸丢弃的孤立短 contig）长度窗 [min, max]
+    pub extend_min_len: usize,
+    pub extend_max_len: usize,
 }
 
 impl Default for StitchParams {
     fn default() -> Self {
-        StitchParams { anchor_len: 30, min_bridge_reads: 2, max_gap: 40, max_seam_overlap: 60 }
+        StitchParams {
+            anchor_len: 30,
+            min_bridge_reads: 2,
+            max_gap: 40,
+            max_seam_overlap: 60,
+            extend_min_len: 100,
+            extend_max_len: 199,
+        }
     }
 }
 
@@ -59,6 +69,12 @@ pub struct StitchStats {
     pub bridges_applied: usize,
     /// 缝合出的链数（长度 ≥2）
     pub chains: usize,
+    /// v2: 读入的延伸候选（短 contig）数
+    pub ext_candidates: usize,
+    /// v2: containment 剔除的候选锚数（被主 contig 包含 → 误桥源）
+    pub ext_contained: usize,
+    /// v2: 含延伸候选的输出链数
+    pub extended: usize,
 }
 
 /// 2-bit 打包的锚键（anchor_len ≤ 32 时用 u64; N 等非 gatc 断键返回 None）。
@@ -77,17 +93,38 @@ fn pack_key(seq: &[u8]) -> Option<u64> {
     Some(v)
 }
 /// 对 `fasta`（harvest 产物）就地执行缝合, 就地重写文件。
+/// v2: `extra_fa` 提供延伸候选（bundle 闸丢弃的孤立短 contig, 长度窗
+/// [extend_min_len, extend_max_len]）——不进图, 仅在输出层作为端部延伸片段
+/// 缝到主 contig; 纯候选链不输出, 单独候选不输出。
 pub fn stitch_fasta(
     fasta: &Path,
+    extra_fa: Option<&Path>,
     read_files: &[std::path::PathBuf],
     seq_type: SeqType,
     params: &StitchParams,
 ) -> Result<StitchStats, CommonError> {
     let raw = std::fs::read(fasta)?;
-    let contigs = parse_fasta(&raw)?;
+    let parsed = parse_fasta(&raw)?;
+    // (name, seq, is_extra)
+    let mut contigs: Vec<(String, Vec<u8>, bool)> =
+        parsed.into_iter().map(|(n, s)| (n, s, false)).collect();
     let mut stats = StitchStats { contigs_in: contigs.len(), ..Default::default() };
+    // 延伸候选池
+    if let Some(ep) = extra_fa {
+        if let Ok(eraw) = std::fs::read(ep) {
+            for (n, s) in parse_fasta(&eraw)? {
+                if s.len() >= params.extend_min_len
+                    && s.len() <= params.extend_max_len
+                    && s.len() >= params.anchor_len * 2
+                {
+                    stats.ext_candidates += 1;
+                    contigs.push((n, s, true));
+                }
+            }
+        }
+    }
     if contigs.len() < 2 {
-        stats.contigs_out = contigs.len();
+        stats.contigs_out = stats.contigs_in;
         std::fs::write(fasta, &raw)?;
         return Ok(stats);
     }
@@ -101,7 +138,7 @@ pub fn stitch_fasta(
     // 键 -> (contig 下标, 是否尾锚); 端位出现计数
     let mut anchors: FxHashMap<u64, (u32, bool)> = FxHashMap::default();
     let mut end_seen: FxHashMap<u64, u32> = FxHashMap::default();
-    for (i, (_, seq)) in contigs.iter().enumerate() {
+    for (i, (_, seq, _)) in contigs.iter().enumerate() {
         if seq.len() < k * 2 {
             continue;
         }
@@ -115,6 +152,53 @@ pub fn stitch_fasta(
         }
     }
     anchors.retain(|key, _| end_seen.get(key).copied().unwrap_or(0) == 1);
+
+    // ---- 1.5 v2 containment 护栏: 候选锚串被任何主 contig 以窗口包含 → 剔除。
+    // 被包含的候选头/尾锚会被主 contig 的普通 read 命中（read 横跨内部锚到端锚）,
+    // 造成海量误桥——必须在桥计数前剔除。只扫主 contig 的窗口查候选键集合。
+    let extra_keys: FxHashMap<u64, ()> = anchors
+        .iter()
+        .filter(|(_, &(i, _))| contigs[i as usize].2)
+        .map(|(&key, _)| (key, ()))
+        .collect();
+    if !extra_keys.is_empty() {
+        let hits: Vec<u64> = contigs
+            .par_iter()
+            .filter(|c| !c.2)
+            .map(|(_, seq, _)| {
+                let mut local: Vec<u64> = Vec::new();
+                if seq.len() < k {
+                    return local;
+                }
+                let mask = (1u64 << (2 * k as u32)) - 1;
+                let mut valid = 0usize;
+                let mut v: u64 = 0;
+                for i in 0..seq.len() {
+                    let x = match seq[i] {
+                        b'G' => 0,
+                        b'A' => 1,
+                        b'T' => 2,
+                        b'C' => 3,
+                        _ => {
+                            valid = 0;
+                            v = 0;
+                            continue;
+                        }
+                    };
+                    v = ((v << 2) | x as u64) & mask;
+                    valid += 1;
+                    if valid >= k && extra_keys.contains_key(&v) {
+                        local.push(v);
+                    }
+                }
+                local
+            })
+            .flatten()
+            .collect();
+        let contained: FxHashMap<u64, ()> = hits.into_iter().map(|h| (h, ())).collect();
+        stats.ext_contained = contained.len();
+        anchors.retain(|key, _| !contained.contains_key(key));
+    }
     stats.anchors_live = anchors.len();
     if anchors.is_empty() {
         stats.contigs_out = contigs.len();
@@ -178,16 +262,37 @@ pub fn stitch_fasta(
         let is_chain = next.contains_key(&(i as u32));
         let mut seq = contigs[i].1.clone();
         let mut cur = i as u32;
+        let mut has_main = !contigs[i].2;
         while let Some(&nxt) = next.get(&cur) {
             let n = nxt as usize;
             let seam = max_exact_overlap(&seq, &contigs[n].1, params.max_seam_overlap);
             // 重叠 = B 头部 r bp（suffix(seq)==prefix(B)）→ 拼接 B[r..]
             seq.extend_from_slice(&contigs[n].1[seam..]);
+            has_main |= !contigs[n].2;
             removed[n] = true;
             cur = nxt;
         }
+        // v2: 纯延伸候选链不输出（候选本不在产物里; 只有缝进主 contig 才现身）
+        if !has_main {
+            continue;
+        }
         if is_chain {
             stats.chains += 1;
+        }
+        // v2: 链中含延伸候选 → 计数（首成员 extra 即 5' 延伸, 或后续任一成员 extra）
+        {
+            let mut c = i as u32;
+            if contigs[i].2 {
+                stats.extended += 1;
+            } else {
+                while let Some(&nxt) = next.get(&c) {
+                    if contigs[nxt as usize].2 {
+                        stats.extended += 1;
+                        break;
+                    }
+                    c = nxt;
+                }
+            }
         }
         out.push((contigs[i].0.clone(), seq));
     }
@@ -491,7 +596,7 @@ mod tests {
         let rf = d.join("r.fq");
         std::fs::write(&rf, fq).unwrap();
         let p = StitchParams::default();
-        let st = stitch_fasta(&fa, &[rf], SeqType::Fq, &p).unwrap();
+        let st = stitch_fasta(&fa, None, &[rf], SeqType::Fq, &p).unwrap();
         assert_eq!(st.contigs_in, 3);
         assert_eq!(st.contigs_out, 1, "应缝合成单链: {st:?}");
         assert_eq!(st.bridges_applied, 2);
@@ -525,7 +630,7 @@ mod tests {
             fq.push_str(&format!("@r{}\n{}\n+\n{}\n", i + 1, String::from_utf8_lossy(s).into_owned(), "I".repeat(s.len())));
         }
         std::fs::write(&rf, fq).unwrap();
-        let st = stitch_fasta(&fa, &[rf], SeqType::Fq, &StitchParams::default()).unwrap();
+        let st = stitch_fasta(&fa, None, &[rf], SeqType::Fq, &StitchParams::default()).unwrap();
         assert_eq!(st.bridges_kept, 2);
         assert_eq!(st.bridges_applied, 1, "环必须被拒: {st:?}");
         assert_eq!(st.contigs_out, 1);
@@ -553,7 +658,7 @@ mod tests {
             String::from_utf8_lossy(&r).into_owned(), "I".repeat(r.len()),
             String::from_utf8_lossy(&r).into_owned(), "I".repeat(r.len()));
         std::fs::write(&rf, fq).unwrap();
-        let st = stitch_fasta(&fa, &[rf], SeqType::Fq, &StitchParams::default()).unwrap();
+        let st = stitch_fasta(&fa, None, &[rf], SeqType::Fq, &StitchParams::default()).unwrap();
         assert_eq!(st.bridges_kept, 0, "歧义锚不得产生桥: {st:?}");
         assert_eq!(st.contigs_out, 2);
         let _ = std::fs::remove_dir_all(&d);
@@ -594,9 +699,65 @@ mod tests {
             ));
         }
         std::fs::write(&rf, fq).unwrap();
-        let st = stitch_fasta(&fa, &[rf], SeqType::Fq, &StitchParams::default()).unwrap();
+        let st = stitch_fasta(&fa, None, &[rf], SeqType::Fq, &StitchParams::default()).unwrap();
         assert_eq!(st.bridges_applied, 1, "内部命中不阻断缝合: {st:?}");
         assert_eq!(st.contigs_out, 2);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// v2 端部延伸: 候选短 contig B (150bp) 缝到主 contig A 头部（5' 延伸）,
+    /// 输出 = B+A 单链; 纯候选不独立输出。
+    #[test]
+    fn extend_candidate_stitches_to_main_head() {
+        let d = tmpdir("ext5");
+        let a = rand_seq(901, 300); // 主 contig
+        let b = rand_seq(911, 150); // 延伸候选（5' 侧）
+        let fa = d.join("t.fasta");
+        std::fs::write(&fa, format!(">A\n{}\n", String::from_utf8_lossy(&a))).unwrap();
+        let ef = d.join("extra.fasta");
+        std::fs::write(&ef, format!(">B\n{}\n", String::from_utf8_lossy(&b))).unwrap();
+        // read 横跨 B 尾/A 头接缝 ×2
+        let r = [b[b.len() - 40..].to_vec(), a[..40].to_vec()].concat();
+        let rf = d.join("r.fq");
+        let mut fq = String::new();
+        for i in 0..2 {
+            fq.push_str(&format!("@r{}\n{}\n+\n{}\n", i + 1, String::from_utf8_lossy(&r), "I".repeat(r.len())));
+        }
+        std::fs::write(&rf, fq).unwrap();
+        let st = stitch_fasta(&fa, Some(&ef), &[rf], SeqType::Fq, &StitchParams::default()).unwrap();
+        assert_eq!(st.ext_candidates, 1);
+        assert_eq!(st.extended, 1, "候选应缝到主 contig: {st:?}");
+        assert_eq!(st.contigs_out, 1);
+        let data = std::fs::read(&fa).unwrap();
+        let out = parse_fasta(&data).unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].1, [b.clone(), a.clone()].concat(), "5' 延伸 = B+A");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// v2 containment 护栏: 候选整体被主 contig 包含（锚串都在主内）→ 不缝。
+    #[test]
+    fn contained_candidate_rejected() {
+        let d = tmpdir("extc");
+        let a = rand_seq(921, 400);
+        // 候选 = a[100..250]（150bp, 完全被 A 包含）
+        let b = a[100..250].to_vec();
+        let fa = d.join("t.fasta");
+        std::fs::write(&fa, format!(">A\n{}\n", String::from_utf8_lossy(&a))).unwrap();
+        let ef = d.join("extra.fasta");
+        std::fs::write(&ef, format!(">B\n{}\n", String::from_utf8_lossy(&b))).unwrap();
+        // read 横跨"B 尾/A 头"接缝（伪造误桥信号: A 上从 B 尾位置到 A 头的 read）
+        let r = a[..80].to_vec(); // 含 B 尾锚(a[220..250] 在其中)与 A 头锚
+        let rf = d.join("r.fq");
+        let mut fq = String::new();
+        for i in 0..5 {
+            fq.push_str(&format!("@r{}\n{}\n+\n{}\n", i + 1, String::from_utf8_lossy(&r), "I".repeat(r.len())));
+        }
+        std::fs::write(&rf, fq).unwrap();
+        let st = stitch_fasta(&fa, Some(&ef), &[rf], SeqType::Fq, &StitchParams::default()).unwrap();
+        assert!(st.ext_contained >= 1, "候选锚应被 containment 剔除: {st:?}");
+        assert_eq!(st.extended, 0, "被包含候选不得缝入: {st:?}");
+        assert_eq!(st.contigs_out, 1);
         let _ = std::fs::remove_dir_all(&d);
     }
 
@@ -615,7 +776,7 @@ mod tests {
         let r = [s1[70..].to_vec(), s2[..30].to_vec()].concat(); // 仅 1 条
         let rf = d.join("r.fq");
         std::fs::write(&rf, format!("@r1\n{}\n+\n{}\n", String::from_utf8_lossy(&r).into_owned(), "I".repeat(r.len()))).unwrap();
-        let st = stitch_fasta(&fa, &[rf], SeqType::Fq, &StitchParams::default()).unwrap();
+        let st = stitch_fasta(&fa, None, &[rf], SeqType::Fq, &StitchParams::default()).unwrap();
         assert_eq!(st.bridges_kept, 0);
         assert_eq!(st.contigs_out, 2);
         let _ = std::fs::remove_dir_all(&d);

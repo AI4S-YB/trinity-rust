@@ -118,7 +118,10 @@ pub fn run_chrysalis_pipeline(
     })?;
     let (bundle, bundle_path) = timed(out_dir, "bundle", || {
         println!("-running CreateIwormFastaBundle...");
-        let bundle = create_iworm_fasta_bundle(&comps, 200)?;
+        // 2026-09-03: 原版此处硬编码 200; 改为随 --min_contig_length 联动——
+        // QM4 端部截断解剖显示孤立 100-200bp 组件在此被整体丢弃（TPM≥20 截断
+        // 缺口的 42% 归因于该档, 见 opt-log「端部截断全景」）。
+        let bundle = create_iworm_fasta_bundle(&comps, p.min_contig_length)?;
         let bundle_path = out_dir.join("bundled_iworm_contigs.fasta");
         std::fs::write(&bundle_path, &bundle)?;
         Ok::<_, CommonError>((bundle, bundle_path))
