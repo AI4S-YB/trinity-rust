@@ -23,8 +23,6 @@ use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 
 use trinity_common::error::CommonError;
-use trinity_common::fasta::FastaReader;
-use trinity_common::fastq::FastqReader;
 use trinity_common::io_util::open_maybe_gz;
 
 use crate::args::SeqType;
@@ -78,20 +76,6 @@ fn pack_key(seq: &[u8]) -> Option<u64> {
     }
     Some(v)
 }
-
-fn revcomp(seq: &[u8]) -> Vec<u8> {
-    seq.iter()
-        .rev()
-        .map(|&c| match c {
-            b'A' | b'a' => b'T',
-            b'T' | b't' => b'A',
-            b'C' | b'c' => b'G',
-            b'G' | b'g' => b'C',
-            _ => b'N',
-        })
-        .collect()
-}
-
 /// 对 `fasta`（harvest 产物）就地执行缝合, 就地重写文件。
 pub fn stitch_fasta(
     fasta: &Path,
@@ -109,10 +93,14 @@ pub fn stitch_fasta(
     }
 
     // ---- 1. 锚构建: 每条 contig 的尾/头锚（长度不足 anchor*2 的 contig 不参与）----
+    // v1 端位唯一: 同串只允许作为**一个端**的锚出现（端位计数==1）; 串在别的
+    // contig **内部**出现不再剔除（v0 全局唯一砍掉 60% 锚——isoform 家族共享
+    // 末端使端锚串普遍在兄弟 contig 内部出现, 而紧邻断点恰密集于共享区）。
+    // 内部命中混入的风险由桥竞争仲裁（端唯一化取 read 数最大）+ 接缝几何兜底。
     let k = params.anchor_len;
-    // 键 -> (contig 下标, 是否尾锚)
+    // 键 -> (contig 下标, 是否尾锚); 端位出现计数
     let mut anchors: FxHashMap<u64, (u32, bool)> = FxHashMap::default();
-
+    let mut end_seen: FxHashMap<u64, u32> = FxHashMap::default();
     for (i, (_, seq)) in contigs.iter().enumerate() {
         if seq.len() < k * 2 {
             continue;
@@ -122,16 +110,11 @@ pub fn stitch_fasta(
             (pack_key(&seq[..k]), false),
         ] {
             let Some(key) = key else { continue };
-            // 同键多次插入（同串出现在多个 contig 端）无需显式处理:
-            // 唯一性计数阶段会以出现次数 >=2 将其剔除。
+            *end_seen.entry(key).or_insert(0) += 1;
             anchors.insert(key, (i as u32, is_tail));
         }
     }
-
-    // ---- 2. 锚唯一性: 全体 contigs 的所有 k-mer 窗口计数, 出现 >1 次的键剔除 ----
-    // 分块并行计数（per-chunk FxHashMap + merge; 序列界跨块窗口由块尾补 k-1 拼接）。
-    let counts = count_windows(&contigs, k);
-    anchors.retain(|key, _| counts.get(key).copied().unwrap_or(0) == 1);
+    anchors.retain(|key, _| end_seen.get(key).copied().unwrap_or(0) == 1);
     stats.anchors_live = anchors.len();
     if anchors.is_empty() {
         stats.contigs_out = contigs.len();
@@ -258,49 +241,8 @@ fn parse_fasta(data: &[u8]) -> Result<Vec<(String, Vec<u8>)>, CommonError> {
     Ok(out)
 }
 
-/// 全 contigs 的 k-mer 窗口并行计数（含 N 的窗口跳过）。
-fn count_windows(contigs: &[(String, Vec<u8>)], k: usize) -> FxHashMap<u64, u32> {
-    contigs
-        .par_iter()
-        .map(|(_, seq)| {
-            let mut m: FxHashMap<u64, u32> = FxHashMap::default();
-            if seq.len() >= k {
-                let mut valid = 0usize;
-                let mut v: u64 = 0;
-                let mask = (1u64 << (2 * k as u32)) - 1;
-                for i in 0..seq.len() {
-                    let x = match seq[i] {
-                        b'G' => 0,
-                        b'A' => 1,
-                        b'T' => 2,
-                        b'C' => 3,
-                        _ => {
-                            valid = 0;
-                            v = 0;
-                            continue;
-                        }
-                    };
-                    v = ((v << 2) | x as u64) & mask;
-                    valid += 1;
-                    if valid >= k {
-                        *m.entry(v).or_insert(0) += 1;
-                    }
-                }
-            }
-            m
-        })
-        .reduce(FxHashMap::default, |a, b| {
-            let (big, small) = if a.len() >= b.len() { (a, b) } else { (b, a) };
-            let mut big = big;
-            for (k2, c) in small {
-                *big.entry(k2).or_insert(0) += c;
-            }
-            big
-        })
-}
-
-/// 扫单个 reads 文件: 正反链各滚一遍, 命中 (尾锚@pos, 头锚@pos') 且
-/// pos+k <= pos'+max_gap 的对计数。
+/// 扫单个 reads 文件（v1 并行版）: 整读入内存 → 切序列行区间 → rayon 分块
+/// 并行扫描 → 局部桥表归并。命中 (尾锚@pos, 头锚@pos') 且接缝几何成立 → 计数。
 fn scan_reads(
     path: &Path,
     seq_type: SeqType,
@@ -309,70 +251,144 @@ fn scan_reads(
     bridges: &mut FxHashMap<(u32, u32), u32>,
     max_gap: usize,
 ) -> Result<(), CommonError> {
-    let reader = open_maybe_gz(path)?;
-    let mut process = |seq: &[u8]| {
-        if seq.len() < 2 * k {
-            return;
-        }
-        for strand in [seq, &revcomp(seq)] {
-            // 收集本 read 命中的锚 (end_pos, contig, is_tail)
-            let mut hits: Vec<(usize, u32, bool)> = Vec::new();
-            let mask = (1u64 << (2 * k as u32)) - 1;
-            let mut valid = 0usize;
-            let mut v: u64 = 0;
-            for i in 0..strand.len() {
-                let x = match strand[i] {
-                    b'G' | b'g' => 0,
-                    b'A' | b'a' => 1,
-                    b'T' | b't' => 2,
-                    b'C' | b'c' => 3,
-                    _ => {
-                        valid = 0;
-                        v = 0;
-                        continue;
-                    }
-                };
-                v = ((v << 2) | x as u64) & mask;
-                valid += 1;
-                if valid >= k {
-                    if let Some(&(c, is_tail)) = anchors.get(&v) {
-                        hits.push((i + 1, c, is_tail)); // i+1 = 窗口右端(含)
-                    }
+    let mut reader = open_maybe_gz(path)?;
+    let mut data = Vec::new();
+    std::io::Read::read_to_end(&mut reader, &mut data)?;
+
+    // 序列字节区间收集: fq 按 4 行组（第 2 行 = 序列）; fa 按记录（序列行拼接,
+    // 多行时退化为逐行区间——跨行 k-mer 会断窗, 但 fa 输入在此路径为归一化
+    // 产物（单行）, 实际不触发）。
+    let mut seqs: Vec<(usize, usize)> = Vec::new();
+    let mut pos = 0usize;
+    let mut line_no = 0usize;
+    while pos < data.len() {
+        let end = memchr(b'\n', &data[pos..]).map(|i| pos + i).unwrap_or(data.len());
+        let content_end = if end > pos && data[end - 1] == b'\r' { end - 1 } else { end };
+        let is_hdr = content_end > pos
+            && ((seq_type == SeqType::Fq && data[pos] == b'@')
+                || (seq_type == SeqType::Fa && data[pos] == b'>'));
+        let is_blank = content_end == pos;
+        match seq_type {
+            SeqType::Fq => {
+                let m = line_no % 4;
+                if m == 0 && !is_hdr && !is_blank {
+                    return Err(CommonError::Parse(format!(
+                        "stitch: 非 fq 记录边界（{} 第 {} 行）",
+                        path.display(),
+                        line_no + 1
+                    )));
                 }
-            }
-            // 桥判定: 尾锚区间 [e-k, e), 头锚区间 [s2, s2+k), s2 = e2-k。
-            // 顺序: 头锚起点不早于尾锚起点（允许锚重叠）; 间距: e - s2 <= k + max_gap。
-            for &(e, ca, ta) in &hits {
-                if !ta {
+                if m == 1 && !is_blank {
+                    seqs.push((pos, content_end));
+                }
+                if m == 0 && !is_hdr {
+                    line_no += 1; // 空行宽容: 只推进不校验
+                    pos = end + 1;
                     continue;
                 }
-                for &(e2, cb, hb) in &hits {
-                    if hb {
-                        continue;
-                    }
-                    let s2 = e2.saturating_sub(k);
-                    if ca != cb && s2 >= e.saturating_sub(k) && e <= s2 + k + max_gap {
-                        *bridges.entry((ca, cb)).or_insert(0) += 1;
-                    }
+            }
+            SeqType::Fa => {
+                if !is_blank && !is_hdr {
+                    seqs.push((pos, content_end));
                 }
             }
         }
-    };
-    match seq_type {
-        SeqType::Fq => {
-            let mut r = FastqReader::new(reader);
-            while let Some(rec) = r.next_record()? {
-                process(rec.sequence.as_bytes());
+        line_no += 1;
+        pos = end + 1;
+    }
+
+    // 并行扫描: 每 4096 条序列一块, 局部桥表 + 归并（小并大）。
+    let partials: Vec<FxHashMap<(u32, u32), u32>> = seqs
+        .par_chunks(4096)
+        .map(|chunk| {
+            let mut local: FxHashMap<(u32, u32), u32> = FxHashMap::default();
+            let mut rc_buf: Vec<u8> = Vec::new();
+            for &(s, e) in chunk {
+                scan_one_read(&data[s..e], k, anchors, &mut local, max_gap, &mut rc_buf);
             }
-        }
-        SeqType::Fa => {
-            let mut r = FastaReader::new(reader);
-            while let Some(rec) = r.next_record()? {
-                process(rec.sequence.as_bytes());
-            }
+            local
+        })
+        .collect();
+    for p in partials {
+        for (key, c) in p {
+            *bridges.entry(key).or_insert(0) += c;
         }
     }
     Ok(())
+}
+
+/// 单条 read 扫描: 正反链各滚一遍（rc 复用缓冲免逐条分配）。
+fn scan_one_read(
+    seq: &[u8],
+    k: usize,
+    anchors: &FxHashMap<u64, (u32, bool)>,
+    bridges: &mut FxHashMap<(u32, u32), u32>,
+    max_gap: usize,
+    rc_buf: &mut Vec<u8>,
+) {
+    if seq.len() < 2 * k {
+        return;
+    }
+    let mut hits: Vec<(usize, u32, bool)> = Vec::new();
+    for flip in [false, true] {
+        hits.clear();
+        let strand: &[u8] = if flip {
+            rc_buf.clear();
+            rc_buf.extend(seq.iter().rev().map(|&c| match c {
+                b'A' | b'a' => b'T',
+                b'T' | b't' => b'A',
+                b'C' | b'c' => b'G',
+                b'G' | b'g' => b'C',
+                _ => b'N',
+            }));
+            rc_buf
+        } else {
+            seq
+        };
+        let mask = (1u64 << (2 * k as u32)) - 1;
+        let mut valid = 0usize;
+        let mut v: u64 = 0;
+        for i in 0..strand.len() {
+            let x = match strand[i] {
+                b'G' | b'g' => 0,
+                b'A' | b'a' => 1,
+                b'T' | b't' => 2,
+                b'C' | b'c' => 3,
+                _ => {
+                    valid = 0;
+                    v = 0;
+                    continue;
+                }
+            };
+            v = ((v << 2) | x as u64) & mask;
+            valid += 1;
+            if valid >= k {
+                if let Some(&(c, is_tail)) = anchors.get(&v) {
+                    hits.push((i + 1, c, is_tail)); // i+1 = 窗口右端(含)
+                }
+            }
+        }
+        // 桥判定: 尾锚区间 [e-k, e), 头锚区间 [s2, s2+k), s2 = e2-k。
+        // 顺序: 头锚起点不早于尾锚起点（允许锚重叠）; 间距: e - s2 <= k + max_gap。
+        for &(e, ca, ta) in &hits {
+            if !ta {
+                continue;
+            }
+            for &(e2, cb, hb) in &hits {
+                if hb {
+                    continue;
+                }
+                let s2 = e2.saturating_sub(k);
+                if ca != cb && s2 >= e.saturating_sub(k) && e <= s2 + k + max_gap {
+                    *bridges.entry((ca, cb)).or_insert(0) += 1;
+                }
+            }
+        }
+    }
+}
+
+fn memchr(needle: u8, hay: &[u8]) -> Option<usize> {
+    hay.iter().position(|&b| b == needle)
 }
 
 /// suffix(a) 与 prefix(b) 在 0..=max 内的最大精确重叠长度。
@@ -539,6 +555,47 @@ mod tests {
         std::fs::write(&rf, fq).unwrap();
         let st = stitch_fasta(&fa, &[rf], SeqType::Fq, &StitchParams::default()).unwrap();
         assert_eq!(st.bridges_kept, 0, "歧义锚不得产生桥: {st:?}");
+        assert_eq!(st.contigs_out, 2);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// v1 端位唯一: 锚串在别的 contig **内部**出现不再剔除（可缝合）;
+    /// 端位出现 2 次（另一端同串）仍是歧义（ambiguous 测试锁定）。
+    #[test]
+    fn internal_anchor_hit_tolerated() {
+        let d = tmpdir("internal");
+        let s1: Vec<u8> = rand_seq(501, 100);
+        let s2: Vec<u8> = rand_seq(601, 100);
+        // C = 别的 contig, 其内部恰好包含 s1 的尾锚 30bp（非端位）
+        let a_tail30 = s1[s1.len() - 30..].to_vec();
+        let mut c = rand_seq(701, 40);
+        c.extend_from_slice(&a_tail30);
+        c.extend_from_slice(&rand_seq(801, 40));
+        let fa = d.join("t.fasta");
+        std::fs::write(
+            &fa,
+            format!(
+                ">A\n{}\n>B\n{}\n>C\n{}\n",
+                String::from_utf8_lossy(&s1),
+                String::from_utf8_lossy(&s2),
+                String::from_utf8_lossy(&c)
+            ),
+        )
+        .unwrap();
+        let r = [s1[s1.len() - 40..].to_vec(), s2[..40].to_vec()].concat();
+        let rf = d.join("r.fq");
+        let mut fq = String::new();
+        for i in 0..2 {
+            fq.push_str(&format!(
+                "@r{}\n{}\n+\n{}\n",
+                i + 1,
+                String::from_utf8_lossy(&r),
+                "I".repeat(r.len())
+            ));
+        }
+        std::fs::write(&rf, fq).unwrap();
+        let st = stitch_fasta(&fa, &[rf], SeqType::Fq, &StitchParams::default()).unwrap();
+        assert_eq!(st.bridges_applied, 1, "内部命中不阻断缝合: {st:?}");
         assert_eq!(st.contigs_out, 2);
         let _ = std::fs::remove_dir_all(&d);
     }

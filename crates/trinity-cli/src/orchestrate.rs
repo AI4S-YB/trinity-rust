@@ -273,6 +273,16 @@ pub fn run_trinity(args: &TrinityArgs) -> Result<PathBuf, CommonError> {
     let ss = args.ss_lib_type.as_deref();
     let ds = ss.is_none();
     let mut a = args.clone();
+    // stitch 的 reads 快照（v1）: 归一化会稀释断点横跨 read（max_cov cap）,
+    // 缝合 pass 扫**原始** reads; no_normalize 时两者相同。
+    let stitch_reads: Vec<std::path::PathBuf> = args
+        .left
+        .iter()
+        .chain(&args.right)
+        .chain(&args.single)
+        .cloned()
+        .collect();
+    let stitch_seq_type = args.seq_type;
 
     // rayon 全局池按 --CPU 设一次（局部需不同线程数的入口——inchworm/
     // chrysalis GFF/RTT/quantify/butterfly 池——各自显式 scoped pool 覆盖;
@@ -701,21 +711,15 @@ pub fn run_trinity(args: &TrinityArgs) -> Result<PathBuf, CommonError> {
     }
 
     // ---- 7.5 输出层 split-read 缝合（Rust 版扩展, --stitch 开启）----
-    // reads 用管线当前持有的（fq 输入时为归一化 fa——断点处桥 read 深度被
-    // cap 到 ~max_cov 仍远超阈值; 与 frag_merge 用原始 reads 的取舍不同,
-    // 此处判据是同 read 共现, 稀释不伤特异性）。统计行落 .stage_timings。
+    // v1 起扫**原始** reads（归一化的 max_cov cap 会把断点横跨 read 稀释到
+    // 阈值边缘）; 整文件读入 + rayon 分块并行扫描（stitch_reads/stitch_seq_type
+    // 在归一化前快照）。统计行落 .stage_timings。
     if args.stitch {
-        let read_files: Vec<std::path::PathBuf> = args
-            .left
-            .iter()
-            .chain(&args.right)
-            .cloned()
-            .collect();
         let st = trinity_common::timer::timed(&round_dir, "stitch", || {
             crate::stitch::stitch_fasta(
                 &trinity_tmp,
-                &read_files,
-                args.seq_type,
+                &stitch_reads,
+                stitch_seq_type,
                 &crate::stitch::StitchParams::default(),
             )
         })?;
