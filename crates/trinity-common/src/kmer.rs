@@ -15,11 +15,13 @@ pub struct U256 {
     pub lo: u128,
 }
 
-/// 滚动 k-mer 编码键抽象（性能分层, 2026-09-02）:
+/// 滚动 k-mer 编码键抽象（性能分层, 2026-09-02; 2026-09-04 加 u64 层）:
 /// - [`U256`]（= KmerId）: 全域 k≤128, 管线对外类型
 /// - `u128`: k≤64 的紧凑键（diginorm 计数/查表热路径——k=25 时代价 24B/槽
 ///   vs U256 的 40B/槽, 表 footprint 与插入访存显著占优）
-/// 数值语义全域一致: u128 键 = KmerId 的 lo limb（hi 恒 0）。
+/// - `u64`: k≤32 的最紧凑键（diginorm k=25 主路径——键带宽/哈希域减半,
+///   大表 cache miss 与 FxHash 成本同步降; 压时间战役 2026-09-04）
+/// 数值语义全域一致: u64 键 = u128 键 = KmerId 的低 limb（高位恒 0）。
 pub trait RollingKey: Copy + Eq + Ord + std::hash::Hash {
     /// 低 2k 位全 1 掩码
     fn low_mask(k: usize) -> Self;
@@ -34,6 +36,47 @@ pub trait RollingKey: Copy + Eq + Ord + std::hash::Hash {
     /// 从全宽键收窄（u128: hi 必须为 0）
     fn from_wide(w: &KmerId) -> Self;
     fn to_wide(self) -> KmerId;
+}
+
+impl RollingKey for u64 {
+    #[inline]
+    fn low_mask(k: usize) -> u64 {
+        debug_assert!(k <= 32);
+        if k >= 32 { u64::MAX } else { (1u64 << (2 * k)) - 1 }
+    }
+    #[inline]
+    fn zero() -> u64 {
+        0
+    }
+    #[inline]
+    fn from_base(v: u8) -> u64 {
+        v as u64
+    }
+    #[inline]
+    fn roll_forward(self, v: u8, mask: u64) -> u64 {
+        ((self << 2) | v as u64) & mask
+    }
+    #[inline]
+    fn roll_rev(self, v: u8, rev_shift: u32, mask: u64) -> u64 {
+        ((self >> 2) | (((v ^ 3) as u64) << rev_shift)) & mask
+    }
+    fn revcomp(self, k: usize) -> u64 {
+        let mut r = 0u64;
+        let mut kmer = !self;
+        for _ in 0..k {
+            r <<= 2;
+            r |= kmer & 3;
+            kmer >>= 2;
+        }
+        r
+    }
+    fn from_wide(w: &KmerId) -> u64 {
+        debug_assert!(w.hi == 0 && w.lo <= u64::MAX as u128, "u64 键收窄要求 k≤32");
+        w.lo as u64
+    }
+    fn to_wide(self) -> KmerId {
+        U256 { hi: 0, lo: self as u128 }
+    }
 }
 
 impl RollingKey for u128 {
@@ -487,6 +530,55 @@ pub fn compute_entropy(mut kmer: KmerId, kmer_length: usize) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 性能分层 u64 层（2026-09-04）: k≤32 域内 u64 键数值恒等于 u128 键与
+    /// KmerId 低 limb（滚动/revcomp/canonical 同一算法）——diginorm 计数
+    /// 换 u64 键的多重集等价由该数值一致性 + 泛型同代码保证。
+    #[test]
+    fn rolling_key_u64_numerics_match_u128_and_wide() {
+        for k in [15usize, 25, 31, 32] {
+            let mask64 = u64::low_mask(k);
+            let mask128 = u128::low_mask(k);
+            let mut x64 = u64::zero();
+            let mut x128 = u128::zero();
+            // 滚动喂入一段确定序列（含全部 4 碱基轮转）
+            for b in b"GATCGATCGATCGATCGATCGATCGATCGATCGATC".iter().take(k) {
+                let v = base_to_int(*b).unwrap();
+                x64 = x64.roll_forward(v, mask64);
+                x128 = x128.roll_forward(v, mask128);
+            }
+            assert_eq!(x128, x64 as u128, "k={k}: 滚动键数值一致");
+            assert_eq!(x64.to_wide().lo, x64 as u128);
+            assert_eq!(u64::from_wide(&x128.to_wide()), x64);
+            // revcomp 一致（canonical_merge_sum 的键语义）
+            assert_eq!(x128.revcomp(k), x64.revcomp(k) as u128, "k={k}: revcomp 一致");
+            // 反向滚动键一致
+            let rs = (2 * k - 2) as u32;
+            let mut r64 = u64::zero();
+            let mut r128 = u128::zero();
+            for b in b"GATCGATCGATCGATCGATCGATCGATCGATCGATC".iter().take(k) {
+                let v = base_to_int(*b).unwrap();
+                r64 = r64.roll_rev(v, rs, mask64);
+                r128 = r128.roll_rev(v, rs, mask128);
+            }
+            assert_eq!(r128, r64 as u128, "k={k}: 反向滚动键一致");
+        }
+        // k=25（diginorm 实际值）: 与黄金编码对拍
+        let mask = u64::low_mask(25);
+        let mut x = u64::zero();
+        for b in b"ACGTAACGTAACGTAACGTAACGT" {
+            x = x.roll_forward(base_to_int(*b).unwrap(), mask);
+        }
+        assert_eq!(x128_of_25(), x as u128);
+        fn x128_of_25() -> u128 {
+            let mask = u128::low_mask(25);
+            let mut x = u128::zero();
+            for b in b"ACGTAACGTAACGTAACGTAACGT" {
+                x = x.roll_forward(base_to_int(*b).unwrap(), mask);
+            }
+            x
+        }
+    }
 
     #[test]
     fn single_base_encoding() {

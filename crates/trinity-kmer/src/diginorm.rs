@@ -495,19 +495,27 @@ fn revcomp_fasta_mirror(data: &[u8]) -> Vec<u8> {
 
 // ---------------------------------------------------------------- 计数（dump -L 语义）
 
-/// 归一化计数表双分派（性能分层, 2026-09-02）: k≤64 走 u128 紧凑键
-/// （24B/槽 vs KmerId 表 40B/槽, 表 footprint 缩 40%）, k>64 落 KmerId 全宽。
-/// 表只活在 diginorm 内部（计数→过滤→canonical 合并→逐 read 查表）,
-/// 键不外泄到管线其他环节。
+/// 归一化计数表三分派（性能分层, 2026-09-02; 2026-09-04 加 u64 层）:
+/// k≤32 走 u64 最紧凑键（diginorm k=25 主路径, 键带宽减半）, k≤64 走 u128
+/// （24B/槽 vs KmerId 表 40B/槽）, k>64 落 KmerId 全宽。表只活在 diginorm
+/// 内部（计数→过滤→canonical 合并→逐 read 查表）, 键不外泄到管线其他环节。
 #[derive(PartialEq, Debug)]
 enum CountTable {
+    S(FxHashMap<u64, u32>),
     N(FxHashMap<u128, u32>),
     W(CountMap),
 }
 
 impl CountTable {
     fn build(both_fa: &[u8], params: &DigiNormParams) -> Self {
-        if params.k <= 64 {
+        if params.k <= 32 {
+            CountTable::S(crate::counter::count_fasta_data_of::<u64>(
+                both_fa,
+                params.k,
+                params.ds,
+                0,
+            ))
+        } else if params.k <= 64 {
             CountTable::N(crate::counter::count_fasta_data_of::<u128>(
                 both_fa,
                 params.k,
@@ -527,6 +535,11 @@ impl CountTable {
     /// 同 k 构建 → 变体恒同; 跨变体合并在此为编程错误（debug_assert 兜底丢弃）。
     fn merge_other(&mut self, other: CountTable) {
         match (self, other) {
+            (CountTable::S(a), CountTable::S(b)) => {
+                for (k2, c) in b {
+                    *a.entry(k2).or_insert(0) += c;
+                }
+            }
             (CountTable::N(a), CountTable::N(b)) => {
                 for (k2, c) in b {
                     *a.entry(k2).or_insert(0) += c;
@@ -546,6 +559,7 @@ impl CountTable {
 
     fn retain_min(&mut self, min: u32) {
         match self {
+            CountTable::S(m) => m.retain(|_, c| *c >= min),
             CountTable::N(m) => m.retain(|_, c| *c >= min),
             CountTable::W(m) => m.retain(|_, c| *c >= min),
         }
@@ -553,6 +567,7 @@ impl CountTable {
 
     fn canonical_merge_sum(self, k: usize) -> Self {
         match self {
+            CountTable::S(m) => CountTable::S(canonical_merge_sum_of(m, k)),
             CountTable::N(m) => CountTable::N(canonical_merge_sum_of(m, k)),
             CountTable::W(m) => CountTable::W(canonical_merge_sum_of(m, k)),
         }
@@ -565,15 +580,20 @@ impl CountTable {
         k: usize,
     ) -> Result<Vec<CoverageStatsRow>, CommonError> {
         match self {
+            CountTable::S(m) => coverage_stats_rows_of::<u64>(reads_fa, m, k, true),
             CountTable::N(m) => coverage_stats_rows_of::<u128>(reads_fa, m, k, true),
             CountTable::W(m) => coverage_stats_rows_of::<KmerId>(reads_fa, m, k, true),
         }
     }
 
-    /// 测试访问器: 以全宽键查计数（u128 分支要求 hi==0, k≤64 域内恒真）
+    /// 测试访问器: 以全宽键查计数（u64/u128 分支要求高位为 0, 域内恒真）
     #[cfg(test)]
     fn get(&self, key: &KmerId) -> Option<u32> {
         match self {
+            CountTable::S(m) => {
+                debug_assert!(key.hi == 0 && key.lo <= u64::MAX as u128);
+                m.get(&(key.lo as u64)).copied()
+            }
             CountTable::N(m) => {
                 debug_assert!(key.hi == 0);
                 m.get(&key.lo).copied()
@@ -585,6 +605,7 @@ impl CountTable {
     #[cfg(test)]
     fn len(&self) -> usize {
         match self {
+            CountTable::S(m) => m.len(),
             CountTable::N(m) => m.len(),
             CountTable::W(m) => m.len(),
         }

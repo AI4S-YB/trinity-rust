@@ -154,7 +154,8 @@ pub struct KmerCountTable;
 
 impl KmerCountTable {
     /// 并行统计 FASTA 字节流的 k-mer 计数（KmerId 口径; 泛型核心见
-    /// [`count_fasta_data_of`]——diginorm 热路径用 u128 紧凑键实例化）。
+    /// [`count_fasta_data_of`]——diginorm 热路径按 k 分层用 u64/u128
+    /// 紧凑键实例化）。
     pub fn count_fasta_data(data: &[u8], k: usize, ds: bool) -> CountMap {
         Self::count_fasta_data_with_capacity(data, k, ds, 0)
     }
@@ -178,7 +179,8 @@ impl KmerCountTable {
 }
 
 /// 并行计数泛型核心: rayon 按记录分片 → 每线程局部 FxHashMap<K,u32> →
-/// reduce 合并（jellyfish 同型策略）。K = u128（k≤64 紧凑键）或 KmerId。
+/// reduce 合并（jellyfish 同型策略）。K = u64（k≤32）/u128（k≤64 紧凑键）
+/// 或 KmerId。
 pub fn count_fasta_data_of<K>(
     data: &[u8],
     k: usize,

@@ -30,6 +30,7 @@
 
 use std::collections::HashMap;
 
+use rayon::prelude::*;
 use trinity_common::error::CommonError;
 
 use crate::dna_vector::{compute_entropy, read_fasta_bytes, revcomp, DnaSeq};
@@ -79,20 +80,67 @@ pub fn reads_ext_filename(path: &str) -> String {
     format!("{path}.reads")
 }
 
-/// KmerTable.h:31-59 `KmerEntry`（只留 Index/Pos）。
+/// **性能重构（2026-09-04 压时间战役, 产物逐字节不变）**: 原实现
+/// `add_kmers` 对全部 25-mer 做间接寻址比较排序（`kmer_bytes` 双层间接 +
+/// 25 字节 memcmp, O(N log N) 次 cache miss）, quantify 阶段 39→311s 的
+/// 主热点。改为**两群物化键**:
+/// - 主群: 全 ACGT 的 k-mer 按保序 2bit 映射（A=0,C=1,G=2,T=3 —— 与 ASCII
+///   序 A<C<G<T 一致）打包 u64（kk ≤ 32 时恒可装下 2·32=64 bit）;
+/// - 次群: 其余（含 N/其他字符）按原字节比较路径, 天然稀少。
+///
+/// **等价性**: 查询是精确匹配——sub 全 ACGT 时只可能与主群条目相等（次群
+/// 至少一个字节非 ACGT）, 反之亦然, 两群不交叉, 无跨群序问题。同 kmer 组内
+/// 收集序 = (read, pos) 升序: 原版稳定排序保持生成序（read 主序内 pos 升序）,
+/// 新实现 `sort_unstable_by_key((key, read, pos))` 显式保证同键组内
+/// (read, pos) 升序 —— 与生成序一致, ids push 顺序不变, 输出逐字节相同。
+#[derive(Debug, Default)]
+struct KmerTable {
+    /// 主群（kk ≤ 32 且 k-mer 全 ACGT; kk > 32 时恒空, 全走次群）。
+    main: Vec<MainEntry>,
+    /// 次群（key = 原始字节, 稀少: Q30 数据 N 率 ~0.01%）。
+    alt: Vec<(Vec<u8>, u32, u32)>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct KmerEntry {
-    read: usize,
-    pos: usize,
+struct MainEntry {
+    key: u64,
+    read: u32,
+    pos: u32,
+}
+
+/// 保序 2bit 打包: 全 ACGT 的定长字节串 → u64（None = 含其他字符或 kk > 32）。
+/// A=0,C=1,G=2,T=3 与 ASCII 序一致 → u64 字典序 == 字节字典序。
+#[inline]
+fn pack_acgt(sub: &[u8]) -> Option<u64> {
+    if sub.len() > 32 {
+        return None;
+    }
+    let mut k = 0u64;
+    for &c in sub {
+        let v = match c {
+            b'A' => 0,
+            b'C' => 1,
+            b'G' => 2,
+            b'T' => 3,
+            _ => return None,
+        };
+        k = (k << 2) | v as u64;
+    }
+    Some(k)
 }
 
 /// KmerTable.h:63-135 `IDS`：ori=-1 表示 revcomp 命中（坐标已翻转）。
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// 字段紧凑化（压时间战役 2026-09-04, 值域论证）: id ≤ max_reads 截断
+/// （u32 充裕）; start < read 长（i32）; edge = 组件内节点号（组件图行数
+/// 远达不到 i32 域）; ori ∈ {1,-1}（i8）。40B → 16B, 亿级命中条目的
+/// 排序比较与内存流量同步降。排序仍为稳定 sort_by_key((ori,id,start))
+/// ——tie（同 (ori,id,start) 不同 edge）保持收集序, 与原版一致。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Ids {
-    id: usize,
-    start: i64,
-    edge: i64,
-    ori: i32,
+    id: u32,
+    start: i32,
+    edge: i32,
+    ori: i8,
 }
 
 /// QuantifyGraph 主流程（两遍扫图）。输入 `graph_tmp` / `reads_tmp`（分区器
@@ -131,12 +179,25 @@ pub fn quantify_graph_mem(
     p: &QgParams,
 ) -> Result<(String, String), CommonError> {
     let kk = p.k + 1; // 内部 25
+    let t_parse = std::time::Instant::now();
     let mut seqs = read_fasta_bytes(reads_data, true);
     if p.max_reads > 0 {
         seqs.truncate(p.max_reads as usize);
     }
 
+    let t_add = std::time::Instant::now();
     let kmers = add_kmers(&seqs, kk);
+    let t_join = std::time::Instant::now();
+    if qg_profile_enabled() {
+        QG_STATS.parse_nanos.fetch_add(
+            t_parse.elapsed().as_nanos() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        QG_STATS.add_nanos.fetch_add(
+            t_add.elapsed().as_nanos() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
 
     let graph = graph_text;
 
@@ -190,10 +251,10 @@ pub fn quantify_graph_mem(
                 if n1 + n2 < i32::MAX as i64 {
                     for e in &mut ids[from..] {
                         e.ori = -1;
-                        let len = seqs[e.id].seq.len() as i64;
+                        let len = seqs[e.id as usize].seq.len() as i32;
                         let pos = e.start + 1;
                         // 原版 SetStart(len - pos - k + 1) = len - start - 25
-                        e.start = len - pos - kk as i64 + 1;
+                        e.start = len - pos - kk as i32 + 1;
                     }
                 } else {
                     println!("WARNING: k-mer overflow, n={} . Discarding.", n1 + n2);
@@ -219,27 +280,63 @@ pub fn quantify_graph_mem(
     if !ids.is_empty() {
         sort_print(&mut r, &mut ids, &seqs);
     }
+    if qg_profile_enabled() {
+        QG_STATS.join_nanos.fetch_add(
+            t_join.elapsed().as_nanos() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
 
     Ok((g, r))
 }
 
-/// `add_kmers`（:225-235）：全部 25-mer 入表后按 25 字节字典序排序。
-fn add_kmers(seqs: &[DnaSeq], kk: usize) -> Vec<KmerEntry> {
-    let mut v: Vec<KmerEntry> = Vec::new();
+/// QG_PROFILE=1 时的分段累计（压时间战役 2026-09-04, 不对外承诺格式）:
+/// parse = read_fasta_bytes + 截断, add = add_kmers（生成+排序）,
+/// join = 其余（两遍扫图 + 二分收集 + sort_print）。
+pub struct QgStats {
+    pub parse_nanos: std::sync::atomic::AtomicU64,
+    pub add_nanos: std::sync::atomic::AtomicU64,
+    pub join_nanos: std::sync::atomic::AtomicU64,
+}
+
+pub static QG_STATS: QgStats = QgStats {
+    parse_nanos: std::sync::atomic::AtomicU64::new(0),
+    add_nanos: std::sync::atomic::AtomicU64::new(0),
+    join_nanos: std::sync::atomic::AtomicU64::new(0),
+};
+
+pub fn qg_profile_enabled() -> bool {
+    static P: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *P.get_or_init(|| std::env::var_os("QG_PROFILE").is_some())
+}
+
+/// `add_kmers`（:225-235）: 全部 k-mer 入两群表（见 [`KmerTable`]）,
+/// 各群按 (键, read, pos) 排序——同 kmer 组内 (read, pos) 升序 = 生成序,
+/// 与原单一数组 + 稳定排序的收集序逐条目一致。
+fn add_kmers(seqs: &[DnaSeq], kk: usize) -> KmerTable {
+    let mut t = KmerTable::default();
     for (j, s) in seqs.iter().enumerate() {
         if s.seq.len() >= kk {
             for i in 0..=s.seq.len() - kk {
-                v.push(KmerEntry { read: j, pos: i });
+                let sub = &s.seq[i..i + kk];
+                match pack_acgt(sub) {
+                    Some(key) => t.main.push(MainEntry {
+                        key,
+                        read: j as u32,
+                        pos: i as u32,
+                    }),
+                    None => t.alt.push((sub.to_vec(), j as u32, i as u32)),
+                }
             }
         }
     }
-    v.sort_by(|a, b| kmer_bytes(seqs, a, kk).cmp(kmer_bytes(seqs, b, kk)));
-    v
-}
-
-#[inline]
-fn kmer_bytes<'a>(seqs: &'a [DnaSeq], e: &KmerEntry, kk: usize) -> &'a [u8] {
-    &seqs[e.read].seq[e.pos..e.pos + kk]
+    // par_sort: 巨型组件（200k read ≈ 25M k-mer）排序是大头; 组件间已在
+    // rayon 池并行, 长尾大组件经 work-stealing 吃到空闲核。(key, read, pos)
+    // 为全序无重复键 → 并行排序结果确定, 与串行 sort_unstable 逐字节一致。
+    t.main.par_sort_unstable_by_key(|e| (e.key, e.read, e.pos));
+    t.alt
+        .sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
+    t
 }
 
 /// `BasesToNumberCountPlus`（:237-287）：
@@ -247,9 +344,10 @@ fn kmer_bytes<'a>(seqs: &'a [DnaSeq], e: &KmerEntry, kk: usize) -> &'a [u8] {
 ///    `< 1.0` 直接返回（count 不动）；
 /// 2. lower_bound（键 = sub 完整 25 字符）起线性收集相等条目入 ids，
 ///    count = 命中数；查不到则 count 不动（原版 return -1 前不赋值）。
+///    主/次群按 [`pack_acgt`] 归位（精确匹配下两群不交叉）。
 fn bases_to_number_count_plus(
-    kmers: &[KmerEntry],
-    seqs: &[DnaSeq],
+    table: &KmerTable,
+    _seqs: &[DnaSeq],
     ids: &mut Vec<Ids>,
     count: &mut i64,
     sub: &[u8],
@@ -263,24 +361,38 @@ fn bases_to_number_count_plus(
         return;
     }
 
-    let idx = kmers.partition_point(|e| kmer_bytes(seqs, e, kk) < sub);
-    if idx == kmers.len() || sub < kmer_bytes(seqs, &kmers[idx], kk) {
-        return; // 未命中
-    }
     let mut n = 0i64;
-    for e in &kmers[idx..] {
-        if kmer_bytes(seqs, e, kk) != sub {
-            break;
+    if let Some(sk) = pack_acgt(sub) {
+        let m = &table.main;
+        let mut i = m.partition_point(|e| e.key < sk);
+        while i < m.len() && m[i].key == sk {
+            ids.push(Ids {
+                id: m[i].read,
+                start: m[i].pos as i32,
+                edge: edge as i32,
+                ori: 1,
+            });
+            n += 1;
+            i += 1;
         }
-        ids.push(Ids {
-            id: e.read,
-            start: e.pos as i64,
-            edge,
-            ori: 1,
-        });
-        n += 1;
+    } else {
+        let a = &table.alt;
+        let mut i = a.partition_point(|e| e.0.as_slice() < sub);
+        while i < a.len() && a[i].0.as_slice() == sub {
+            ids.push(Ids {
+                id: a[i].1,
+                start: a[i].2 as i32,
+                edge: edge as i32,
+                ori: 1,
+            });
+            n += 1;
+            i += 1;
+        }
     }
-    *count = n;
+    // 命中（原版此路径 n ≥ 1）才覆盖 count; 未命中不动（原版 return -1 语义）
+    if n > 0 {
+        *count = n;
+    }
 }
 
 /// `SortPrint`（:45-146）。输出直接追加到 `out`（graph/read 两个文件共享的
@@ -313,9 +425,9 @@ fn sort_print(out: &mut String, ids: &mut [Ids], seqs: &[DnaSeq]) {
 
     for e in ids.iter() {
         id = e.id as i64;
-        ori = e.ori;
-        start = e.start;
-        edge = e.edge;
+        ori = e.ori as i32;
+        start = e.start as i64;
+        edge = e.edge as i64;
         if id != last_id || ori != last_ori {
             if last_id != -1 {
                 line.push_str(&format!("{last_start}\t{last_edge}\t"));
@@ -328,7 +440,7 @@ fn sort_print(out: &mut String, ids: &mut [Ids], seqs: &[DnaSeq]) {
                     last_ori,
                 );
             }
-            line = format!("{}\t{start}\t{edge}\t", seqs[e.id].name);
+            line = format!("{}\t{start}\t{edge}\t", seqs[e.id as usize].name);
             last_start_temp = start;
         }
         last_id = id;
@@ -377,31 +489,45 @@ mod tests {
     }
 
     #[test]
-    fn add_kmers_sorts_by_25_byte_lexicographic_including_n() {
-        // N 的 ASCII ('N'=0x4E) > 'GATC'，混 N 的 k-mer 按原始字节序排
+    fn add_kmers_two_group_ordering_equivalent_to_lexicographic() {
+        // 原语义: 全部 k-mer 按原始字节字典序稳定排序（N 的 ASCII 在 G/T 之间）。
+        // 新实现: 主群（全 ACGT, 2bit u64 保序）+ 次群（含 N 按字节）,
+        // 各群内 (键, read, pos) 升序。两群精确匹配不交叉 → 收集序等价。
         let seqs = vec![
-            seq(">a", "TTACG"),
-            seq(">b", "AAAN"), // 短于 25 的 read 不入表
-        ];
-        let kmers = add_kmers(&seqs, 25);
-        // "TTACG" 25-mer 不存在（len 5 < 25）→ 空
-        assert!(kmers.is_empty());
-
-        let seqs = vec![
-            seq(">a", "ACGTN"), // k=4（kk=5 测试）：ACGTN、CGTN…
+            seq(">a", "ACGTN"), // k=4（kk=5）: ACGTN、CGTN…（ACGTN 含 N → 次群）
             seq(">b", "ACGTA"),
+            seq(">c", "ACGTG"), // 主群序: ACGTA < ACGTG; 次群: ACGTN
         ];
-        let kmers = add_kmers(&seqs, 5);
-        let keys: Vec<&[u8]> = kmers.iter().map(|e| kmer_bytes(&seqs, e, 5)).collect();
+        let t = add_kmers(&seqs, 5);
+        // 主群键序 == 字节序（A<C<G<T 保序打包）
+        let main_keys: Vec<u64> = t.main.iter().map(|e| e.key).collect();
+        let mut sorted = main_keys.clone();
+        sorted.sort_unstable();
+        assert_eq!(main_keys, sorted, "主群须按 key 升序");
+        assert!(t.main.iter().all(|e| e.pos < 5));
+        // 次群字节序
+        let alt_keys: Vec<&[u8]> = t.alt.iter().map(|e| e.0.as_slice()).collect();
+        let mut sorted = alt_keys.clone();
+        sorted.sort();
+        assert_eq!(alt_keys, sorted, "次群须按字节升序");
+        // 含 N 的 5-mer 全在次群（ACGTN、CGTN…）
+        assert!(t.alt.iter().all(|e| e.0.contains(&b'N')));
+        assert!(!t.main.is_empty());
+
+        // 同 kmer 组内 (read, pos) 升序 = 生成序（原稳定排序的收集序）
+        let seqs = vec![seq(">x", "ACGTAACGTA"), seq(">y", "ACGTAACGTA")];
+        let t = add_kmers(&seqs, 5);
+        let hits: Vec<(u32, u32)> = t
+            .main
+            .iter()
+            .filter(|e| e.key == pack_acgt(b"ACGTA").unwrap())
+            .map(|e| (e.read, e.pos))
+            .collect();
         assert_eq!(
-            keys,
-            vec![
-                &b"ACGTA"[..], // read b（'A' < 'N'）
-                &b"ACGTN"[..], // read a
-            ]
+            hits,
+            vec![(0, 0), (0, 5), (1, 0), (1, 5)],
+            "同 kmer 组内 (read,pos) 须为生成序"
         );
-        assert_eq!(kmers[0].read, 1);
-        assert_eq!(kmers[1].read, 0);
     }
 
     // 手推拼查询 + ori=-1 坐标换算的端到端小向量：
@@ -551,7 +677,7 @@ mod tests {
         }];
         for e in ids.iter_mut() {
             e.ori = -1;
-            let len = seqs[e.id].seq.len() as i64;
+            let len = seqs[e.id as usize].seq.len() as i32;
             let pos = e.start + 1;
             e.start = len - pos - 25 + 1;
         }

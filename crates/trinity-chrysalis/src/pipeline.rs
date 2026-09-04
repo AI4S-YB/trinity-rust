@@ -284,6 +284,18 @@ pub fn run_chrysalis_pipeline(
         for w in writers.values() {
             w.lock().unwrap().finish()?;
         }
+        if crate::quantify::qg_profile_enabled() {
+            use std::sync::atomic::Ordering::Relaxed;
+            let q = &crate::quantify::QG_STATS;
+            eprintln!(
+                "[qg-profile] CPU 累计: parse(read_fasta) {:.1}s, add_kmers(生成+排序) {:.1}s, join(扫图+收集+输出) {:.1}s, pipe_read(tmp.pack) {:.1}s, pipe_write(锁内写) {:.1}s",
+                q.parse_nanos.load(Relaxed) as f64 / 1e9,
+                q.add_nanos.load(Relaxed) as f64 / 1e9,
+                q.join_nanos.load(Relaxed) as f64 / 1e9,
+                PIPE_READ_NANOS.load(Relaxed) as f64 / 1e9,
+                PIPE_WRITE_NANOS.load(Relaxed) as f64 / 1e9,
+            );
+        }
         // 清理统计行 + 落 .stage_timings（CPU 时间累计: 各组件并行清理的耗时和）
         if p.graph_clean_rnaspades {
             let st = clean_stats.lock().unwrap();
@@ -410,10 +422,20 @@ fn run_quantify_packed(
     gap_stats: &Mutex<crate::gap_close::GapCloseStats>,
     gap_nanos: &std::sync::atomic::AtomicU64,
 ) -> Result<(), String> {
-    let graph = read_tmp_record(dir, tmp_idx, id, KIND_GRAPH_TMP)?;
-    let reads = read_tmp_record(dir, tmp_idx, id, KIND_READS_TMP)?;
-    let graph = String::from_utf8(graph).map_err(|e| e.to_string())?;
-    let (gout, rout) = quantify_graph_mem(&graph, &reads, p).map_err(|e| e.to_string())?;
+    let graph = {
+        let t = std::time::Instant::now();
+        let g = read_tmp_record(dir, tmp_idx, id, KIND_GRAPH_TMP)?;
+        let r = read_tmp_record(dir, tmp_idx, id, KIND_READS_TMP)?;
+        let g = String::from_utf8(g).map_err(|e| e.to_string())?;
+        if crate::quantify::qg_profile_enabled() {
+            PIPE_READ_NANOS.fetch_add(
+                t.elapsed().as_nanos() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
+        (g, r)
+    };
+    let (gout, rout) = quantify_graph_mem(&graph.0, &graph.1, p).map_err(|e| e.to_string())?;
     let gout = if graph_clean {
         let t0 = std::time::Instant::now();
         let (cleaned, st) = crate::graph_clean::clean_graph_rnaspades(&gout);
@@ -428,7 +450,7 @@ fn run_quantify_packed(
     // after_simplify=true）——此处清理之后缝合, 顺序一致。
     let gout = if gap_close {
         let t0 = std::time::Instant::now();
-        let (closed, st) = crate::gap_close::close_gaps_spades(&gout, &reads, p.strand);
+        let (closed, st) = crate::gap_close::close_gaps_spades(&gout, &graph.1, p.strand);
         gap_nanos
             .fetch_add(t0.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
         gap_stats.lock().unwrap().add_assign(&st);
@@ -437,14 +459,26 @@ fn run_quantify_packed(
         gout
     };
     {
+        let t = std::time::Instant::now();
         let mut w = writer.lock().unwrap();
         w.append(id, KIND_GRAPH_OUT, gout.as_bytes())
             .map_err(|e| e.to_string())?;
         w.append(id, KIND_GRAPH_READS, rout.as_bytes())
             .map_err(|e| e.to_string())?;
+        drop(w);
+        if crate::quantify::qg_profile_enabled() {
+            PIPE_WRITE_NANOS.fetch_add(
+                t.elapsed().as_nanos() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
     }
     Ok(())
 }
+
+/// QG_PROFILE 分段（管线层: tmp.pack 读 + writer 锁内写）。
+static PIPE_READ_NANOS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static PIPE_WRITE_NANOS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 #[cfg(test)]
 mod tests {

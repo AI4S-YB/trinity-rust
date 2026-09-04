@@ -132,6 +132,27 @@ pub fn detect_read_length(args: &TrinityArgs) -> Result<usize, CommonError> {
     })
 }
 
+/// `--weld-min-glue` auto 的读长分界（2026-09-04 转正）: RL ≥ 150 → 1（mg1,
+/// QM4 组合验证 R+0.6）; 短读 → 2（原版, dev1 76bp 上单 read 证据 P−1.7 系噪声）。
+pub const WELD_MG1_READ_LEN_MIN: usize = 150;
+
+/// `--weld-min-glue` auto（哨兵 0）resolve: 按抽样读长给 mg1/原版阈值;
+/// 显式值（≠0）原样返回、不读文件。`detected_rl` 传入已测读长避免重复抽样
+/// （None 且需要时才现场测）。
+pub fn resolve_weld_min_glue(
+    args: &TrinityArgs,
+    detected_rl: Option<usize>,
+) -> Result<u32, CommonError> {
+    if args.weld_min_glue != 0 {
+        return Ok(args.weld_min_glue);
+    }
+    let rl = match detected_rl {
+        Some(rl) => rl,
+        None => detect_read_length(args)?,
+    };
+    Ok(if rl >= WELD_MG1_READ_LEN_MIN { 1 } else { 2 })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -186,6 +207,46 @@ mod tests {
         assert_eq!(clamp_auto_k_list(vec![29, 37]), vec![29, 37]);
         assert_eq!(clamp_auto_k_list(vec![55, 123]), vec![55, 63]);
         assert_eq!(clamp_auto_k_list(vec![73, 123]), vec![63]);
+    }
+
+    /// weld-min-glue auto 分界: RL≥150 → 1（mg1）, 短读 → 2（原版）;
+    /// 显式值直通（不触发读长抽样）。
+    #[test]
+    fn resolve_weld_min_glue_boundaries() {
+        fn args_with(mg: u32) -> TrinityArgs {
+            parse_with_weld_min_glue(mg)
+        }
+        // 显式值直通（哨兵之外的任何值, 含 1/2）
+        assert_eq!(resolve_weld_min_glue(&args_with(1), None).unwrap(), 1);
+        assert_eq!(resolve_weld_min_glue(&args_with(2), None).unwrap(), 2);
+        assert_eq!(resolve_weld_min_glue(&args_with(5), Some(150)).unwrap(), 5);
+        // auto: 分界 150（≥ → mg1, < → 原版）——detected_rl 直通免抽样
+        assert_eq!(resolve_weld_min_glue(&args_with(0), Some(150)).unwrap(), 1);
+        assert_eq!(resolve_weld_min_glue(&args_with(0), Some(250)).unwrap(), 1);
+        assert_eq!(resolve_weld_min_glue(&args_with(0), Some(149)).unwrap(), 2);
+        assert_eq!(resolve_weld_min_glue(&args_with(0), Some(76)).unwrap(), 2);
+    }
+
+    /// 测试用 TrinityArgs 构造（--weld-min-glue 显式注入, 其余走 CLI 解析）。
+    fn parse_with_weld_min_glue(mg: u32) -> TrinityArgs {
+        let argv: Vec<String> = [
+            "--seqType",
+            "fq",
+            "--left",
+            "l.fq",
+            "--right",
+            "r.fq",
+            "--max_memory",
+            "2G",
+            "--output",
+            "out",
+            "--weld-min-glue",
+            &mg.to_string(),
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        crate::args::parse_args(&argv).unwrap()
     }
 
     fn write(p: &Path, bytes: &[u8]) {

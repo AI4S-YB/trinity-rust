@@ -297,7 +297,15 @@ pub fn run_trinity(args: &TrinityArgs) -> Result<PathBuf, CommonError> {
     // gtasm·recursive 特例回退, 见 args::resolve_multi_k）;
     // auto → 读长抽样 + rna_k_values 公式 + 支持域钳制（multik.rs）。
     // 启动即打印生效 k 序列（"multi-k: auto → [..]" / "single-k: N"）,
-    // 让用户一眼确认模式。k = 最后一轮的 k（单 k 时即唯一轮）。----
+    // 让用户一眼确认模式。k = 最后一轮的 k（单 k 时即唯一轮）。
+    // 读长抽样只做一次: multi-k auto 公式与 weld-min-glue auto（mg1 分界）
+    // 共用（multik::detect_read_length, 每文件前 1000 条）。----
+    let need_rl = matches!(args.multi_k, Some(MultiK::Auto)) || args.weld_min_glue == 0;
+    let detected_rl = if need_rl {
+        Some(crate::multik::detect_read_length(args)?)
+    } else {
+        None
+    };
     let k_list: Vec<usize> = match &args.multi_k {
         None => {
             eprintln!("single-k: {}", args.kmer_size);
@@ -308,7 +316,8 @@ pub fn run_trinity(args: &TrinityArgs) -> Result<PathBuf, CommonError> {
             ks.clone()
         }
         Some(MultiK::Auto) => {
-            let rl = crate::multik::detect_read_length(args)?;
+            let rl = detected_rl
+                .expect("need_rl 守卫: multi-k auto 必已抽样读长");
             let raw = crate::multik::rna_k_values(rl);
             let ks = crate::multik::clamp_auto_k_list(raw.clone());
             eprintln!(
@@ -320,6 +329,33 @@ pub fn run_trinity(args: &TrinityArgs) -> Result<PathBuf, CommonError> {
     };
     // 恒非空: None→[kmer_size]; List 解析校验非空; auto 公式恒非空。
     let k = *k_list.last().unwrap();
+
+    // ---- 2026-09-04 转正: 两个 QM4(150bp) 验证项默认生效 ----
+    // rtt-multi-kmer 默认开（dev1/dev3 零回退 + QM4 R+0.3/召回+99）,
+    // --no-rtt-multi-kmer 回退; weld-min-glue 默认 auto（RL≥150 → 1/mg1,
+    // 短读 → 2/原版）, 显式值覆盖。启动打印让用户确认生效值。----
+    let weld_min_glue = crate::multik::resolve_weld_min_glue(args, detected_rl)?;
+    eprintln!(
+        "rtt-multi-kmer: {}（默认开, --no-rtt-multi-kmer 回退）; weld-min-glue: {}（{}）",
+        if args.rtt_multi_kmer { "on" } else { "off" },
+        weld_min_glue,
+        if args.weld_min_glue != 0 {
+            format!("显式 --weld-min-glue {}", args.weld_min_glue)
+        } else {
+            format!(
+                "auto: 读长 RL={} {} → {}",
+                detected_rl
+                    .map(|rl| rl.to_string())
+                    .unwrap_or_else(|| "未抽样".into()),
+                if detected_rl.is_some_and(|rl| rl >= crate::multik::WELD_MG1_READ_LEN_MIN) {
+                    "≥150"
+                } else {
+                    "<150"
+                },
+                if weld_min_glue == 1 { "mg1" } else { "原版 2" }
+            )
+        },
+    );
 
     // ---- 1. 归一化（L1441-1453; checkpoint insilico_read_normalization/normalization.ok）----
     // fa_direct（fq 输入直出归一化 fa）时: 下游按 fa 消费, 且 SS revcomp 已在
@@ -507,7 +543,7 @@ pub fn run_trinity(args: &TrinityArgs) -> Result<PathBuf, CommonError> {
                         graph_clean_rnaspades: args.graph_clean_rnaspades,
                         rtt_multi_kmer: args.rtt_multi_kmer,
                         weld_glue_factor: args.weld_glue_factor,
-                        weld_min_glue: args.weld_min_glue,
+                        weld_min_glue,
                         cluster_max_size: args.cluster_max_size,
                         weld_reads_path: None,
                         gap_close_spades: args.gap_close_spades,
@@ -1016,7 +1052,8 @@ fn run_recursive(
                     graph_clean_rnaspades: false, // 递归 phase-1 跳过 quantify, 清理不生效
                     rtt_multi_kmer: args.rtt_multi_kmer,
                     weld_glue_factor: args.weld_glue_factor,
-                    weld_min_glue: args.weld_min_glue,
+                    // auto（哨兵 0）同样在递归线生效: 现场抽样读长 resolve
+                    weld_min_glue: crate::multik::resolve_weld_min_glue(args, None)?,
                     cluster_max_size: args.cluster_max_size,
                     weld_reads_path: None,
                     gap_close_spades: false,      // 递归 phase-1 跳过 quantify, 缝合不生效

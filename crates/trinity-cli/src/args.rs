@@ -142,13 +142,17 @@ pub struct TrinityArgs {
     /// 默认关 = 现有行为逐字节不变。--recursive 下暂不生效（迷你管线未接线）。
     pub graph_clean_rnaspades: bool,
     /// **Rust 版扩展**: ReadsToTranscripts 的 25-mer 索引多值化（共享 kmer
-    /// 记全部组件, 默认关 = 原版后写者赢单值语义）。救跨 weld 口 read 被
-    /// 其他组件抢占 → 组件图断口无桥（QM4 缺失解剖 2026-09-03）。
+    /// 记全部组件, 原版为后写者赢单值语义）。救跨 weld 口 read 被其他组件
+    /// 抢占 → 组件图断口无桥（QM4 缺失解剖 2026-09-03）。**2026-09-04 转正
+    /// 默认开**（dev1/dev3 零回退 + QM4 R+0.3/召回+99/230 组件进图）;
+    /// `--no-rtt-multi-kmer` 回退原版单值语义。
     pub rtt_multi_kmer: bool,
     /// **Rust 版扩展**: GraphFromFasta weld 证据因子（--weld-glue-factor,
     /// 默认 0.05 = 原版）。聚类割裂档放宽方向（min_glue 随 cov 比例下调）。
     pub weld_glue_factor: f64,
-    /// **Rust 版扩展**: weld 最小 read 支持（--weld-min-glue, 默认 2 = 原版）。
+    /// **Rust 版扩展**: weld 最小 read 支持（--weld-min-glue）。**2026-09-04
+    /// 默认 auto（哨兵 0, orchestrate 处 resolve: 读长 ≥150 → 1/mg1, 短读 →
+    /// 2/原版——dev1 76bp 上单 read 证据 P−1.7 系噪声）**; 显式值覆盖。
     pub weld_min_glue: u32,
     /// **Rust 版扩展**: BubbleUpClustering 最大簇大小（--cluster-max-size,
     /// 默认 25 = 原版 -max_cluster_size）。
@@ -374,11 +378,14 @@ pub fn parse_args(argv: &[String]) -> Result<TrinityArgs, CliError> {
     let kmer_given = cli.was_given("--KMER_SIZE") || cli.was_given("__KMER_SIZE");
     // --graph-clean-rnaspades（Rust 版扩展, 默认关）
     let graph_clean_rnaspades = cli.bool_flag("--graph-clean-rnaspades");
-    // --rtt-multi-kmer（Rust 版扩展, 默认关）: RTT 25-mer 索引多值化
-    let rtt_multi_kmer = cli.bool_flag("--rtt-multi-kmer");
-    // 聚类参数（Rust 版扩展, 默认 = 原版）
+    // --rtt-multi-kmer（Rust 版扩展, 2026-09-04 转正默认开）: RTT 25-mer 索引
+    // 多值化; 旧旗标保留为幂等兼容, --no-rtt-multi-kmer 回退原版单值语义
+    let _rtt_multi_kmer_on = cli.bool_flag("--rtt-multi-kmer");
+    let rtt_multi_kmer = !cli.bool_flag("--no-rtt-multi-kmer");
+    // 聚类参数（Rust 版扩展; weld-min-glue 默认 auto 哨兵 0, orchestrate 按
+    // 读长 resolve: RL≥150 → 1/mg1, 短读 → 2/原版; 显式值覆盖）
     let weld_glue_factor = cli.float_flag("--weld-glue-factor", 0.05f64)?;
-    let weld_min_glue = cli.uint_flag("--weld-min-glue", 2u32)?;
+    let weld_min_glue = cli.uint_flag("--weld-min-glue", 0u32)?;
     let cluster_max_size = cli.uint_flag("--cluster-max-size", 25usize)?;
     // --gap-close-spades（Rust 版扩展, 默认关）
     let gap_close_spades = cli.bool_flag("--gap-close-spades");
@@ -589,6 +596,26 @@ mod tests {
     fn scratch_defaults_to_none() {
         let a = parse_args(&argv(&[])).unwrap();
         assert_eq!(a.scratch, None);
+    }
+
+    /// 2026-09-04 转正: rtt-multi-kmer 默认开 + weld-min-glue 默认 auto（哨兵 0）。
+    #[test]
+    fn rtt_multi_kmer_and_weld_min_glue_promoted_defaults() {
+        // 默认: rtt-multi-kmer 开, weld-min-glue = 0（auto, orchestrate 按读长 resolve）
+        let a = parse_args(&argv(&[])).unwrap();
+        assert!(a.rtt_multi_kmer);
+        assert_eq!(a.weld_min_glue, 0);
+        // 旧旗标保留为幂等兼容（不报 "do not understand option"）
+        let a = parse_args(&argv(&["--rtt-multi-kmer"])).unwrap();
+        assert!(a.rtt_multi_kmer);
+        // --no-rtt-multi-kmer 回退原版单值语义
+        let a = parse_args(&argv(&["--no-rtt-multi-kmer"])).unwrap();
+        assert!(!a.rtt_multi_kmer);
+        // 显式 weld-min-glue 覆盖 auto（含显式 2 = 原版）
+        let a = parse_args(&argv(&["--weld-min-glue", "1"])).unwrap();
+        assert_eq!(a.weld_min_glue, 1);
+        let a = parse_args(&argv(&["--weld-min-glue", "2"])).unwrap();
+        assert_eq!(a.weld_min_glue, 2);
     }
 
     #[test]

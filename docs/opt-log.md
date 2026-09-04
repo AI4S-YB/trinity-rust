@@ -2743,3 +2743,61 @@ F1 +0.2, 净召回 99 + partial 237。dev1 组合: R +0.1, **P −1.7**（mg1
 - --weld-min-glue 1: 数据依赖（真实 150bp 可开, 短读/模拟不建议）
 - 其余探索旗标（no-merge/empty-retry/weld-reads/glue/cluster-max）:
   未达转正线, 留复现
+
+## QM4 验证项转正默认 + quantify 物化键优化（2026-09-04）
+
+**转正（用户指令"两个 150bp 可用的东西设置为默认开启"）**:
+- --rtt-multi-kmer → 默认开（三数据集零回退 + QM4 R+0.3/召回+99）,
+  --rtt-multi-kmer 保留为幂等兼容, --no-rtt-multi-kmer 回退原版单值语义
+- --weld-min-glue → 默认 auto（哨兵 0, multik::resolve_weld_min_glue）:
+  读长抽样 RL≥150 → 1（mg1, WELD_MG1_READ_LEN_MIN）, 短读 → 2（原版）;
+  显式值覆盖; 读长抽样与 --multi-k auto 共用一次（need_rl 守卫）;
+  递归 phase-1 线同样 resolve。启动打印生效值行。
+
+**quantify 压时间**（rttmk 的 39→311s 代价）:
+微基准 examples/qg_bench（QM4 left.fq 前 200k read ≈ 25.2M 25-mer,
+20k 边）: baseline 14.83s → 物化键 4.72s → +par_sort 4.20s（3.5×）。
+产物 FNV 指纹与 cmp 逐字节一致; quantify_vs_original 黄金对拍过。
+
+机制: add_kmers 原为 KmerEntry{read,pos} 间接寻址 + 25 字节 memcmp
+排序（O(N log N) 次 cache miss, 巨型组件 25M 条目）; 改两群物化——
+主群全 ACGT 按 A=0,C=1,G=2,T=3 保序 2bit 打包 u64（kk≤32）,
+sort_unstable_by_key((key,read,pos)); 次群（含 N 等, 稀少）按字节排序。
+查询 pack_acgt(sub) 归位两群（精确匹配下不交叉）, partition_point 数值
+比较收集。等价性: 同 kmer 组内 (read,pos) 升序 = 原稳定排序保持的生成序
+→ ids push 序不变 → 输出逐字节相同。排序 par_sort（(key,read,pos) 全序
+无重复 → 并行结果确定）。
+
+| 2026-09-04 | qg_bench 微基准 | 14.83s → **4.20s**（3.5×） | 逐字节一致 | examples/qg_bench left.fq.gz 200000 20000 |
+| 2026-09-04 | promo_default | R=44.4% P=51.3% **F1=47.6%** | N50=1796 n=117841 | --CPU 8 --max_memory 8G |
+| 2026-09-04 | promo_optimized | R=44.5% P=51.3% **F1=47.7%** | N50=1801 n=117922 | --CPU 8 --max_memory 8G |
+
+## diginorm 计数表 u64 键层（2026-09-04 压时间战役续）
+
+性能分层再加一层: `RollingKey` 补 `u64` 实现（k≤32 最紧凑键）, diginorm
+计数表三分派 k≤32→u64 / k≤64→u128 / 其余→KmerId。k=25 主路径键带宽
+与哈希域减半, 大表（FxHashMap 键+计数值 16B/槽 vs u128 的 28B）的
+footprint、cache miss 与 FxHash 同步降。等价性: k≤32 域内 u64 键数值
+恒等于 u128 键与 KmerId 低 limb（滚动/反向滚动/revcomp 同一算法）,
+由单测 `rolling_key_u64_numerics_match_u128_and_wide` 对 k=15/25/31/32
+全断言锁定 + 泛型同代码保证; 多重集计数与产物不变。
+
+微基准 examples/dn_bench（QM4 全量 PE fq.gz 3.1GB, 管线同参 DS +
+fa_direct, 32 线程, DN_PROFILE=1 分段）, 基线 = HEAD 38c7fa3（u128 层）:
+
+- wall 602.1s → **562.4s**（-6.6%）; 两侧 normalized fa 逐字节一致
+  （各 2.08GB cmp 通过）
+- 分段（段差）: stats_query_table 378.7→321.4s（**-15%**, 计数+逐 read
+  查表热路径）, sorted_stats_rows 76.9→68.6s（-11%）, select/index/
+  prep 持平; read_side/emit_side 段 +8.8s/+17.1s 系 NFS IO 抖动（与键
+  类型无关, 方向不利仍净赢 39.7s）
+- 归一化 wall 与 2026-09-01 战役的 584-749s 口径可比（当时 8-32 线程
+  不同配置）; 本轮固定 32 线程 A/B 同机串行
+
+| 2026-09-04 | dn_bench 微基准 | 602.1s → **562.4s**（-6.6%） | 逐字节一致 | examples/dn_bench left.fq.gz right.fq.gz out_dir（32 线程） |
+
+- 验证备注: 全量测试三轮中 `cli_parallel_iworm_smoke` 间歇挂一次
+  （6/2 线程 contig 多重集差异超容忍）——backlog.md 早已立案的 inchworm
+  并行平局序非确定（backlog.md:52, 原版同病）, 与本轮改动无关
+  （inchworm 不经 RollingKey/泛型计数路径）; 复跑即绿。
+
