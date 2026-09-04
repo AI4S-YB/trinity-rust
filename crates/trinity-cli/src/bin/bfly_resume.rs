@@ -22,11 +22,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut cpu = 32usize;
     let mut min_read_support = 2i64;
     let mut min_contig_length = 200usize;
+    let mut empty_retry = false;
     let mut out = iter_dir.join("bfly_resume.Trinity.fasta");
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
             "--no-path-merging" => no_path_merging = true,
+            "--empty-retry" => empty_retry = true,
             "--min-read-support" | "-R" => {
                 i += 1;
                 min_read_support = args[i].parse()?;
@@ -86,6 +88,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             gtasm_pair_support: false,
             no_path_merging,
             min_read_support,
+            empty_retry,
         },
     )?;
     let n = harvest(&listing, min_contig_length, Path::new(&out))?;

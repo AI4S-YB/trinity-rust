@@ -509,6 +509,7 @@ pub fn run_trinity(args: &TrinityArgs) -> Result<PathBuf, CommonError> {
                         weld_glue_factor: args.weld_glue_factor,
                         weld_min_glue: args.weld_min_glue,
                         cluster_max_size: args.cluster_max_size,
+                        weld_reads_path: None,
                         gap_close_spades: args.gap_close_spades,
                         ..Default::default()
                     },
@@ -644,6 +645,7 @@ pub fn run_trinity(args: &TrinityArgs) -> Result<PathBuf, CommonError> {
                         gtasm_pair_support: args.gtasm_pair_support,
                         no_path_merging: args.bfly_no_path_merging,
                         min_read_support: 2,
+                        empty_retry: args.bfly_empty_retry,
                     },
                 )
             },
@@ -1016,6 +1018,7 @@ fn run_recursive(
                     weld_glue_factor: args.weld_glue_factor,
                     weld_min_glue: args.weld_min_glue,
                     cluster_max_size: args.cluster_max_size,
+                    weld_reads_path: None,
                     gap_close_spades: false,      // 递归 phase-1 跳过 quantify, 缝合不生效
                 },
             )?;

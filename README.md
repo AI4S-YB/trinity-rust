@@ -99,6 +99,12 @@ target/release/trinity-cli \
 - 拟南芥真实数据（PE，`--CPU 8`）端到端 wall time **54 min → 17 min（-69%）**，组装指标与基线一致。
 - 四项优化：k-mer dump 落盘消除（二进制直桥，省 ~8 min）、ReadsToTranscripts 查询结构 16.3×、归一化 3.6×、组件分区写出 5.5×；全部带 oracle/字节级等价验证。
 
+**实验旗标（默认关 = 原版语义，2026-09 缺失解剖战役产出）**：
+
+- `--rtt-multi-kmer`（**推荐，真实 PE 数据可开**）：ReadsToTranscripts 25-mer 索引多值化——共享 kmer 记全部组件，救跨 weld 口 read 被其他组件抢占（单值后写者赢）导致的组件断口无桥。QM4（150bp 真实）：R +0.3、缺失转录本召回 +99、230 个原零 read 组件进图；dev1/dev3（76bp 模拟）：R/P 零回退。代价：quantify 阶段 ~39s→311s（QM4 32 线程）。
+- `--weld-min-glue 1`（**数据依赖，短读/模拟数据不建议**）：weld 证据门槛降至单 read。QM4：R +0.3、P −0.2；dev1：P −1.7（短读上单 read 证据多为噪声）。
+- `--bfly-no-path-merging` / `--bfly-empty-retry` / `--weld-reads <fa>` / `--weld-glue-factor` / `--cluster-max-size`：机制探索旗标（详见 `docs/opt-log.md` 2026-09-03/04 各节），QM4/dev1 评估后均未达转正线，保留供复现实验。
+
 ## 验证
 
 - `cargo test --workspace`：553 项单测/组件对拍全绿。

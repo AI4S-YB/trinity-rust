@@ -300,6 +300,10 @@ fn cmd_chrysalis_all(cli: &mut Cli) -> Result<(), CliError> {
             skip_quantify: false,
             graph_clean_rnaspades: false, // 子命令工具不暴露清理开关（默认关）
             rtt_multi_kmer: cli.bool_flag("-multi_kmer"),
+            weld_glue_factor: cli.float_flag("-glue_factor", 0.05f64)?,
+            weld_min_glue: cli.uint_flag("-min_glue", 2u32)?,
+            cluster_max_size: cli.uint_flag("-max_cluster_size", 25usize)?,
+            weld_reads_path: None,
             gap_close_spades: false,      // 子命令工具不暴露缝合开关（默认关）
         },
     )?;

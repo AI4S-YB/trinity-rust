@@ -30,6 +30,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut weld_glue_factor = 0.05f64;
     let mut weld_min_glue = 2u32;
     let mut cluster_max_size = 25usize;
+    let mut weld_reads: Option<PathBuf> = None;
     let mut out = iter_dir.join("chrysalis_resume.Trinity.fasta");
     let mut suffix = "rttmk".to_string();
     let mut i = 0;
@@ -48,6 +49,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "--cluster-max" => {
                 i += 1;
                 cluster_max_size = args[i].parse()?;
+            }
+            "--weld-reads" => {
+                i += 1;
+                weld_reads = Some(PathBuf::from(&args[i]));
             }
             "--cpu" => {
                 i += 1;
@@ -93,6 +98,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             weld_glue_factor,
             weld_min_glue,
             cluster_max_size,
+            weld_reads_path: weld_reads,
             ..Default::default()
         },
     )?;
@@ -113,6 +119,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             gtasm_pair_support: false,
             no_path_merging,
             min_read_support: 2,
+            empty_retry: false,
         },
     )?;
     let n = harvest(&listing, 200, Path::new(&out))?;

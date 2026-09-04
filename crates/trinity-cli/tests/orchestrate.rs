@@ -212,6 +212,7 @@ fn butterfly_pool_isolates_failures() {
             gtasm_pair_support: false,
             no_path_merging: false,
             min_read_support: 2,
+            empty_retry: false,
         },
     )
     .unwrap_err();

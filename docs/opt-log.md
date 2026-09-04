@@ -2695,3 +2695,51 @@ overlap**（tx 坐标块重叠不等于输出序列可 overlap 拼接: 共享区
 - **净召回最多 +79, 远低于割裂档预估 330-500**——大部分割裂的 weld 边
   本身不存在（单 read 证据之外低表达区域无 weld 证据）, 不是聚类门槛
   拒绝。全部保持实验旗标不转正。
+
+## 分级 diginorm 实验: 证伪——weld 证据缺失是原始数据上限（2026-09-04）
+
+机制假设: weld（GraphFromFasta）用 max_cov 更高的归一化 reads（低/中表达
+区保留更多桥 read）, RTT/quantify 仍用默认 200（控图规模）。实现:
+ChrysalisParams.weld_reads_path（None=原版）+ chrysalis_resume --weld-reads。
+
+QM4 实验（weld@maxC1000, 16.1M reads/side vs 基线 10.8M, both.fa 6.2GB,
+chrysalis ~12.5min）: 组件 50,232→50,206, R/P/F1 全不变, 净召回 **−12**。
+
+**证伪逻辑**: diginorm maxC200 对 cov<200 区域不丢 read（两版输入完全
+相同）; cov>200 区域 weld 证据早已充足（200 条 >> min_glue=2）。weld 边
+缺失的区域是**原始数据里就没有横跨 read**（低表达/接缝区 read 供给上限,
+与端部截断战役"~40% 缺口区无 reads（dep<3）"结论汇流）——不是 diginorm
+抽稀。构图层探索到此收束; 分级归一化保留为机制能力（weld_reads_path）
+但不产生收益。
+
+## 381 档定向豁免: 粒度错配, 无效（2026-09-04）
+
+实现 --bfly-empty-retry（PathSearchParams.retry_empty_comp, 默认关）:
+分量级"搜索 0 产出 → min_read_support=1 重试"。
+
+QM4: n 117,879→119,976（+2,097 条）, **R 43.9 不变, P −0.1, F1 −0.1,
+missing 召回 0**——救出的 2,097 条几乎全是单 read 撑的噪声路径。
+
+**粒度错配根因**: 381 档 tx 的图节点分散在**多个分量**（0 产出的 +
+有产出但路径偏选的）; 0 产出豁免只救回单分量路径（案例 25323 分量仅
+325bp, 对 tx 覆盖 ~30%——仍 <0.9）。该档需要的是分量间路径重组,
+非门槛豁免。全局 R=1（57 条召回/P−2.0）仍是此档最好成绩, 不转正。
+定向豁免代码保留（默认关）。
+
+**381 档终判**: 图/证据全在而输出不走 = 路径搜索在多分量上同时偏选,
+单点门槛修复不可及; 归入"搜索层结构性偏差", 与 GTasm/加权路径引擎的
+路线汇合（gtasm 引擎本就是为此而设）。
+| 2026-09-04 | dev1-mkmgl | R=15.5% P=79.0% **F1=25.9%** | N50=1924 n=8605 | --CPU 32 --max_memory 32G --rtt-multi-kmer --weld-min-glue 1 |
+
+## 组合验证 + 推荐配置定稿（2026-09-04, bench 2dbfe1c2813ac33f + chrysalis_resume mkmgl）
+
+QM4 rttmk+mg1 组合: R 43.9→44.5（+0.6, 两单变量精确叠加）, P −0.3,
+F1 +0.2, 净召回 99 + partial 237。dev1 组合: R +0.1, **P −1.7**（mg1
+在 76bp 模拟上单 read 证据=噪声, 与 no-merge 同型数据依赖）。
+
+**推荐配置定稿**（README 实验旗标节）:
+- --rtt-multi-kmer: 唯一推荐（三数据集零回退 + QM4 +0.3R/召回 99;
+  代价 quantify 39→311s）
+- --weld-min-glue 1: 数据依赖（真实 150bp 可开, 短读/模拟不建议）
+- 其余探索旗标（no-merge/empty-retry/weld-reads/glue/cluster-max）:
+  未达转正线, 留复现

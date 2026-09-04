@@ -117,6 +117,9 @@ pub struct TrinityArgs {
     /// （**默认关** = 原版语义; `--bfly-no-path-merging` 开启则跳过两处
     /// twoPathsAreTooSimilar 去冗余——同基因高相似 isoform 不再被删）。
     pub bfly_no_path_merging: bool,
+    /// **Rust 版扩展**: butterfly 搜索 0 产出分量的 R=1 定向豁免
+    /// （**默认关**; `--bfly-empty-retry` 开启——381 档定向修复）。
+    pub bfly_empty_retry: bool,
     /// **Rust 版扩展**: gtasm 组件产出的碎片 pair-guided 合并（组件产出
     /// contigs 后、入 harvest 前, 同组件内 contig 末端 × 末端的 mate 链接
     /// ≥2 对 → OLC/N 保守拼接, 机制见 frag_merge 模块文档）。**默认关**;
@@ -354,6 +357,8 @@ pub fn parse_args(argv: &[String]) -> Result<TrinityArgs, CliError> {
     // --bfly-no-path-merging（Rust 版扩展, 默认关）: 跳过 butterfly 两处
     // cd-hit 式去冗余（twoPathsAreTooSimilar）
     let bfly_no_path_merging = cli.bool_flag("--bfly-no-path-merging");
+    // --bfly-empty-retry（Rust 版扩展, 默认关）: 0 产出分量 R=1 定向豁免
+    let bfly_empty_retry = cli.bool_flag("--bfly-empty-retry");
     // --gtasm-frag-merge（Rust 版扩展, 默认关）: 组件产出碎片 pair-guided 合并
     let gtasm_frag_merge = cli.bool_flag("--gtasm-frag-merge");
     // --stitch（Rust 版扩展, 默认关）: 输出层 split-read 缝合
@@ -543,6 +548,7 @@ pub fn parse_args(argv: &[String]) -> Result<TrinityArgs, CliError> {
         gtasm_bulge_dual,
         gtasm_pair_support,
         bfly_no_path_merging,
+        bfly_empty_retry,
         gtasm_frag_merge,
         stitch,
         multi_k,

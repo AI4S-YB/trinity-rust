@@ -74,6 +74,8 @@ pub struct ButterflyPoolParams {
     /// `-R`：最小 read 支持（默认 2 = 原版）。实验: 381 档死因之一——
     /// 低 read 分量分叉处 support<2 全拒（QM4 案例验证 R=1 可救）。
     pub min_read_support: i64,
+    /// **Rust 版扩展**: 搜索 0 产出的分量以 R=1 重试（定向豁免, 默认关）。
+    pub empty_retry: bool,
 }
 
 /// 原版 butterfly 命令实参（L2363-2388）:
@@ -95,6 +97,7 @@ fn component_params(base: &Path, p: &ButterflyPoolParams) -> ComponentParams {
         stack_size: p.stack_size_mb.saturating_mul(1024 * 1024),
         no_path_merging: p.no_path_merging,
         min_read_support: p.min_read_support,
+        empty_retry: p.empty_retry,
         ..Default::default()
     }
 }

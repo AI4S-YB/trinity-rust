@@ -63,6 +63,11 @@ pub struct ChrysalisParams {
     pub weld_min_glue: u32,
     /// BubbleUpClustering 的 `-max_cluster_size`（默认 25 = 原版）。
     pub cluster_max_size: usize,
+    /// **Rust 版扩展**: weld（GraphFromFasta）阶段专用 reads 文件路径——
+    /// None = 用管线 reads_fa（原版语义）。分级归一化实验: weld 用
+    /// max_cov 更高的归一化版本（低/中表达区保留更多桥 read 证据）,
+    /// RTT/quantify 仍用默认归一化（控图规模）。
+    pub weld_reads_path: Option<PathBuf>,
     /// `--gap-close-spades`：清理之后对 graph.out 做 SPAdes 式 tip 对 tip
     /// overlap 缝合（PE 证据排序候选, 见 gap_close 模块）。默认 false = 逐字节不变。
     pub gap_close_spades: bool,
@@ -83,6 +88,7 @@ impl Default for ChrysalisParams {
             weld_glue_factor: 0.05,
             weld_min_glue: 2,
             cluster_max_size: 25,
+            weld_reads_path: None,
             gap_close_spades: false,
         }
     }
@@ -104,9 +110,17 @@ pub fn run_chrysalis_pipeline(
     // 1. GraphFromFasta → weld 图 → sort
     println!("-running GraphFromFasta...");
     let (iworm_seqs, welds_sorted) = timed(out_dir, "gff", || {
-        let iworm_seqs = read_fasta_bytes(iworm_fa, false);
-        let reads_text = String::from_utf8_lossy(reads_fa).into_owned();
+        let reads_text: String = match &p.weld_reads_path {
+            Some(path) => {
+                let bytes = std::fs::read(path).map_err(|e| {
+                    CommonError::Parse(format!("weld reads {}: {e}", path.display()))
+                })?;
+                String::from_utf8_lossy(&bytes).into_owned()
+            }
+            None => String::from_utf8_lossy(reads_fa).into_owned(),
+        };
         let reads_streamed = stream_fasta_records(&reads_text);
+        let iworm_seqs = read_fasta_bytes(iworm_fa, false);
         let welds = graph_from_fasta(
             &iworm_seqs,
             &reads_streamed,

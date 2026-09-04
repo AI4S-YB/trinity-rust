@@ -34,6 +34,9 @@ pub struct PathSearchParams {
     pub max_paths_per_node_init: usize,
     /// KMER_SIZE（S/T PairPath、getPathSeq 的 k-1 截断）。
     pub kmer_size: usize,
+    /// **Rust 版扩展（默认 false）**: 搜索 0 产出的分量以 min_read_support=1
+    /// 重试（定向豁免, 见 run_butterfly_all_prob_paths_with 内注释）。
+    pub retry_empty_comp: bool,
 }
 
 impl Default for PathSearchParams {
@@ -45,6 +48,7 @@ impl Default for PathSearchParams {
             max_paths_per_node_extend: 25,
             max_paths_per_node_init: 100,
             kmer_size: 25,
+            retry_empty_comp: false,
         }
     }
 }
@@ -1099,7 +1103,7 @@ pub fn run_butterfly_all_prob_paths_with(
             params.min_read_support_thr,
         );
 
-        let result = get_all_probable_paths(
+        let mut result = get_all_probable_paths(
             &graph,
             &comp,
             &comp_reads,
@@ -1108,6 +1112,27 @@ pub fn run_butterfly_all_prob_paths_with(
             &x_structures,
             params,
         );
+        // 定向豁免（retry_empty_comp, Rust 版扩展默认关）: 搜索 0 产出的
+        // 分量以 min_read_support=1 重试——低 read 分量（diginorm+containment
+        // 重映射后仅 1 条 PairPath）在分叉处凑不够 R=2 支持被全拒, 但图与
+        // read 证据可能完整（QM4 381 档: 图 bp 覆盖>=0.9、read path>=0.9、
+        // 输出 0）。全局 R=1 有 P 代价, 只对原本无产出的分量豁免。
+        if result.final_paths.is_empty()
+            && params.retry_empty_comp
+            && params.min_read_support_thr > 1
+        {
+            let mut relaxed = params.clone();
+            relaxed.min_read_support_thr = 1;
+            result = get_all_probable_paths(
+                &graph,
+                &comp,
+                &comp_reads,
+                &triplets,
+                &extended,
+                &x_structures,
+                &relaxed,
+            );
+        }
         let final_paths = remove_short_seqs(
             &graph,
             result.final_paths,
