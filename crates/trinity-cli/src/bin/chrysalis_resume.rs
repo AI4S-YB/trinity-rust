@@ -27,6 +27,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let left = PathBuf::from(args.remove(0));
     let right = PathBuf::from(args.remove(0));
     let (mut multi_kmer, mut no_path_merging, mut cpu) = (false, false, 32usize);
+    let mut weld_glue_factor = 0.05f64;
+    let mut weld_min_glue = 2u32;
+    let mut cluster_max_size = 25usize;
     let mut out = iter_dir.join("chrysalis_resume.Trinity.fasta");
     let mut suffix = "rttmk".to_string();
     let mut i = 0;
@@ -34,6 +37,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         match args[i].as_str() {
             "--multi-kmer" => multi_kmer = true,
             "--no-path-merging" => no_path_merging = true,
+            "--glue-factor" => {
+                i += 1;
+                weld_glue_factor = args[i].parse()?;
+            }
+            "--min-glue" => {
+                i += 1;
+                weld_min_glue = args[i].parse()?;
+            }
+            "--cluster-max" => {
+                i += 1;
+                cluster_max_size = args[i].parse()?;
+            }
             "--cpu" => {
                 i += 1;
                 cpu = args[i].parse()?;
@@ -75,6 +90,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             max_reads: 200_000,
             threads: cpu,
             rtt_multi_kmer: multi_kmer,
+            weld_glue_factor,
+            weld_min_glue,
+            cluster_max_size,
             ..Default::default()
         },
     )?;

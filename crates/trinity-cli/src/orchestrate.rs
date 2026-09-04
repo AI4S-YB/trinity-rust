@@ -506,6 +506,9 @@ pub fn run_trinity(args: &TrinityArgs) -> Result<PathBuf, CommonError> {
                         threads: args.cpu.max(1),
                         graph_clean_rnaspades: args.graph_clean_rnaspades,
                         rtt_multi_kmer: args.rtt_multi_kmer,
+                        weld_glue_factor: args.weld_glue_factor,
+                        weld_min_glue: args.weld_min_glue,
+                        cluster_max_size: args.cluster_max_size,
                         gap_close_spades: args.gap_close_spades,
                         ..Default::default()
                     },
@@ -1010,6 +1013,9 @@ fn run_recursive(
                     graphs_per_partition: 1000,
                     graph_clean_rnaspades: false, // 递归 phase-1 跳过 quantify, 清理不生效
                     rtt_multi_kmer: args.rtt_multi_kmer,
+                    weld_glue_factor: args.weld_glue_factor,
+                    weld_min_glue: args.weld_min_glue,
+                    cluster_max_size: args.cluster_max_size,
                     gap_close_spades: false,      // 递归 phase-1 跳过 quantify, 缝合不生效
                 },
             )?;

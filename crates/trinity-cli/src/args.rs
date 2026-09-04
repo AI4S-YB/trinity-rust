@@ -142,6 +142,14 @@ pub struct TrinityArgs {
     /// 记全部组件, 默认关 = 原版后写者赢单值语义）。救跨 weld 口 read 被
     /// 其他组件抢占 → 组件图断口无桥（QM4 缺失解剖 2026-09-03）。
     pub rtt_multi_kmer: bool,
+    /// **Rust 版扩展**: GraphFromFasta weld 证据因子（--weld-glue-factor,
+    /// 默认 0.05 = 原版）。聚类割裂档放宽方向（min_glue 随 cov 比例下调）。
+    pub weld_glue_factor: f64,
+    /// **Rust 版扩展**: weld 最小 read 支持（--weld-min-glue, 默认 2 = 原版）。
+    pub weld_min_glue: u32,
+    /// **Rust 版扩展**: BubbleUpClustering 最大簇大小（--cluster-max-size,
+    /// 默认 25 = 原版 -max_cluster_size）。
+    pub cluster_max_size: usize,
     /// **Rust 版扩展**: SPAdes 式 gap closer（chrysalis QuantifyGraph/清理后
     /// 对 c*.graph.out 做 tip 对 tip overlap 缝合, PE 证据排序候选, 见
     /// trinity-chrysalis::gap_close）。默认关 = 现有行为逐字节不变。
@@ -363,6 +371,10 @@ pub fn parse_args(argv: &[String]) -> Result<TrinityArgs, CliError> {
     let graph_clean_rnaspades = cli.bool_flag("--graph-clean-rnaspades");
     // --rtt-multi-kmer（Rust 版扩展, 默认关）: RTT 25-mer 索引多值化
     let rtt_multi_kmer = cli.bool_flag("--rtt-multi-kmer");
+    // 聚类参数（Rust 版扩展, 默认 = 原版）
+    let weld_glue_factor = cli.float_flag("--weld-glue-factor", 0.05f64)?;
+    let weld_min_glue = cli.uint_flag("--weld-min-glue", 2u32)?;
+    let cluster_max_size = cli.uint_flag("--cluster-max-size", 25usize)?;
     // --gap-close-spades（Rust 版扩展, 默认关）
     let gap_close_spades = cli.bool_flag("--gap-close-spades");
 
@@ -536,6 +548,9 @@ pub fn parse_args(argv: &[String]) -> Result<TrinityArgs, CliError> {
         multi_k,
         graph_clean_rnaspades,
         rtt_multi_kmer,
+        weld_glue_factor,
+        weld_min_glue,
+        cluster_max_size,
         gap_close_spades,
     })
 }

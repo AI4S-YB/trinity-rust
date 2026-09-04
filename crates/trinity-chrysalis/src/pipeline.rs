@@ -55,6 +55,14 @@ pub struct ChrysalisParams {
     /// 的 25-mer 索引多值化——共享 kmer 记全部组件。救跨 weld 口 read 被
     /// 其他组件抢占导致的断口无桥（见 RttParams::multi_kmer 文档）。
     pub rtt_multi_kmer: bool,
+    /// GraphFromFasta 的 weld 证据门槛 `glue_factor`（默认 0.05 = 原版）:
+    /// min_cov = clamp(max(cov_i,cov_c) * glue_factor, min_glue, max_glue)。
+    /// 实验: 聚类割裂档（missing tx 物理相邻组件被拆）的放宽方向。
+    pub weld_glue_factor: f64,
+    /// weld 最小 read 支持数 `min_glue_required`（默认 2 = 原版）。
+    pub weld_min_glue: u32,
+    /// BubbleUpClustering 的 `-max_cluster_size`（默认 25 = 原版）。
+    pub cluster_max_size: usize,
     /// `--gap-close-spades`：清理之后对 graph.out 做 SPAdes 式 tip 对 tip
     /// overlap 缝合（PE 证据排序候选, 见 gap_close 模块）。默认 false = 逐字节不变。
     pub gap_close_spades: bool,
@@ -72,6 +80,9 @@ impl Default for ChrysalisParams {
             skip_quantify: false,
             graph_clean_rnaspades: false,
             rtt_multi_kmer: false,
+            weld_glue_factor: 0.05,
+            weld_min_glue: 2,
+            cluster_max_size: 25,
             gap_close_spades: false,
         }
     }
@@ -102,6 +113,8 @@ pub fn run_chrysalis_pipeline(
             &GffParams {
                 strand: p.strand,
                 threads: p.threads.max(1),
+                glue_factor: p.weld_glue_factor,
+                min_glue_required: p.weld_min_glue,
                 ..Default::default()
             },
         )?;
@@ -117,6 +130,7 @@ pub fn run_chrysalis_pipeline(
             &welds_sorted,
             &BubbleParams {
                 min_contig_length: p.min_contig_length,
+                max_cluster_size: p.cluster_max_size,
                 ..Default::default()
             },
         )
