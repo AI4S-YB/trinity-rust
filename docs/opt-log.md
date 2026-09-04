@@ -2801,3 +2801,29 @@ fa_direct, 32 线程, DN_PROFILE=1 分段）, 基线 = HEAD 38c7fa3（u128 层�
   并行平局序非确定（backlog.md:52, 原版同病）, 与本轮改动无关
   （inchworm 不经 RollingKey/泛型计数路径）; 复跑即绿。
 
+
+## HEAD 端到端分段实测（2026-09-04, e3a3241, QM4 标准口径）
+
+命令同 09-01 基线（--multi-k auto --inchworm_cpu 32 --CPU 32 --max_memory
+64G, 2135 万对 150bp）。**wall 34:07**（avg 12.2 核 / 32, 峰值 RSS 118GB）。
+09-01 的 31min 记录已过时: 09-03 起自动档位含 k=63 轮（auto 顶 k 钳 63）,
+多花一整轮 count+inchworm。
+
+分段（s, 占 wall）:
+
+| 段 | 耗时 | 占比 |
+|---|---|---|
+| normalize + prep | 415 + 14 | 21% |
+| k49 轮（count+inchworm） | 332 + 220 | 27% |
+| k63 轮（count+load+inchworm） | 308 + 22 + 278 | 30% |
+| k63 chrysalis（gff 194 / rtt 101 / quantify 56 / 其他 23） | 374 | 18% |
+| butterfly + harvest | 96 | 5% |
+
+- **quantify 55.6s**: rttmk 默认开 + 物化键下, 已回到单值基线（39s）附近
+  ——旧 rttmk 代码 311s 的代价被今天的工作在管线内证实收回。
+- normalize 415s（vs dn_bench 562s: 差额=NFS→本地 scratch 写 + 无右册对拍）。
+- 剩余大账: **两轮 kmer_count 合计 640s（31%）**——KmerId 表（40B/槽）
+  逐轮重数 both.fa 4.16GB; inchworm 两轮 498s（24%）, 贪心段固有。
+- gff 194s 仍为 chrysalis 内最大单段（1199→196 后的余量）。
+
+| 2026-09-04 | qm4-e3a3241 全程 | wall **34:07**（12.2 核均值） | R/P 待 bench 登记 | --multi-k auto --inchworm_cpu 32 --CPU 32 --max_memory 64G |
