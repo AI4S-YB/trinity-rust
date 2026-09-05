@@ -220,6 +220,45 @@ where
         .reduce(FxHashMap::default, merge_counts)
 }
 
+/// 窄键表 → CountMap（KmerId）一次性 widen（压时间战役 2026-09-04 刀1）:
+/// 精确预留容量（无生长 rehash）, 键值多重集原样平移——窄键域内
+/// `K::to_wide()` 与 KmerId 低 limb 数值恒等（kmer.rs 数值一致性单测）。
+fn widen_to_count_map<K: RollingKey>(m: FxHashMap<K, u32>) -> CountMap {
+    let mut out = FxHashMap::with_capacity_and_hasher(m.len(), Default::default());
+    for (key, cnt) in m {
+        out.insert(key.to_wide(), cnt);
+    }
+    out
+}
+
+/// inchworm 轮计数的分层入口: k≤32 用 u64 键、k≤64 用 u128 键在窄键空间
+/// 完成 per-thread 计数与 reduce 合并（键带宽与槽位减半~四分之一, 大表
+/// cache miss 与 FxHash 输入同步缩）, 终点一次 widen 回 CountMap——管线
+/// 既有消费方（trusted 注入 / counts_bin 落盘 / KmerCounter::from_count_map）
+/// 接口与语义不变。等价性: 各窄键层与 KmerId 层走同一泛型代码, 键数值
+/// 域内恒等 → 计数多重集相等（单测 count_layered_matches_wide 全 k 对拍）。
+/// 迭代序差异不构成回归: 并行 reduce 的合并序本就非确定（inchworm 并行
+/// 平局序非确定, backlog 已立案）。
+pub fn count_fasta_data_layered(data: &[u8], k: usize, ds: bool, per_thread_capacity: usize) -> CountMap {
+    if k <= 32 {
+        widen_to_count_map(count_fasta_data_of::<u64>(
+            data,
+            k,
+            ds,
+            per_thread_capacity,
+        ))
+    } else if k <= 64 {
+        widen_to_count_map(count_fasta_data_of::<u128>(
+            data,
+            k,
+            ds,
+            per_thread_capacity,
+        ))
+    } else {
+        count_fasta_data_of::<KmerId>(data, k, ds, per_thread_capacity)
+    }
+}
+
 /// reduce 合并: b 并入 a（计数累加）。小表并入大表（rehash 次数最少化）。
 pub fn merge_counts<K: RollingKey>(
     mut a: FxHashMap<K, u32>,
@@ -363,6 +402,35 @@ mod tests {
                 assert_eq!(wide.len(), narrow.len(), "k={k} ds={ds}");
                 for (key, c) in &narrow {
                     assert_eq!(wide.get(&key.to_wide()), Some(c), "k={k} ds={ds}");
+                }
+            }
+        }
+    }
+
+    /// 分层计数入口（count_fasta_data_layered, 压时间战役 2026-09-04 刀1）与
+    /// KmerId 直计在全部键层（u64 k≤32 / u128 k≤64 / KmerId 直通）多重集等价。
+    /// 多行记录 fixture 额外覆盖 split_fasta_ranges 的 multiline 回退分支。
+    #[test]
+    fn count_layered_matches_wide() {
+        let single = b">x\nACGTACGTNNAGGCACGTACGTACGTagct\n>y\nAAAAACCCCCGGGGGTTTTTACGTACGTA";
+        let multiline: Vec<u8> = {
+            let mut v = b">m\n".to_vec();
+            for _ in 0..10 {
+                v.extend_from_slice(b"ACGTACGT"); // 80 base, 分两行
+                v.push(b'\n');
+            }
+            v.extend_from_slice(b"ACGTACGTNNAGG");
+            v
+        };
+        for (tag, seq) in [("single", &single[..]), ("multiline", &multiline[..])] {
+            for k in [7usize, 25, 31, 32, 33, 49, 63, 64, 65] {
+                for ds in [true, false] {
+                    let wide = KmerCountTable::count_fasta_data(seq, k, ds);
+                    let layered = count_fasta_data_layered(seq, k, ds, 0);
+                    assert_eq!(layered.len(), wide.len(), "{tag} k={k} ds={ds}");
+                    for (key, c) in &wide {
+                        assert_eq!(layered.get(key), Some(c), "{tag} k={k} ds={ds}");
+                    }
                 }
             }
         }

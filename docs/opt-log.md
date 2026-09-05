@@ -2827,3 +2827,43 @@ fa_direct, 32 线程, DN_PROFILE=1 分段）, 基线 = HEAD 38c7fa3（u128 层�
 - gff 194s 仍为 chrysalis 内最大单段（1199→196 后的余量）。
 
 | 2026-09-04 | qm4-e3a3241 全程 | wall **34:07**（12.2 核均值） | R/P 待 bench 登记 | --multi-k auto --inchworm_cpu 32 --CPU 32 --max_memory 64G |
+
+## 刀1: kmer_count 分层窄键计数（2026-09-04 压时间战役, 640s 池/占 wall 31%）
+
+机制: inchworm 轮计数（KmerCountTable::count_fasta_data_with_capacity,
+KmerId 全宽 40B/槽）改为 `count_fasta_data_layered`——k≤32 用 u64 键、
+k≤64 用 u128 键在窄键空间完成 per-thread 计数与 reduce 合并（键带宽与
+槽位减半~四分之一, 大表 cache miss 与 FxHash 输入同步缩）, 终点一次
+widen 回 CountMap（精确容量预留, 无生长 rehash）。管线消费方（trusted
+注入 / counts_bin 落盘 / KmerCounter::from_count_map move 直构）接口与
+语义全部不变。orchestrate 两条计数路径（kmer_count 阶段 + kmer_load
+checkpoint 回退重数）都走分层入口。
+
+等价性: 各窄键层与 KmerId 层同一泛型代码、键数值域内恒等 → 计数键值
+多重集相等。三层证据: ①单测 count_layered_matches_wide（单行+多行
+fixture, k=7~65 跨三层, ds 两态, 全键对拍）; ②微基准内置全表逐键对拍
+（k=49 1.95 亿键 / k=63 2.05 亿键, 各 8s 通过）; ③widen 只平移键值,
+迭代序差异不构成回归——并行 reduce 合并序本就非确定（inchworm 平局序
+非确定已立案, cli_parallel_iworm_smoke 直调 inchworm 二进制不经此路径）。
+
+微基准 examples/count_bench（QM4 both.fa 4.16GB 重生成, 32 线程,
+estimate_hash_size(64G) 同管线口径, 全表对拍内置）:
+
+| k | KmerId 直计 | 分层窄键+widen | 加速 |
+|---|---|---|---|
+| 49 | 373.0s | **270.1s** | **1.38×** |
+| 63 | 299.3s | **279.7s** | 1.07× |
+
+- 净省 ~123s/两轮; k63 侧两层同为 u128 键、结构性收益只剩宽侧基线差
+  （该次 wide 偏快, 共享机波动带内）。k≤32 单 k 运行（dev 系 k=25）
+  叠加 u64 层（diginorm 同款 -15% 口径）, 未单独计测。
+
+**端到端复测（同口径 QM4 全程, 32 线程）**: wall **34:07 → 29:48（-4:19,
+-12.6%）**。分段: kmer_count 两轮 640→399s（**-241s, 1.6×**, 超微基准
+预测的 -123s——窄表内存红利外溢: 峰值 RSS 118→88GB, chrysalis_total
+374→315s（quantify 56→38 / rtt 101→80 / gff 194→175）; normalize 415→501s
+系当晚共享机 IO 波动（diginorm 独立重建轮同步 +13%）, 方向不利仍净赢。
+产物: n=117834（基线 118068, -0.2%）N50=1793（1787）——在 inchworm 并行
+非确定带内（promo 两跑自身 ±0.2%）; 计数表逐键等价已证, 指标等价随之。
+
+| 2026-09-04 | qm4-knife1 全程 | wall **29:48**（基线 34:07） | n=117834 N50=1793 | --multi-k auto --inchworm_cpu 32 --CPU 32 --max_memory 64G |

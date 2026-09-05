@@ -105,11 +105,12 @@ target/release/trinity-cli \
 - `--weld-min-glue`（**默认 auto**）：读长 ≥150 → 1（mg1，QM4 组合验证 R+0.6/F1+0.2），短读 → 2（原版阈值，dev1 76bp 上单 read 证据 P−1.7 系噪声）；显式值覆盖。分界常数 `multik::WELD_MG1_READ_LEN_MIN`。
 - quantify 阶段随 rtt-multi-kmer 放大的耗时已由物化键排序优化压回（间接寻址 memcmp → ACGT 2bit u64 主群 + 含 N 次群，微基准 3.5×，产物逐字节一致）。
 - diginorm 计数表 k≤32 键层再降一档（u128→u64，键带宽/哈希域减半）：QM4 全量微基准 602→562s（热段 −15%），产物逐字节一致。
+- inchworm 轮 kmer_count 分层窄键计数（k≤32 u64 / k≤64 u128 + 终点 widen 回 KmerId，消费方接口不变）：微基准 k=49 1.38×，QM4 端到端 34:07→**29:48**（kmer_count 两轮 -241s，峰值 RSS 118→88GB），计数表亿键逐键对拍等价。
 - `--bfly-no-path-merging` / `--bfly-empty-retry` / `--weld-reads <fa>` / `--weld-glue-factor` / `--cluster-max-size`：机制探索旗标（详见 `docs/opt-log.md` 2026-09-03/04 各节），QM4/dev1 评估后均未达转正线，保留供复现实验。
 
 ## 验证
 
-- `cargo test --workspace`：679 项单测/组件对拍全绿。
+- `cargo test --workspace`：680 项单测/组件对拍全绿。
 - 三层交叉验证（`cargo xtask`）：
   - `xcheck-kmer / xcheck-inchworm / xcheck-chrysalis / xcheck-butterfly`——第 1、2 层（单元/管线级，对拍原版二进制或黄金）；
   - `xcheck-trinity [--full]`——第 3 层端到端：截断（默认 50000 PE reads）/全量双侧全管线对拍 + eval 统计 + both.fa 互喂抽查 + SS(RF) 合成小集；判定阈值与校准依据见 `docs/xcheck-trinity-report.md`。

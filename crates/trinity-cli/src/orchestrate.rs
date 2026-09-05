@@ -20,7 +20,7 @@ use trinity_inchworm::irke::{
     compute_sequence_assemblies_parallel, prune_some_kmers, write_kmer_count_report,
     AssemblyParams, IrkeParams, Monitor,
 };
-use trinity_kmer::counter::{estimate_hash_size, KmerCountTable};
+use trinity_kmer::counter::estimate_hash_size;
 use trinity_kmer::diginorm::{self, DigiNormParams, ReadsInput};
 
 use crate::args::{MultiK, PathEngine, SeqType, TrinityArgs};
@@ -882,8 +882,10 @@ fn run_count_and_inchworm(
                 // 避免增长期 rehash 内存峰值。
                 let estimate = estimate_hash_size(args.max_memory, data.len() as u64);
                 let per_thread = (estimate / KMER_ENTRY_BYTES / args.cpu.max(1) as u64) as usize;
+                // 分层窄键计数（k≤32 u64 / k≤64 u128）+ 终点 widen, 键值
+                // 多重集与 KmerId 直计相等（counter::count_layered_matches_wide）
                 let counts =
-                    KmerCountTable::count_fasta_data_with_capacity(&data, k, ds, per_thread);
+                    trinity_kmer::counter::count_fasta_data_layered(&data, k, ds, per_thread);
                 save_counts(&counts_bin, &counts, k, ds)?;
                 fs::write(&count_ok, b"")?;
                 return Ok(Some(counts));
@@ -921,7 +923,7 @@ fn run_count_and_inchworm(
                             let estimate = estimate_hash_size(args.max_memory, data.len() as u64);
                             let per_thread =
                                 (estimate / KMER_ENTRY_BYTES / args.cpu.max(1) as u64) as usize;
-                            KmerCountTable::count_fasta_data_with_capacity(&data, k, ds, per_thread)
+                            trinity_kmer::counter::count_fasta_data_layered(&data, k, ds, per_thread)
                         }
                     };
                     // multi-k trusted contig 注入（presence-only）: 计数表两条
