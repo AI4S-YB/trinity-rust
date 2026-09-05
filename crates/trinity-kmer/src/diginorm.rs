@@ -41,7 +41,7 @@ use rustc_hash::FxHashMap;
 use trinity_common::io_util::open_maybe_gz;
 use trinity_common::kmer::{KmerId, RollingKey};
 
-use crate::counter::{CountMap, KmerCountTable};
+use crate::counter::CountMap;
 use crate::coverage_stats::{coverage_stats_rows_of, CoverageStatsRow};
 use crate::drand48::Drand48;
 use crate::nbkc::{merge_pairs, select, MergedRow, NbkcParams, StatsRow};
@@ -508,22 +508,26 @@ enum CountTable {
 
 impl CountTable {
     fn build(both_fa: &[u8], params: &DigiNormParams) -> Self {
+        // 分片共享表计数（刀2, 2026-09-05）: diginorm 形态（双侧各自计数,
+        // 每调用 ~CPU/2 线程）实测大赢——同负载 dn_bench 677.6→516.0s,
+        // 局部表 reduce 合并（221~282s ≥ 计数本体）坍缩为 ~15s 终点折叠,
+        // 峰值内存 ≈ D + 缓冲; 键值多重集等价（counter 分片单测）。
         if params.k <= 32 {
-            CountTable::S(crate::counter::count_fasta_data_of::<u64>(
+            CountTable::S(crate::counter::count_fasta_data_of_sharded::<u64>(
                 both_fa,
                 params.k,
                 params.ds,
                 0,
             ))
         } else if params.k <= 64 {
-            CountTable::N(crate::counter::count_fasta_data_of::<u128>(
+            CountTable::N(crate::counter::count_fasta_data_of_sharded::<u128>(
                 both_fa,
                 params.k,
                 params.ds,
                 0,
             ))
         } else {
-            CountTable::W(KmerCountTable::count_fasta_data_with_capacity(
+            CountTable::W(crate::counter::count_fasta_data_of_sharded::<KmerId>(
                 both_fa,
                 params.k,
                 params.ds,

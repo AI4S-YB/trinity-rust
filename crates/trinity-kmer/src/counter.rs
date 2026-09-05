@@ -178,9 +178,94 @@ impl KmerCountTable {
     }
 }
 
+/// 分片位宽（2^8 = 256 片）: 每片表 ≈ D/256 条（D = distinct 键数）,
+/// 大表的随机插入变为片内局部插入; 片表 Mutex 下按缓冲批量冲刷摊薄锁开销。
+const COUNT_SHARD_BITS: usize = 8;
+/// 每线程缓冲的 k-mer 键数上限, 触发即整批冲刷进片表（u64 2M 键 = 16MB）。
+const COUNT_FLUSH_KEYS: usize = 1 << 21;
+
+fn cnt_profile_enabled() -> bool {
+    static P: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *P.get_or_init(|| std::env::var_os("CNT_PROFILE").is_some())
+}
+
+/// 每线程分片缓冲: 键按片追加, 攒满上限（调用方传入）整批冲刷进片表。
+/// drain 清空保留容量, 后续复用免再分配。
+struct ShardBufs<K> {
+    bufs: Vec<Vec<K>>,
+    buffered: usize,
+}
+
+impl<K: RollingKey> ShardBufs<K> {
+    fn new(shards: usize) -> Self {
+        ShardBufs {
+            bufs: vec![Vec::new(); shards],
+            buffered: 0,
+        }
+    }
+
+    #[inline]
+    fn push(&mut self, shard: usize, key: K) {
+        self.bufs[shard].push(key);
+        self.buffered += 1;
+    }
+
+    fn flush_into(&mut self, tables: &[std::sync::Mutex<FxHashMap<K, u32>>]) {
+        for (i, buf) in self.bufs.iter_mut().enumerate() {
+            if buf.is_empty() {
+                continue;
+            }
+            let mut t = tables[i].lock().unwrap();
+            for key in buf.drain(..) {
+                *t.entry(key).or_insert(0) += 1;
+            }
+        }
+        self.buffered = 0;
+    }
+}
+
+/// 键 → 片号: FxHash 高位（canonical 键的顶部位分布偏斜, 散列混合消除;
+/// 低 k 小时键高位恒 0, 散列同样均匀）。
+#[inline]
+fn shard_of<K: std::hash::Hash>(key: &K, shard_bits: usize) -> usize {
+    use std::hash::Hasher;
+    let mut h = rustc_hash::FxHasher::default();
+    key.hash(&mut h);
+    (h.finish() >> (64 - shard_bits)) as usize
+}
+
+/// 并行计数泛型核心（分片共享表, 压时间战役 2026-09-05 刀2）:
+/// rayon 按记录分片 → 每线程按片缓冲键 → 批量冲刷进 256 张 Mutex 片表
+/// （片表 ≈ D/256 条, 局部性好）→ 终点按精确容量把片表一次折叠回单表。
+///
+/// **适用面（2026-09-05 交错 A/B 实测裁定）**: 对 diginorm 形态（u64 键,
+/// 双侧各自计数 → 每调用 ~CPU/2 线程, 旧路径合并实测 221~282s ≥ 计数
+/// 本体）大赢: 同负载 dn_bench 677.6→516.0s, 合并坍缩至 ~15s; 对
+/// inchworm 轮形态（u128 键单次 32 线程, 分层入口）真回退: count_bench
+/// k49 layered 240.5→303.6s——32 冲刷线程 × 256 片表的 Mutex 在共享机
+/// 高负载下有护航效应。故本变体仅供 diginorm 计数表构建调用, 轮计数
+/// 维持 [`count_fasta_data_of`] 的局部表+reduce。
+///
+/// 相对旧路径的机制收益: reads 随机分布下各线程局部表收敛到近全量
+/// distinct 集（合并 ≈ 线程数×D 次随机插入, 局部表叠加把 RSS 顶到
+/// 2~3×D）; 分片后合并工作量恰为 D 次精确容量插入, 峰值内存 ≈ D + 缓冲。
+/// 键值多重集与任何计数路径等价（片间键不交, 片内 += 可交换）。
+pub fn count_fasta_data_of_sharded<K>(
+    data: &[u8],
+    k: usize,
+    ds: bool,
+    per_thread_capacity: usize,
+) -> FxHashMap<K, u32>
+where
+    K: RollingKey + Send,
+{
+    count_fasta_data_sharded::<K>(data, k, ds, per_thread_capacity, COUNT_SHARD_BITS, COUNT_FLUSH_KEYS)
+}
+
 /// 并行计数泛型核心: rayon 按记录分片 → 每线程局部 FxHashMap<K,u32> →
 /// reduce 合并（jellyfish 同型策略）。K = u64（k≤32）/u128（k≤64 紧凑键）
-/// 或 KmerId。
+/// 或 KmerId。inchworm 轮计数（分层入口）与公共 API 走本路径; diginorm
+/// 形态走 [`count_fasta_data_of_sharded`]（适用面裁定见其文档）。
 pub fn count_fasta_data_of<K>(
     data: &[u8],
     k: usize,
@@ -191,9 +276,13 @@ where
     K: RollingKey + Send,
 {
     let cap = per_thread_capacity.min(1 << 22); // 单线程上限 ~4M 槽，防 rehash 峰值即可
+    let t0 = std::time::Instant::now();
     let (ranges, multiline) = split_fasta_ranges(data);
-    if multiline {
-        return split_fasta_sequences(data)
+    // fold（非 map）: 每个 rayon 任务一张局部表跨 range 复用——map+collect
+    // 会给每个 range 各建一张 cap 槽初始表, orchestrate 传入非零 per_thread
+    // （~4M 槽 × 数百 range）时内存爆至数百 GB（2026-09-05 管线 OOM 实证）。
+    let merged = if multiline {
+        split_fasta_sequences(data)
             .par_iter()
             .fold(
                 || FxHashMap::<K, u32>::with_capacity_and_hasher(cap, Default::default()),
@@ -204,20 +293,113 @@ where
                     local
                 },
             )
-            .reduce(FxHashMap::default, merge_counts);
+            .reduce(FxHashMap::default, merge_counts)
+    } else {
+        ranges
+            .par_iter()
+            .fold(
+                || FxHashMap::<K, u32>::with_capacity_and_hasher(cap, Default::default()),
+                |mut local, &(s, e)| {
+                    for_each_kmer_of::<K>(&data[s..e], k, ds, |key| {
+                        *local.entry(key).or_insert(0) += 1;
+                    });
+                    local
+                },
+            )
+            .reduce(FxHashMap::default, merge_counts)
+    };
+    if cnt_profile_enabled() {
+        eprintln!(
+            "[cnt] k={k} ds={ds}: locals+reduce 合计 {:.1}s",
+            t0.elapsed().as_secs_f64()
+        );
     }
-    ranges
-        .par_iter()
-        .fold(
-            || FxHashMap::<K, u32>::with_capacity_and_hasher(cap, Default::default()),
-            |mut local, &(s, e)| {
-                for_each_kmer_of::<K>(&data[s..e], k, ds, |key| {
-                    *local.entry(key).or_insert(0) += 1;
-                });
-                local
-            },
-        )
-        .reduce(FxHashMap::default, merge_counts)
+    merged
+}
+
+/// 分片计数实现（flush_keys 参数化供测试强制多轮冲刷）。
+fn count_fasta_data_sharded<K>(
+    data: &[u8],
+    k: usize,
+    ds: bool,
+    per_thread_capacity: usize,
+    shard_bits: usize,
+    flush_keys: usize,
+) -> FxHashMap<K, u32>
+where
+    K: RollingKey + Send,
+{
+    use std::sync::Mutex;
+    let t0 = std::time::Instant::now();
+    let shards = 1usize << shard_bits;
+    // per_thread_capacity 原语义（每线程局部表初始容量）均摊到片表作初始提示
+    let per_shard_cap = (per_thread_capacity.min(1 << 22) / shards).max(64);
+    let tables: Vec<Mutex<FxHashMap<K, u32>>> = (0..shards)
+        .map(|_| {
+            Mutex::new(FxHashMap::with_capacity_and_hasher(
+                per_shard_cap,
+                Default::default(),
+            ))
+        })
+        .collect();
+
+    let (ranges, multiline) = split_fasta_ranges(data);
+    let run_range = |buf: &mut ShardBufs<K>, slice: &[u8]| {
+        for_each_kmer_of::<K>(slice, k, ds, |key| {
+            buf.push(shard_of(&key, shard_bits), key);
+        });
+        if buf.buffered >= flush_keys {
+            buf.flush_into(&tables);
+        }
+    };
+    // fold 携带每 rayon 任务的缓冲跨记录复用, collect 收回残余（collect 后
+    // 逐个冲刷, 不丢尾部）; multiline 记录粒度同型
+    let bufs: Vec<ShardBufs<K>> = if multiline {
+        split_fasta_sequences(data)
+            .par_iter()
+            .fold(
+                || ShardBufs::new(shards),
+                |mut buf, rec| {
+                    run_range(&mut buf, rec);
+                    buf
+                },
+            )
+            .collect()
+    } else {
+        ranges
+            .par_iter()
+            .fold(
+                || ShardBufs::new(shards),
+                |mut buf, &(s, e)| {
+                    run_range(&mut buf, &data[s..e]);
+                    buf
+                },
+            )
+            .collect()
+    };
+    for mut buf in bufs {
+        buf.flush_into(&tables);
+    }
+    let t_count = t0.elapsed();
+
+    let t1 = std::time::Instant::now();
+    // 终点折叠: 片间键不交（分片由键哈希决定）→ 每键恰好一次插入;
+    // 精确总容量预留, 无生长 rehash
+    let total: usize = tables.iter().map(|t| t.lock().unwrap().len()).sum();
+    let mut out = FxHashMap::with_capacity_and_hasher(total, Default::default());
+    for t in tables {
+        for (key, cnt) in t.into_inner().unwrap() {
+            out.insert(key, cnt);
+        }
+    }
+    if cnt_profile_enabled() {
+        eprintln!(
+            "[cnt] k={k} ds={ds}: count(shard) {:.1}s, merge(final-fold {total} 键) {:.1}s",
+            t_count.as_secs_f64(),
+            t1.elapsed().as_secs_f64()
+        );
+    }
+    out
 }
 
 /// 窄键表 → CountMap（KmerId）一次性 widen（压时间战役 2026-09-04 刀1）:
@@ -402,6 +584,50 @@ mod tests {
                 assert_eq!(wide.len(), narrow.len(), "k={k} ds={ds}");
                 for (key, c) in &narrow {
                     assert_eq!(wide.get(&key.to_wide()), Some(c), "k={k} ds={ds}");
+                }
+            }
+        }
+    }
+
+    /// 分片计数（刀2, 2026-09-05）: 强制多轮冲刷（flush_keys=64）与常规路径
+    /// （大上限, 单轮冲刷）在 u64/u128/KmerId 三层键上多重集等价——冲刷轮数
+    /// 只改插入时序, 片内 += 可交换、片间键不交。
+    #[test]
+    fn count_sharded_forced_flush_matches() {
+        let fa = b">x\nACGTACGTNNAGGCACGTACGTACGTagctACGTACGTACGT\n>y\nAAAAACCCCCGGGGGTTTTTACGTACGTACGTACGT";
+        let multiline: Vec<u8> = {
+            let mut v = b">m\n".to_vec();
+            for _ in 0..12 {
+                v.extend_from_slice(b"ACGTACGT");
+                v.push(b'\n');
+            }
+            v.extend_from_slice(b"ACGTACGTNNAGG");
+            v
+        };
+        for (tag, seq) in [("single", &fa[..]), ("multiline", &multiline[..])] {
+            for k in [7usize, 25, 33, 63] {
+                for ds in [true, false] {
+                    let normal = count_fasta_data_of::<KmerId>(seq, k, ds, 0);
+                    let tiny_flush = count_fasta_data_sharded::<KmerId>(
+                        seq, k, ds, 0, COUNT_SHARD_BITS, 64,
+                    );
+                    assert_eq!(tiny_flush.len(), normal.len(), "{tag} k={k} ds={ds}");
+                    for (key, c) in &normal {
+                        assert_eq!(tiny_flush.get(key), Some(c), "{tag} k={k} ds={ds}");
+                    }
+                    if k <= 32 {
+                        let narrow = count_fasta_data_sharded::<u64>(
+                            seq, k, ds, 0, COUNT_SHARD_BITS, 64,
+                        );
+                        for (key, c) in &normal {
+                            debug_assert!(key.hi == 0);
+                            assert_eq!(
+                                narrow.get(&(key.lo as u64)),
+                                Some(c),
+                                "{tag} k={k} ds={ds}"
+                            );
+                        }
+                    }
                 }
             }
         }

@@ -12,6 +12,9 @@ trinity-butterfly = { path = "../trinity-butterfly" }
 rayon = { workspace = true }
 rustc-hash = { workspace = true }
 mimalloc = { workspace = true }
+# 与 mimalloc 0.1.52 锁定的同一 libmimalloc-sys 实例（选项号 = vendored
+# mimalloc v2 的 mi_option_purge_delay; 升级依赖须复核位次, 见 trinity-cli.rs）
+libmimalloc-sys = { version = "=0.1.49", features = ["extended"] }
 libc = "0.2"
 
 [dev-dependencies]

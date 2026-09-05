@@ -2867,3 +2867,64 @@ estimate_hash_size(64G) 同管线口径, 全表对拍内置）:
 非确定带内（promo 两跑自身 ±0.2%）; 计数表逐键等价已证, 指标等价随之。
 
 | 2026-09-04 | qm4-knife1 全程 | wall **29:48**（基线 34:07） | n=117834 N50=1793 | --multi-k auto --inchworm_cpu 32 --CPU 32 --max_memory 64G |
+
+## 刀2: diginorm 分片共享表计数——负结果裁定的正收益（2026-09-05）
+
+**动机（CNT_PROFILE 分段实测, QM4 k=25 u64 键）**: diginorm 计数的 reduce
+合并 221.6/282.1s（两侧）≥ 计数本体 181.0/313.0s——reads 随机分布下每线程
+局部表收敛到近全量 distinct 集（~0.73D/线程）, 合并 ≈ 线程数×D 次随机
+插入, 局部表叠加把 RSS 顶到 2~3×D。
+
+**实现**: counter 新增 `count_fasta_data_of_sharded`——k-mer 按键哈希高
+8 位入 256 片, 每线程分片缓冲攒 2M 键整批冲刷进 Mutex 片表（片表 ≈ D/256
+条, 局部性好）; 终点按精确容量把片表一次折叠回单表（恰 D 次插入, 无生长
+rehash）。键值多重集等价: 片间键不交 + 片内 += 可交换（强制冲刷单测
+count_sharded_forced_flush_matches, flush=64 三层键全对拍）。
+
+**交错 A/B 裁定（同负载窗口, 基线 = 956af9a worktree 二进制背靠背）**:
+- **diginorm（u64 键, 双侧各 ~CPU/2 线程）: 大赢**——dn_bench 677.6→516.0s
+  （-24%）; 合并坍缩至 ~15s（D=1.22/1.34 亿键/侧）; 产物与基线逐字节一致。
+- **inchworm 轮（u128 键, 单次 32 线程）: 真回退**——count_bench k49
+  layered 240.5→303.6s（k63 249.2→262.7s）; 段数据显示回退全在
+  count(shard) 段: 32 冲刷线程 × 256 片表的 Mutex 在共享机高负载下有
+  护航效应（持锁线程被抢占 → 同片冲刷排队）。
+- **定案: 按调用形态分发**——diginorm CountTable::build 三变体全走分片;
+  轮计数（count_fasta_data_layered / 公共 API）恢复局部表+reduce。
+  两条路径并存, 均带 CNT_PROFILE 分段。
+
+**flake 容差校准（cli_parallel_iworm_smoke, 同日）**: 高负载日孤立复跑
+12 次挂 5 次（远超注释记录的 2%）, 5 次失败全部 uniq≤2/侧、6 条核心
+contig 恒齐备——竞态分裂量实测 ±2。容差 +1→+2 并显式断言交集 ≥6
+（系统性破裂下交集坍缩, 不可能恰好差 2）; 加固后 10/10 稳, 全量 681 绿。
+该测试直调 inchworm 二进制, 不经 counter 路径, 与刀1/刀2 无关（负载
+加宽竞态窗的环境效应, 2026-09-04 起便已 1/3 出现）。
+
+| 2026-09-05 | dn_bench 交错 A/B | 677.6s → **516.0s**（-24%） | 逐字节一致 | 分片 diginorm 形态, 32 线程 |
+| 2026-09-05 | count_bench 交错 | k49 layered 240.5→303.6s **（回退）** | — | 32 线程单调用形态 → 裁定不分片 |
+
+**端到端排障与终态（mimalloc 交互, 2026-09-05 晚）**:
+
+- 管线复测 3/3 在 k49 fold 计数段 RSS 45s 内 35→455GB 被 OOM-kill
+  （GNU time 对被杀子进程误报 "Exit status: 0", 以 bash $?=137 与
+  RSS 观察器为准）。同二进制同输入同线程的 glibc example（count_bench）
+  不复现——#[global_allocator] 只在各 bin 声明, example 默认 glibc,
+  排障时构成天然 A/B。
+- **根因**: 分片归一化的大表释放后, mimalloc 默认 PURGE_DELAY=10ms 滞留
+  已释放页; 与 multi-k 轮计数（每线程局部表翻倍增长 + reduce 合并新表）
+  叠加, 大分配链在滞留堆上雪崩。
+- **修复**: trinity-cli main() 程序内 mi_option_set(PURGE_DELAY, 0)
+  （libmimalloc-sys extended 特性; 选项位次 15 以 vendored v2 头文件
+  锚定, 升级须复核）。程序内设置覆盖同名环境变量。
+- 验证: 全量 QM4 exit=0, wall 34:57（重负载窗）, 峰值 RSS 85GB,
+  k49/k63 fold 各 238/232s 正常; 切片 2M PE 447s exit=0（程序内默认生效）。
+- 分配器 A/B（切片 2M PE, 交错两轮, 同负载窗）: mimalloc 默认 370/380s,
+  glibc 493/474s——**mimalloc 快 22%**, 小尺度不触发 OOM（交互需全量
+  尺度的内存压力）; purge=0 切片 447s（与默认档的差含晚间负载漂移,
+  未隔离纯代价, 但不影响终态选择: purge=0 是全量安全的唯一 mimalloc
+  配置, glibc 档全量 38:40 且切片 +22%）。
+- 刀2 净效果（QM4 全量, 重负载窗口径）: 34:57 vs glibc 38:40; 归一化
+  段交错口径 -161s。端到端含 diginorm 分片 + 刀1 全部优化的轻负载复测
+  留待后续（今日全程重负载, 与 29:48 不可比）。
+
+| 2026-09-05 | qm4-purge0 全程 | wall **34:57**（重负载） | exit=0 峰值 85GB | mimalloc+PURGE_DELAY=0+分片归一化 |
+| 2026-09-05 | 切片分配器 A/B | mimalloc 375s vs glibc 483s（**-22%**） | n 带内一致 | 2M PE 交错两轮 |

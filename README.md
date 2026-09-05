@@ -106,11 +106,13 @@ target/release/trinity-cli \
 - quantify 阶段随 rtt-multi-kmer 放大的耗时已由物化键排序优化压回（间接寻址 memcmp → ACGT 2bit u64 主群 + 含 N 次群，微基准 3.5×，产物逐字节一致）。
 - diginorm 计数表 k≤32 键层再降一档（u128→u64，键带宽/哈希域减半）：QM4 全量微基准 602→562s（热段 −15%），产物逐字节一致。
 - inchworm 轮 kmer_count 分层窄键计数（k≤32 u64 / k≤64 u128 + 终点 widen 回 KmerId，消费方接口不变）：微基准 k=49 1.38×，QM4 端到端 34:07→**29:48**（kmer_count 两轮 -241s，峰值 RSS 118→88GB），计数表亿键逐键对拍等价。
+- diginorm 计数改分片共享表（256 片 Mutex 片表 + 终点精确容量折叠，仅 diginorm 形态；轮计数维持局部表+reduce——交错 A/B 裁定分片对 32 线程单调用形态有锁护航回退）：diginorm 同负载 677→516s（-24%），产物逐字节一致。
+- mimalloc 全局分配器补 `PURGE_DELAY=0`（程序内默认）：分片归一化前置 + 轮计数大表翻倍在默认滞留下全量 QM4 必现 OOM（45s 内 35→455GB），置 0 后全程通过（峰值 85GB）；mimalloc 相对 glibc 切片口径快 22%。
 - `--bfly-no-path-merging` / `--bfly-empty-retry` / `--weld-reads <fa>` / `--weld-glue-factor` / `--cluster-max-size`：机制探索旗标（详见 `docs/opt-log.md` 2026-09-03/04 各节），QM4/dev1 评估后均未达转正线，保留供复现实验。
 
 ## 验证
 
-- `cargo test --workspace`：680 项单测/组件对拍全绿。
+- `cargo test --workspace`：681 项单测/组件对拍全绿。
 - 三层交叉验证（`cargo xtask`）：
   - `xcheck-kmer / xcheck-inchworm / xcheck-chrysalis / xcheck-butterfly`——第 1、2 层（单元/管线级，对拍原版二进制或黄金）；
   - `xcheck-trinity [--full]`——第 3 层端到端：截断（默认 50000 PE reads）/全量双侧全管线对拍 + eval 统计 + both.fa 互喂抽查 + SS(RF) 合成小集；判定阈值与校准依据见 `docs/xcheck-trinity-report.md`。
