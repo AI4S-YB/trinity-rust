@@ -109,16 +109,17 @@ target/release/trinity-cli \
 - diginorm 计数改分片共享表（256 片 Mutex 片表 + 终点精确容量折叠，仅 diginorm 形态；轮计数维持局部表+reduce——交错 A/B 裁定分片对 32 线程单调用形态有锁护航回退）：diginorm 同负载 677→516s（-24%），产物逐字节一致。
 - mimalloc 全局分配器补 `PURGE_DELAY=0`（程序内默认）：分片归一化前置 + 轮计数大表翻倍在默认滞留下全量 QM4 必现 OOM（45s 内 35→455GB），置 0 后全程通过（峰值 85GB）；mimalloc 相对 glibc 切片口径快 22%。
 
-**内存战役（2026-09-05/06，QM4 峰值 83→28.7GB，目标 <32GB 达成）**：
+**内存战役（2026-09-05/06 两期，QM4 峰值 83→21.1GB，目标 32→达成后压至 ~20G 档）**：
 
-- 峰值画像（`.stage_memory` 阶段边界 + CNT/GFF_PROFILE 行尾 VmHWM + 2s 采样器）：83GB 归属 = diginorm 分片计数缓冲病（细粒度任务永不冲刷，键流隐式全量缓存 ~60GB）+ 轮计数 32 局部表（75.6/70.3GB）+ gff read_counts 分块稠密 partials（47GB）+ inchworm 种子收集/排序/DashMap 转换三叠瞬态（33.5-33.8GB）。
-- 六刀（全部语义无损，等价性实测）：①分片冲刷字节定界（1MB/键宽）+`with_min_len` 钳任务数；②轮计数统一切片（旧"锁护航回退"裁定被缓冲病污染，作废——count_bench k49 249→**87s** 且单段峰值 ~13GB）；③gff 改回原版 omp atomic 共享计数 + crossover 即时释放 + `from_utf8_lossy` Cow 借用 + 共享 rc_seqs（gff_profile 301s/102.8GB→**198s/24.1GB**，weld 图逐字节一致）；④种子排序 `sort_unstable`（键唯一→比较器全序，免 n/2 暂存）；⑤种子收集精确容量预留（免末次翻倍 +11.7GB）；⑥DashMap 整表重建提前到种子收集前的空窗 + 种子只取键（count 实时重查）。
-- 附带收益：diginorm 432→207s、两轮计数 490→100s、gff 175→169s、`save_counts_bin` 流式（-7GB 瞬时）；QM4 端到端 34:57→**25:23**，产物 n/N50 带内一致（117,722-118,195，平局非确定带宽）。
-- `--bfly-no-path-merging` / `--bfly-empty-retry` / `--weld-reads <fa>` / `--weld-glue-factor` / `--cluster-max-size`：机制探索旗标（详见 `docs/opt-log.md` 2026-09-03/04 各节），QM4/dev1 评估后均未达转正线，保留供复现实验。
+- 第一期六刀（83→28.7GB）：分片冲刷字节定界+`with_min_len`（缓冲病根修）；轮计数统一切分片（旧"锁护航回退"裁定系缓冲病污染，作废——count_bench k49 249→**87s**）；gff 改 omp atomic 共享计数 + crossover 即释 + Cow 借用 + 共享 rc_seqs（102.8→24.1GB，weld 图逐字节一致）；种子排序 `sort_unstable`；种子收集精确容量；DashMap 重建提前到空窗+种子只取键。
+- 第二期六刀（28.7→21.1GB）：diginorm 侧计数串行 + 表/行集分阶段释放 + emit 流式化（span 元数据 + 原位切片流写）；**轮链窄键化**——33≤k≤64 全程 u128（`count_fasta_data_layered128` 直通 + `save_counts_bin128` 流式落盘 + prune 泛型化 + `SyncKmerCounter128`，KmerId 宽表不再物化）；diginorm read+prep 按侧串行（raw/fa 不四份并存）；gff phase1 平铺竞技场 + 窗口直指竞技场（候选 11.7→4.5GB，免二次平铺）；diginorm 折叠带 min_kmer_cov 过滤（单例错误 k-mer 过半不进表）。
+- 等价性：每刀带等价锁（窄目录查询/置零逐项一致、窄链 prune 多重集一致、flat/Vec 模板表逐条一致、折叠过滤=retain_min、sharded=locals 全键对拍），产物 n/N50 全程带内（117.7-118.2K，平局非确定带宽）。
+- 附带收益：diginorm 432→~290s、gff 175→~170s；`save_counts_bin` 流式。端到端 34:57→25-28min（重负载窗）。685 项测试全绿。
+- `--bfly-no-path-merging` / `--bfly-empty-retry` / `--weld-reads <fa>` / `--weld-glue-factor` / `--cluster-max-size`：机制探索旗标（详见 `docs/opt-log.md`），未达转正线，保留供复现实验。
 
 ## 验证
 
-- `cargo test --workspace`：682 项单测/组件对拍全绿。
+- `cargo test --workspace`：685 项单测/组件对拍全绿。
 - 三层交叉验证（`cargo xtask`）：
   - `xcheck-kmer / xcheck-inchworm / xcheck-chrysalis / xcheck-butterfly`——第 1、2 层（单元/管线级，对拍原版二进制或黄金）；
   - `xcheck-trinity [--full]`——第 3 层端到端：截断（默认 50000 PE reads）/全量双侧全管线对拍 + eval 统计 + both.fa 互喂抽查 + SS(RF) 合成小集；判定阈值与校准依据见 `docs/xcheck-trinity-report.md`。

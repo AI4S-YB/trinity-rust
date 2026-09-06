@@ -342,7 +342,11 @@ pub fn graph_from_fasta(
     // ---- Phase 1（:1304-1403）：收集候选 weldmers ----
     // 原版 omp critical push_back——本版 per-contig 局部收集 + 按索引序合并
     // （表构造前会排序去重，顺序只影响日志；仍取确定性）。
-    let crossover: Vec<Vec<u8>> = if p.no_welds {
+    // 刀M10（2026-09-06 内存战役）: 候选改平铺竞技场（flat + (off,len) 跨度）
+    // ——亿级短候选（QM4 ~27B/条）免逐候选 Vec 分配（实测 Vec<Vec<u8>> 形态
+    // 11.7GB → 竞技场 ~4.5GB）; set_up_templates_flat 的窗口偏移直接指向
+    // 竞技场, 免内部窗口二次平铺。候选多重集与 Vec 形态恒等。
+    let crossover_arenas: Vec<(Vec<u8>, Vec<(usize, u32)>)> = if p.no_welds {
         Vec::new()
     } else {
         // 显式 `-t` 池（原版 -t1 时也不该吃满全局核）。
@@ -350,12 +354,13 @@ pub fn graph_from_fasta(
             .num_threads(p.threads.max(1))
             .build()
             .map_err(|e| CommonError::Parse(format!("cannot build GFF thread pool: {e}")))?;
-        let per_contig: Vec<Vec<Vec<u8>>> = pool.install(|| {
+        pool.install(|| {
             (0..n)
                 .into_par_iter()
                 .map(|i| {
                     let d = &iworm_seqs[i].seq;
-                    let mut local: Vec<Vec<u8>> = Vec::new();
+                    let mut flat: Vec<u8> = Vec::new();
+                    let mut spans: Vec<(usize, u32)> = Vec::new();
                     if d.len() >= k {
                         for j in 0..=d.len() - k {
                             let sub = &d[j..j + k];
@@ -396,18 +401,18 @@ pub fn graph_from_fasta(
                                             && !is_simple(&add)
                                             && !simple_halves_with(&add, p.disable_repeat_check)
                                         {
-                                            local.push(add);
+                                            spans.push((flat.len(), add.len() as u32));
+                                            flat.extend_from_slice(&add);
                                         }
                                     }
                                 }
                             }
                         }
                     }
-                    local
+                    (flat, spans)
                 })
                 .collect()
-        });
-        per_contig.into_iter().flatten().collect()
+        })
     };
 
     // ---- weldmer 计数（:1412-1427）----
@@ -415,14 +420,17 @@ pub fn graph_from_fasta(
         eprintln!(
             "[gff] phase1_crossover: {:?}, {} 条候选, {}",
             __t.elapsed(),
-            crossover.len(),
+            crossover_arenas
+                .iter()
+                .map(|(_, s)| s.len())
+                .sum::<usize>(),
             mem_dbg()
         );
     }
-    let table = NonRedKmerTable::set_up_templates(&crossover, kk, false);
-    // 候选序列仅用于构造模板表——立即释放（QM4 级候选集数 GB,
-    // 2026-09-05 内存战役; set_up_templates 之后 crossover 无消费方）
-    drop(crossover);
+    let table = NonRedKmerTable::set_up_templates_flat(&crossover_arenas, kk, false);
+    // 候选竞技场仅用于构造模板表——立即释放（刀M3 起语义; 竞技场形态
+    // QM4 ~4.5GB）
+    drop(crossover_arenas);
     if std::env::var_os("GFF_PROFILE").is_some() {
         eprintln!(
             "[gff] weldmer_templates: {:?}, {} 模板, {}",

@@ -178,17 +178,21 @@ impl KmerCountTable {
     }
 }
 
-/// 分片位宽（2^8 = 256 片）: 每片表 ≈ D/256 条（D = distinct 键数）,
+/// 分片位宽（2^9 = 512 片）: 每片表 ≈ D/512 条（D = distinct 键数）,
 /// 大表的随机插入变为片内局部插入; 片表 Mutex 下按缓冲批量冲刷摊薄锁开销。
-const COUNT_SHARD_BITS: usize = 8;
+/// 片数 256→512（2026-09-06 20GB 战役）: hashbrown 桶数 pow2 粒度下,
+/// 每片条目越小、容量浪费比越低（QM4 侧表 D/256 ≈ 52 万条 → 2^20 桶
+/// 浪费 2.2×; D/512 ≈ 26 万条 → 2^19 桶 1.77×）——片表常驻省 ~20%。
+const COUNT_SHARD_BITS: usize = 9;
 /// 单任务分片缓冲的冲刷阈值（**字节**）: flush_keys = 该字节数 / 键宽,
 /// 下限 [`COUNT_FLUSH_MIN_KEYS`]。缓冲内存上界 = 任务数 × 阈值字节:
-/// 经 with_min_len 粒度控制后 QM4 级（~21.5M 记录 → ≤2.6K 任务）≈ 2.6GB。
+/// 经 with_min_len 粒度控制后 QM4 级（~21.5M 记录 → ≤2.6K 任务）≈ 1.3GB
+/// （2026-09-06 20GB 战役 M11 自 1MB 再减半; 锁次数经 wide 对照验证无回退）。
 /// 2026-09-05 旧值 2M 键下细粒度任务（单任务 <2M 键）**永不触发冲刷**,
 /// 键滞留在任务缓冲里等 collect 终点统一冲刷——整个 k-mer 键流被隐式
 /// 缓存在内存（QM4 63 亿键 × 8B + Vec 倍增 ≈ 60GB 瞬时, 即实测阶段
 /// 峰值 86GB 的主体; 当时的"峰值 ≈ D + 缓冲"推断未经实测）。
-const COUNT_FLUSH_BYTES: usize = 1 << 20;
+const COUNT_FLUSH_BYTES: usize = 1 << 19;
 /// 冲刷阈值键数下限（防宽键下字节数除出过小值——锁次数过多）。
 const COUNT_FLUSH_MIN_KEYS: usize = 1 << 14;
 /// 每任务最少处理记录数（with_min_len）: 任务数上界 = 记录数/该值,
@@ -290,6 +294,33 @@ where
         per_thread_capacity,
         COUNT_SHARD_BITS,
         count_flush_keys_for::<K>(),
+        1,
+    )
+}
+
+/// [`count_fasta_data_of_sharded`] 的折叠过滤变体（刀M12, 2026-09-06
+/// 20GB 战役）: 终点折叠只落 count ≥ `fold_min` 的键——与"全量折叠后
+/// retain_min"产出**恒等**（同一过滤谓词作用于同一多重集）, 但输出表
+/// 只为保留键付出容量（QM4 diginorm m=2 过滤掉单例错误 k-mer ~30-40%
+/// distinct, 侧折叠输出 ≈ -40%）, 且折叠插入次数同步减少。
+pub fn count_fasta_data_of_sharded_min<K>(
+    data: &[u8],
+    k: usize,
+    ds: bool,
+    per_thread_capacity: usize,
+    fold_min: u32,
+) -> FxHashMap<K, u32>
+where
+    K: RollingKey + Send,
+{
+    count_fasta_data_sharded::<K>(
+        data,
+        k,
+        ds,
+        per_thread_capacity,
+        COUNT_SHARD_BITS,
+        count_flush_keys_for::<K>(),
+        fold_min,
     )
 }
 
@@ -352,7 +383,8 @@ where
     merged
 }
 
-/// 分片计数实现（flush_keys 参数化供测试强制多轮冲刷）。
+/// 分片计数实现（flush_keys 参数化供测试强制多轮冲刷; fold_min = 终点
+/// 折叠的计数下限——1 即无过滤, 与全量折叠+retain_min(min) 恒等）。
 fn count_fasta_data_sharded<K>(
     data: &[u8],
     k: usize,
@@ -360,6 +392,7 @@ fn count_fasta_data_sharded<K>(
     per_thread_capacity: usize,
     shard_bits: usize,
     flush_keys: usize,
+    fold_min: u32,
 ) -> FxHashMap<K, u32>
 where
     K: RollingKey + Send,
@@ -422,21 +455,36 @@ where
 
     let t1 = std::time::Instant::now();
     // 终点折叠: 片间键不交（分片由键哈希决定）→ 每键恰好一次插入;
-    // 精确总容量预留, 无生长 rehash
+    // 容量按全量预留（pow2 对齐下与过滤后实际差异通常落同一桶数档）。
+    // fold_min > 1 时只落达限键——与全量折叠后 retain_min(fold_min) 恒等
+    // （刀M12: 过滤谓词同、多重集同; 输出表免为被滤键付容量）。
     let total: usize = tables.iter().map(|t| t.lock().unwrap().len()).sum();
     let mut out = FxHashMap::with_capacity_and_hasher(total, Default::default());
+    let mut kept = 0usize;
     for t in tables {
         for (key, cnt) in t.into_inner().unwrap() {
-            out.insert(key, cnt);
+            if cnt >= fold_min {
+                out.insert(key, cnt);
+                kept += 1;
+            }
         }
     }
     if cnt_profile_enabled() {
-        eprintln!(
-            "[cnt] k={k} ds={ds}: count(shard) {:.1}s, merge(final-fold {total} 键) {:.1}s, VmHWM {}MB",
-            t_count.as_secs_f64(),
-            t1.elapsed().as_secs_f64(),
-            vm_hwm_mb()
-        );
+        if fold_min > 1 {
+            eprintln!(
+                "[cnt] k={k} ds={ds}: count(shard) {:.1}s, merge(final-fold {total} 键, ≥{fold_min} 保留 {kept}) {:.1}s, VmHWM {}MB",
+                t_count.as_secs_f64(),
+                t1.elapsed().as_secs_f64(),
+                vm_hwm_mb()
+            );
+        } else {
+            eprintln!(
+                "[cnt] k={k} ds={ds}: count(shard) {:.1}s, merge(final-fold {total} 键) {:.1}s, VmHWM {}MB",
+                t_count.as_secs_f64(),
+                t1.elapsed().as_secs_f64(),
+                vm_hwm_mb()
+            );
+        }
     }
     out
 }
@@ -484,6 +532,77 @@ pub fn count_fasta_data_layered(data: &[u8], k: usize, ds: bool, per_thread_capa
     } else {
         count_fasta_data_of::<KmerId>(data, k, ds, per_thread_capacity)
     }
+}
+
+/// 33≤k≤64 的轮计数窄键直通（刀M8, 2026-09-06 内存战役）: 返回 u128 计数表
+/// 本体, 不做终点 widen——管线窄链（save_counts_bin128 流式落盘 + trusted
+/// 注入 + prune + SyncKmerCounter128 PARALLEL 目录）全程 u128, KmerId 宽表
+/// （QM4 ~2 亿键 × 40B/槽, hashbrown pow2 容量放大后 ~10.7GB）不再被物化。
+/// 键值多重集与 count_fasta_data_layered 的 widen 前身恒等（同一 sharded
+/// 计数, 仅是否 widen 的差别）; 域外 k 返回 None（调用方走宽链）。
+pub fn count_fasta_data_layered128(
+    data: &[u8],
+    k: usize,
+    ds: bool,
+    per_thread_capacity: usize,
+) -> Option<FxHashMap<u128, u32>> {
+    if (33..=64).contains(&k) {
+        Some(count_fasta_data_of_sharded::<u128>(
+            data,
+            k,
+            ds,
+            per_thread_capacity,
+        ))
+    } else {
+        None
+    }
+}
+
+/// save_counts_bin 的 u128 窄表流式变体（刀M8）: 逐条 to_wide 后同格式写出
+/// ——与宽链落盘字节恒等（k≤64 域内 widen 是纯零扩展平移, 表迭代序同一）。
+pub fn save_counts_bin128(
+    path: &std::path::Path,
+    counts: &FxHashMap<u128, u32>,
+    k: usize,
+    ds: bool,
+) -> Result<(), trinity_common::error::CommonError> {
+    use std::io::Write;
+    let fh = std::fs::File::create(path)?;
+    let mut w = std::io::BufWriter::with_capacity(1 << 23, fh);
+    w.write_all(b"TRM3")?;
+    w.write_all(&(k as u32).to_le_bytes())?;
+    w.write_all(&[ds as u8])?;
+    let mut kb = [0u8; 32];
+    let mut cb = [0u8; 4];
+    for (&key, &c) in counts.iter() {
+        kb.copy_from_slice(&KmerId { hi: 0, lo: key }.to_le_bytes());
+        w.write_all(&kb)?;
+        cb.copy_from_slice(&c.to_le_bytes());
+        w.write_all(&cb)?;
+    }
+    w.flush()?;
+    Ok(())
+}
+
+/// inject_trusted_kmers 的 u128 窄表变体（刀M8 窄链注入点）: 语义同宽版
+/// ——表中已存在的键不动计数, 缺席键 count=1 presence-only; k≤64 域内
+/// u128 键与 KmerId 键数值恒等。
+pub fn inject_trusted_kmers128(
+    counts: &mut FxHashMap<u128, u32>,
+    trusted_fasta: &[u8],
+    k: usize,
+    ds: bool,
+) -> usize {
+    let mut inserted = 0usize;
+    for rec in split_fasta_sequences(trusted_fasta) {
+        for_each_kmer_of::<u128>(&rec, k, ds, |key| {
+            if let std::collections::hash_map::Entry::Vacant(e) = counts.entry(key) {
+                e.insert(1);
+                inserted += 1;
+            }
+        });
+    }
+    inserted
 }
 
 /// reduce 合并: b 并入 a（计数累加）。小表并入大表（rehash 次数最少化）。
@@ -663,15 +782,25 @@ mod tests {
                 for ds in [true, false] {
                     let normal = count_fasta_data_of::<KmerId>(seq, k, ds, 0);
                     let tiny_flush = count_fasta_data_sharded::<KmerId>(
-                        seq, k, ds, 0, COUNT_SHARD_BITS, 64,
+                        seq, k, ds, 0, COUNT_SHARD_BITS, 64, 1,
                     );
                     assert_eq!(tiny_flush.len(), normal.len(), "{tag} k={k} ds={ds}");
                     for (key, c) in &normal {
                         assert_eq!(tiny_flush.get(key), Some(c), "{tag} k={k} ds={ds}");
                     }
+                    // 刀M12: 折叠过滤与"全量折叠后 retain_min"恒等
+                    let fold_min2 = count_fasta_data_sharded::<KmerId>(
+                        seq, k, ds, 0, COUNT_SHARD_BITS, 64, 2,
+                    );
+                    let mut retained = tiny_flush.clone();
+                    retained.retain(|_, c| *c >= 2);
+                    assert_eq!(fold_min2.len(), retained.len(), "{tag} k={k} ds={ds}");
+                    for (key, c) in &retained {
+                        assert_eq!(fold_min2.get(key), Some(c), "{tag} k={k} ds={ds}");
+                    }
                     if k <= 32 {
                         let narrow = count_fasta_data_sharded::<u64>(
-                            seq, k, ds, 0, COUNT_SHARD_BITS, 64,
+                            seq, k, ds, 0, COUNT_SHARD_BITS, 64, 1,
                         );
                         for (key, c) in &normal {
                             debug_assert!(key.hi == 0);

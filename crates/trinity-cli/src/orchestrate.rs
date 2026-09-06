@@ -17,8 +17,9 @@ use std::path::{Path, PathBuf};
 use trinity_chrysalis::pipeline::{run_chrysalis_pipeline, ChrysalisParams};
 use trinity_common::error::CommonError;
 use trinity_inchworm::irke::{
-    compute_sequence_assemblies_parallel, prune_some_kmers, write_kmer_count_report,
-    AssemblyParams, IrkeParams, Monitor,
+    compute_sequence_assemblies_parallel, compute_sequence_assemblies_parallel128,
+    prune_some_kmers, prune_some_kmers_narrow, write_kmer_count_report, AssemblyParams, IrkeParams,
+    Monitor,
 };
 use trinity_kmer::counter::estimate_hash_size;
 use trinity_kmer::diginorm::{self, DigiNormParams, ReadsInput};
@@ -847,6 +848,14 @@ pub fn run_trinity(args: &TrinityArgs) -> Result<PathBuf, CommonError> {
 ///
 /// 返回 inchworm 产物 fasta 路径（可能指向空文件——判定归调用方: 主线报错,
 /// multi-k 中间轮降级）。
+/// 一轮 k-mer 计数的内存形态（刀M8, 2026-09-06 内存战役）: 33≤k≤64 走
+/// u128 窄链（save/注入/剪枝/PARALLEL 目录全程 u128, KmerId 宽表不物化）;
+/// 其余 k 与 resume 回退（counts_bin 读回 = 全宽记录）走 CountMap 宽链。
+enum RoundCounts {
+    Wide(trinity_kmer::counter::CountMap),
+    Narrow128(rustc_hash::FxHashMap<u128, u32>),
+}
+
 fn run_count_and_inchworm(
     round_dir: &Path,
     target_fa: &Path,
@@ -861,13 +870,17 @@ fn run_count_and_inchworm(
         args.min_kmer_count
     ));
     let counts_bin = round_dir.join(format!("mer_counts.{k}.{SR_FLAG}.rs.bin"));
-    // 性能: 计数刚算出的内存表直接透传到 kmer_load（同进程同型 CountMap,
+    // 性能: 计数刚算出的内存表直接透传到 kmer_load（同进程同型,
     // 跳过 4GB 级 counts_bin 的读回+重建; bin 照写供 resume）。
     // resume（count_ok 已存在）时 None, kmer_load 回退 load_counts。
+    // 刀M8（2026-09-06 内存战役）: 33≤k≤64 透传 u128 窄表——终点 widen 的
+    // KmerId 宽表（QM4 ~2 亿键 × 40B/槽 ≈ 10.7GB）不再物化, counts_bin 由
+    // 窄表流式按记录 to_wide 落盘（字节与宽链恒等）; both.fa 计数后即释
+    // （旧版持有到闭包尾, 与落盘/widen 瞬时叠加）。
     let counts_mem = trinity_common::timer::timed(
         round_dir,
         "kmer_count",
-        || -> Result<Option<trinity_kmer::counter::CountMap>, CommonError> {
+        || -> Result<Option<RoundCounts>, CommonError> {
             if !checkpoint_exists(&count_ok) {
                 eprintln!("-- Trinity (rust) | Jellyfish count (K={k})");
                 // 硬护栏: target_fa 整读进内存 + 计数哈希。
@@ -882,11 +895,25 @@ fn run_count_and_inchworm(
                 // 避免增长期 rehash 内存峰值。
                 let estimate = estimate_hash_size(args.max_memory, data.len() as u64);
                 let per_thread = (estimate / KMER_ENTRY_BYTES / args.cpu.max(1) as u64) as usize;
-                // 分层窄键计数（k≤32 u64 / k≤64 u128）+ 终点 widen, 键值
-                // 多重集与 KmerId 直计相等（counter::count_layered_matches_wide）
+                // 分层窄键计数（k≤32 u64 / k≤64 u128）, 键值多重集与 KmerId
+                // 直计相等（counter::count_layered_matches_wide）
                 let counts =
-                    trinity_kmer::counter::count_fasta_data_layered(&data, k, ds, per_thread);
-                save_counts(&counts_bin, &counts, k, ds)?;
+                    match trinity_kmer::counter::count_fasta_data_layered128(
+                        &data, k, ds, per_thread,
+                    ) {
+                        Some(m) => {
+                            trinity_kmer::counter::save_counts_bin128(&counts_bin, &m, k, ds)?;
+                            RoundCounts::Narrow128(m)
+                        }
+                        None => {
+                            let c = trinity_kmer::counter::count_fasta_data_layered(
+                                &data, k, ds, per_thread,
+                            );
+                            save_counts(&counts_bin, &c, k, ds)?;
+                            RoundCounts::Wide(c)
+                        }
+                    };
+                drop(data); // 计数后无消费方（trusted 另读; 落盘已流式）
                 fs::write(&count_ok, b"")?;
                 return Ok(Some(counts));
             }
@@ -906,55 +933,62 @@ fn run_count_and_inchworm(
     let iworm_ok = round_dir.join(format!(".iworm.{k}.{SR_FLAG}.ok"));
     trinity_common::timer::timed(round_dir, "inchworm", || {
         run_with_checkpoint(&iworm_ok, "Inchworm (linear contig construction)", || {
-            // M7 直桥: 计数表（checkpoint 二进制或重算）直接构建 counter,
-            // 跳过 jellyfish dump 文本往返; 原 dump 的 -L min_cov 过滤由
-            // 下方 prune_some_kmers 等价承担。
-            let (mut counter, _parsed) = trinity_common::timer::timed(
+            // M7 直桥: 计数表（checkpoint 二进制或重算）统一在此汇合, trusted
+            // 注入（presence-only）先于剪枝; 宽/窄两链分派到各自的
+            // report/剪枝/PARALLEL 目录构建（窄链语义同宽——k≤64 域内键数值
+            // 恒等, canonical 折叠同式）。
+            let counts = trinity_common::timer::timed(
                 round_dir,
                 "kmer_load",
-                || -> Result<(trinity_inchworm::kmer_counter::KmerCounter, usize), CommonError> {
+                || -> Result<RoundCounts, CommonError> {
                     let mut counts = match counts_mem {
                         Some(c) => c,
                         None if checkpoint_exists(&counts_bin) => {
-                            load_counts(&counts_bin, k, ds)?
+                            RoundCounts::Wide(load_counts(&counts_bin, k, ds)?)
                         }
                         None => {
                             let data = fs::read(target_fa)?;
                             let estimate = estimate_hash_size(args.max_memory, data.len() as u64);
                             let per_thread =
                                 (estimate / KMER_ENTRY_BYTES / args.cpu.max(1) as u64) as usize;
-                            trinity_kmer::counter::count_fasta_data_layered(&data, k, ds, per_thread)
+                            match trinity_kmer::counter::count_fasta_data_layered128(
+                                &data,
+                                k,
+                                ds,
+                                per_thread,
+                            ) {
+                                Some(m) => RoundCounts::Narrow128(m),
+                                None => RoundCounts::Wide(
+                                    trinity_kmer::counter::count_fasta_data_layered(
+                                        &data,
+                                        k,
+                                        ds,
+                                        per_thread,
+                                    ),
+                                ),
+                            }
                         }
                     };
                     // multi-k trusted contig 注入（presence-only）: 计数表两条
                     // 构建路径汇合后的统一注入点, 先于 populate/剪枝。
                     if let Some(t) = trusted {
                         let tdata = fs::read(t)?;
-                        let inserted =
-                            trinity_kmer::counter::inject_trusted_kmers(&mut counts, &tdata, k, ds);
+                        let inserted = match &mut counts {
+                            RoundCounts::Wide(c) => {
+                                trinity_kmer::counter::inject_trusted_kmers(c, &tdata, k, ds)
+                            }
+                            RoundCounts::Narrow128(m) => {
+                                trinity_kmer::counter::inject_trusted_kmers128(m, &tdata, k, ds)
+                            }
+                        };
                         eprintln!(
                             "-multi-k: trusted contigs {} → 新注入 {inserted} 个 k-mer（count=1, presence-only）",
                             t.display()
                         );
                     }
-                    // 计数表 move 直构（键已 canonical 且唯一, 与逐条 add_kmer 等价）
-                    let n = counts.len();
-                    Ok((
-                        trinity_inchworm::kmer_counter::KmerCounter::from_count_map(
-                            counts, k, ds,
-                        ),
-                        n,
-                    ))
+                    Ok(counts)
                 },
             )?;
-            write_kmer_count_report(&round_dir.join("inchworm.kmer_count"), counter.size())?;
-            // 主线实参: --min_any_entropy 1.0 --no_prune_error_kmers（L1050/L2707）
-            // + dump -L 已按 min_kmer_cov 过滤（minKmerCount 此处为等价二次过滤）。
-            eprintln!(
-                "Pruning kmers (min_kmer_count={} min_any_entropy=1 min_ratio_non_error=0.005)",
-                args.min_kmer_count
-            );
-            prune_some_kmers(&mut counter, args.min_kmer_count, 1.0, false, 0.005);
             let params = IrkeParams::default();
             // -L = MIN_IWORM_LEN = KMER_SIZE（L1064/L2698）
             let aparams = AssemblyParams {
@@ -963,15 +997,58 @@ fn run_count_and_inchworm(
             };
             let monitor = Monitor::new(1);
             let mut buf = Vec::new();
-            compute_sequence_assemblies_parallel(
-                counter,
-                &params,
-                &aparams,
-                &monitor,
-                true, // TWO_PHASE 默认开（IRKE.cpp:59）
-                Some(args.inchworm_cpu),
-                &mut buf,
-            )?;
+            match counts {
+                RoundCounts::Wide(counts) => {
+                    // 计数表 move 直构（键已 canonical 且唯一, 与逐条 add_kmer 等价）
+                    let mut counter = trinity_inchworm::kmer_counter::KmerCounter::from_count_map(
+                        counts, k, ds,
+                    );
+                    write_kmer_count_report(&round_dir.join("inchworm.kmer_count"), counter.size())?;
+                    // 主线实参: --min_any_entropy 1.0 --no_prune_error_kmers（L1050/L2707）
+                    // + dump -L 已按 min_kmer_cov 过滤（minKmerCount 此处为等价二次过滤）。
+                    eprintln!(
+                        "Pruning kmers (min_kmer_count={} min_any_entropy=1 min_ratio_non_error=0.005)",
+                        args.min_kmer_count
+                    );
+                    prune_some_kmers(&mut counter, args.min_kmer_count, 1.0, false, 0.005);
+                    compute_sequence_assemblies_parallel(
+                        counter,
+                        &params,
+                        &aparams,
+                        &monitor,
+                        true, // TWO_PHASE 默认开（IRKE.cpp:59）
+                        Some(args.inchworm_cpu),
+                        &mut buf,
+                    )?;
+                }
+                RoundCounts::Narrow128(mut narrow) => {
+                    write_kmer_count_report(&round_dir.join("inchworm.kmer_count"), narrow.len())?;
+                    eprintln!(
+                        "Pruning kmers (min_kmer_count={} min_any_entropy=1 min_ratio_non_error=0.005)",
+                        args.min_kmer_count
+                    );
+                    prune_some_kmers_narrow(
+                        &mut narrow,
+                        k,
+                        ds,
+                        args.min_kmer_count,
+                        1.0,
+                        false,
+                        0.005,
+                    );
+                    compute_sequence_assemblies_parallel128(
+                        narrow,
+                        k,
+                        ds,
+                        &params,
+                        &aparams,
+                        &monitor,
+                        true, // TWO_PHASE 默认开（IRKE.cpp:59）
+                        Some(args.inchworm_cpu),
+                        &mut buf,
+                    )?;
+                }
+            }
             fs::write(&iworm_tmp, &buf)?;
             Ok(())
         })

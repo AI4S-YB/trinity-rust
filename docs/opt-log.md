@@ -3032,5 +3032,73 @@ KmerCounter/DashMap（k≤64 用 u128, -6~7GB）与 diginorm 文本往返流式�
 | 2026-09-06 | mem5 全程 | wall 27:37 | 峰 33.82GB（DashMap 重建三叠） | 刀M5 验证, 靶点转刀M6 |
 | 2026-09-06 | mem6 终审 | wall **25:23** | **峰 28.69GB（<32 达成）** | n=118,096 带内; 682 测试绿 |
 
+## 内存战役第二期: 28.7GB → 目标 ~20GB（2026-09-06）
+
+**目标（用户指令）**: 再往下压到 20G 左右。
+
+**mem6 残余构成的精拆（采样器时间线 + [cnt]/[gff] VmHWM）**:
+diginorm 读写+prep 时代 = 双侧 raw fq 解压缓冲 13.8GB + 双侧 fa 7.4GB 并存
+（23.96GB, 全段约束）; diginorm 行/emit 尾段 = 合并表 4.1 + 行集 ~3 +
+emit 整表物化 ×2（out Vec + 每命中记录拷贝, 27.9-28.9GB 棘轮）; diginorm
+计数段 = 并行双侧两套片表（pow2 容量浪费 ~2.2×/侧, 24.6GB 棘轮）; 轮链 =
+count 终点 widen 的 KmerId 宽 Fx 表 ~10.7GB + SyncKmerCounter DashMap 宽表
+重建（26.0GB 转换窗）; gff = phase1 候选 Vec<Vec<u8>> 11.7GB + 模板内部
+窗口二次平铺（23.08GB）。
+
+**六刀（全部语义无损, 各带等价锁）**:
+
+- **刀M7（diginorm）**: 侧计数串行化（M7a——并行双侧两套片表+折叠同时
+  在场; 串行每侧独占 rayon 池墙钟持平, 语义不变仅执行序）; 计数表在行
+  阶段后 drop、行集/merged/selected 在 index 后 drop（M7b, -7GB 常驻）;
+  extract_to_file 流式化（M7c——旧实现 out Vec 整表物化 + fq 路径每命中
+  再拷整条记录 ≈ 双份输出, 改 (acc, span) 元数据 + data 原位切片流写,
+  字节序恒等; 错误路径会留部分文件——调用方错误即中止无消费方）。
+- **刀M8（轮链窄键化）**: 33≤k≤64 全程 u128——count_fasta_data_layered128
+  直通窄表（终点 widen 消除）、save_counts_bin128 流式逐条 to_wide 落盘
+  （字节恒等）、inject_trusted_kmers128、prune_some_kmers 泛型化
+  （ExclusiveClearCatalog: KmerCounter 宽表与 NarrowCounter128 适配器
+  同一实现）、SyncKmerCounter128（DashMap<u128>, 槽 40B→20B）+ PARALLEL
+  入口 compute_sequence_assemblies_parallel128（贪心核心拆出
+  parallel_greedy_core 宽窄共用, 种子保持 u128 32→16B/条）。KmerId 宽
+  Fx 表与宽 DashMap（各 ~10.7GB）在 k≤64 轮链不再物化。
+  等价锁: sync128_query_parity_with_wide（查询/候选/置零逐项, SS/DS）+
+  prune_narrow_parity_with_wide（非零多重集）。
+- **刀M9（diginorm 读写）**: read+prep 按侧串行——双侧 raw 解压缓冲与
+  fa 产物不再四份并存（23.96→~14）; need_raw 判定提前, 左册 raw 先释。
+- **刀M10（gff）**: phase1 候选改平铺竞技场（flat + (off,len) 跨度,
+  Vec<Vec<u8>> 11.7GB→~4.5GB）+ set_up_templates_flat 窗口偏移直指竞技场
+  （免内部窗口二次平铺 ~7.5GB）。gff 23.08→20.97GB。
+  等价锁: set_up_templates_flat_matches_vec_form。
+- **刀M11（计数缓冲）**: COUNT_FLUSH_BYTES 1MB→512KB（缓冲上界 2.6→1.3GB）。
+- **刀M12（diginorm 折叠过滤+片粒度）**: 折叠带 min_kmer_cov 过滤
+  （与全量折叠后 retain_min 恒等, 输出表免为单例错误 k-mer ~30-40%
+  distinct 付容量）+ COUNT_SHARD_BITS 256→512 片（pow2 桶粒度下每片
+  更小 → 容量浪费 2.2×→1.77×）。
+
+**验证链**: mem7（M7/8: diginorm prep 23.96 定位→M9; gff 23.08→M10）
+→ mem8（M7-11: exit=0 wall 27:43 n=117,759 带内, 全局峰 ~20.5-21.0GB
+= diginorm B 侧折叠棘轮 21.76/gff 20.97）→ mem9（M12 全上, 终值见下表）。
+685 项测试全绿（682+3 个窄链/flat 等价锁）。
+
+| 2026-09-06 | mem7 全程 | wall 25:55 | 峰 23.96GB（diginorm prep） | M7/8 验证; n=118,207 带内 |
+| 2026-09-06 | mem8 全程 | wall 27:43 | 峰 ~20.5-21.0GB（B 侧折叠 21.76/gff 20.97） | M7-11 验证; n=117,759 带内 |
+| 2026-09-06 | mem9 终审 | wall **27:33** | **峰 21.12GB（k49 计数时代棘轮 21.21; gff 15.7）** | n=117,695 带内; 685 测试绿 |
+
+**mem9 备注**: M12 折叠过滤实测 diginorm 侧表保留率 43-46%（单例错误
+k-mer 过半）, 侧折叠 9.3→5.8s、diginorm 棘轮 21.76→20.66; 512 片对
+pow2 桶浪费无系统收益（浪费比 1.0-2.0× 对数均匀, 取决于 D/2^b 落点）,
+保留为片内局部性微调。全局约束转移到轮计数时代（both.fa 4.16 + 片表
+5.6 + 折叠输出 5.6——轮链 min_kmer_count 默认 1, 无过滤可带）。
+**28.7→21.1GB（-26%）; 两期累计 83→21.1GB（-75%）, 墙钟 34:57→25-28min。**
+
+**~20GB 之下的下一层（留档）**: gff 的 reads 双份常驻（reads_data 3.9 +
+reads_streamed 4.5——reads_data 为 rtt 阶段所持; flat 化 reads 或
+模板表 u64 打包（kk≤32, 慎入: 字节二分兜底路径与非 GATC 模板域）各
+-2~2.5GB; diginorm fa mmap 化（clean 页可回收, -7.4GB 匿名 RSS）;
+片表换非 pow2 容器。语义注记（遗留, 非本期引入）: diginorm 侧表
+过滤-后-合并序在 min_kmer_cov≥2 且 k-mer 双侧各计 1 时与原版
+jellyfish both.fa 合并-后-过滤分歧（本期 M7a/M12 保持移植既有语义）。
+
+
 
 

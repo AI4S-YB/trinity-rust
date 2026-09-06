@@ -15,11 +15,13 @@
 //!   （组装期不增不删键 → size 恒为转入时键数，与惰性删除的 size 语义一致）。
 
 use dashmap::DashMap;
-use rustc_hash::FxBuildHasher;
+use rustc_hash::{FxBuildHasher, FxHashMap};
 
 use trinity_common::kmer::{decode_kmer_from_intval, get_ds_kmer_val, KmerId};
 
-use crate::kmer_counter::{KmerCatalog, KmerCounter};
+use crate::kmer_counter::{
+    ConcurrentClearCatalog, ExclusiveClearCatalog, KmerCatalog, KmerCounter,
+};
 
 /// 并发 kmer 目录。构造点唯一：[`SyncKmerCounter::from_counter`]
 /// （单线程装载+剪枝完成的 KmerCounter 整表转入）。
@@ -109,6 +111,162 @@ impl KmerCatalog for SyncKmerCounter {
 
     fn get_kmer_string(&self, kmer: KmerId) -> Vec<u8> {
         decode_kmer_from_intval(kmer, self.kmer_length)
+    }
+}
+
+impl ConcurrentClearCatalog for SyncKmerCounter {
+    fn clear_kmer_concurrent(&self, kmer: KmerId) {
+        self.clear_kmer(kmer)
+    }
+}
+
+/// u128 并发 kmer 目录（k≤64 域; 刀M8 窄链 PARALLEL 组装期目录）。
+/// 键 = KmerId 低 limb（k≤64 域内数值恒等, hi 恒 0）——DashMap 槽位
+/// 40B→20B（QM4 ~2 亿键 ≈ 10.7→5.4GB）。查询侧 KmerId 参数经 canonical
+/// 折叠后取 lo（与 KmerCounter.canonical 同式）, debug_assert 守域。
+pub struct SyncKmerCounter128 {
+    kmer_length: usize,
+    ds_mode: bool,
+    counter: DashMap<u128, u32, FxBuildHasher>,
+}
+
+impl SyncKmerCounter128 {
+    /// u128 计数表（trusted 注入 + 剪枝完成态）整表转入。
+    /// 转入瞬态 = 窄表 + DashMap 两份（宽链为宽 Fx 表 + 宽 DashMap 两份
+    /// 大表再叠 KmerId 宽表物化——刀M8 前的全链峰值构成）。
+    pub fn from_narrow(map: FxHashMap<u128, u32>, kmer_length: usize, ds_mode: bool) -> Self {
+        let counter = DashMap::with_capacity_and_hasher(map.len(), FxBuildHasher);
+        for (kmer, count) in map {
+            counter.insert(kmer, count);
+        }
+        SyncKmerCounter128 {
+            kmer_length,
+            ds_mode,
+            counter,
+        }
+    }
+
+    /// canonical 折叠 + 收窄（k≤64 域内与 KmerCounter.canonical 数值恒等）。
+    fn narrow_key(&self, kmer: KmerId) -> u128 {
+        let c = if self.ds_mode {
+            get_ds_kmer_val(kmer, self.kmer_length)
+        } else {
+            kmer
+        };
+        debug_assert_eq!(c.hi, 0, "k≤64 域外键进入窄目录");
+        c.lo
+    }
+
+    /// count > 0 的键快照（PARALLEL 种子列表, 刀M6/8: 只取键 + 精确容量）。
+    pub fn nonzero_keys(&self) -> Vec<u128> {
+        let mut out = Vec::with_capacity(self.counter.len());
+        self.counter.iter().for_each(|item| {
+            if *item.value() > 0 {
+                out.push(*item.key());
+            }
+        });
+        out
+    }
+}
+
+impl KmerCatalog for SyncKmerCounter128 {
+    fn size(&self) -> usize {
+        self.counter.len()
+    }
+
+    fn get_kmer_length(&self) -> usize {
+        self.kmer_length
+    }
+
+    fn is_double_stranded(&self) -> bool {
+        self.ds_mode
+    }
+
+    fn get_kmer_count(&self, kmer: KmerId) -> u32 {
+        self.counter
+            .get(&self.narrow_key(kmer))
+            .map(|count| *count)
+            .unwrap_or(0)
+    }
+
+    fn get_kmer_string(&self, kmer: KmerId) -> Vec<u8> {
+        decode_kmer_from_intval(kmer, self.kmer_length)
+    }
+}
+
+impl ConcurrentClearCatalog for SyncKmerCounter128 {
+    fn clear_kmer_concurrent(&self, kmer: KmerId) {
+        let key = self.narrow_key(kmer);
+        if let Some(mut count) = self.counter.get_mut(&key) {
+            *count = 0;
+        }
+    }
+}
+
+/// u128 计数表的独占借用适配器（刀M8）: 让泛型 [`crate::irke::prune_some_kmers`]
+/// 直接作用于窄表, 免物化 KmerId 宽表。canonical/收窄语义与
+/// SyncKmerCounter128 同式。
+pub struct NarrowCounter128<'a> {
+    map: &'a mut FxHashMap<u128, u32>,
+    kmer_length: usize,
+    ds_mode: bool,
+}
+
+impl<'a> NarrowCounter128<'a> {
+    pub fn new(map: &'a mut FxHashMap<u128, u32>, kmer_length: usize, ds_mode: bool) -> Self {
+        NarrowCounter128 {
+            map,
+            kmer_length,
+            ds_mode,
+        }
+    }
+
+    fn narrow_key(&self, kmer: KmerId) -> u128 {
+        let c = if self.ds_mode {
+            get_ds_kmer_val(kmer, self.kmer_length)
+        } else {
+            kmer
+        };
+        debug_assert_eq!(c.hi, 0, "k≤64 域外键进入窄适配器");
+        c.lo
+    }
+}
+
+impl KmerCatalog for NarrowCounter128<'_> {
+    fn size(&self) -> usize {
+        self.map.len()
+    }
+
+    fn get_kmer_length(&self) -> usize {
+        self.kmer_length
+    }
+
+    fn is_double_stranded(&self) -> bool {
+        self.ds_mode
+    }
+
+    fn get_kmer_count(&self, kmer: KmerId) -> u32 {
+        self.map.get(&self.narrow_key(kmer)).copied().unwrap_or(0)
+    }
+
+    fn get_kmer_string(&self, kmer: KmerId) -> Vec<u8> {
+        decode_kmer_from_intval(kmer, self.kmer_length)
+    }
+}
+
+impl ExclusiveClearCatalog for NarrowCounter128<'_> {
+    fn clear_kmer_exclusive(&mut self, kmer: KmerId) {
+        let key = self.narrow_key(kmer);
+        if let Some(count) = self.map.get_mut(&key) {
+            *count = 0;
+        }
+    }
+
+    fn snapshot_all_keys(&self) -> Vec<KmerId> {
+        self.map
+            .keys()
+            .map(|&k| KmerId { hi: 0, lo: k })
+            .collect()
     }
 }
 
@@ -235,5 +393,118 @@ mod tests {
             assert_eq!(sync.get_kmer_count(k), 0);
         }
         assert_eq!(sync.size(), keys.len()); // 从未删键
+    }
+
+    /// 刀M8: 窄目录 SyncKmerCounter128 与宽目录 SyncKmerCounter 的
+    /// 查询/候选/并发置零逐项一致（SS 与 DS 两模式, 含互补链探测）。
+    #[test]
+    fn sync128_query_parity_with_wide() {
+        use crate::counter_sync::SyncKmerCounter128;
+        for ds in [false, true] {
+            let pairs = [
+                (enc(b"ACGT"), 9u32),
+                (enc(b"ACGA"), 3),
+                (enc(b"ACGG"), 5),
+                (enc(b"TTTT"), 7),
+                (enc(b"ACGC"), 2),
+            ];
+            let mut kc = KmerCounter::new(4, ds);
+            for &(k, c) in &pairs {
+                kc.add_kmer(k, c); // DS: canonical 折叠 +=（同窄表构造口径）
+            }
+            kc.clear_kmer(enc(b"ACGG")); // 惰性置零
+            let wide = SyncKmerCounter::from_counter(kc);
+
+            let canon = |k: KmerId| if ds { get_ds_kmer_val(k, 4) } else { k };
+            let mut narrow_map: FxHashMap<u128, u32> = FxHashMap::default();
+            for &(k, c) in &pairs {
+                *narrow_map.entry(canon(k).lo).or_insert(0) += c;
+            }
+            narrow_map.insert(canon(enc(b"ACGG")).lo, 0);
+            let narrow = SyncKmerCounter128::from_narrow(narrow_map, 4, ds);
+
+            assert_eq!(wide.size(), narrow.size());
+            // 探测集: 表键 + 互补链 + 缺席键（含 1/2/3 碱基前缀邻域）
+            let probes = [
+                b"ACGT".as_ref(),
+                b"ACGA".as_ref(),
+                b"ACGG".as_ref(),
+                b"TTTT".as_ref(),
+                b"ACGC".as_ref(),
+                b"TCGT".as_ref(), // ACGA 互补链（DS 折叠命中）
+                b"GCGT".as_ref(), // ACGC 互补链
+                b"AAAA".as_ref(),
+                b"CCGT".as_ref(),
+            ];
+            for p in probes {
+                let k = enc(p);
+                assert_eq!(
+                    wide.get_kmer_count(k),
+                    narrow.get_kmer_count(k),
+                    "ds={ds} probe={p:?}"
+                );
+                assert_eq!(
+                    wide.get_forward_kmer_candidates(k),
+                    narrow.get_forward_kmer_candidates(k),
+                    "ds={ds} fwd {p:?}"
+                );
+                assert_eq!(
+                    wide.get_reverse_kmer_candidates(k),
+                    narrow.get_reverse_kmer_candidates(k),
+                    "ds={ds} rev {p:?}"
+                );
+            }
+            // 并发置零一致
+            wide.clear_kmer_concurrent(enc(b"ACGA"));
+            narrow.clear_kmer_concurrent(enc(b"ACGA"));
+            for p in [b"ACGA".as_ref(), b"TCGT".as_ref()] {
+                assert_eq!(wide.get_kmer_count(enc(p)), narrow.get_kmer_count(enc(p)), "ds={ds}");
+                assert_eq!(narrow.get_kmer_count(enc(p)), 0, "置零后");
+            }
+            assert_eq!(wide.size(), narrow.size()); // 未删键
+        }
+    }
+
+    /// 刀M8: 窄链 prune（NarrowCounter128 适配泛型 prune）与宽链
+    /// prune_some_kmers(KmerCounter) 的非零计数多重集一致。
+    #[test]
+    fn prune_narrow_parity_with_wide() {
+        use crate::counter_sync::NarrowCounter128;
+        use crate::irke::{prune_some_kmers, prune_some_kmers_narrow};
+        for ds in [false, true] {
+            let seqs: &[&[u8]] = &[
+                b"ACGTACGTAC", b"ACGTACGTAG", b"ACGTACGTAT", b"TTTTTTTTTT",
+                b"ACGTACGTCG", b"GGGGGGGGGG", b"ACGACGACGT",
+            ];
+            let mut kc = KmerCounter::new(5, ds);
+            let mut narrow_map: FxHashMap<u128, u32> = FxHashMap::default();
+            let canon = |k: KmerId| if ds { get_ds_kmer_val(k, 5) } else { k };
+            for (i, s) in seqs.iter().enumerate() {
+                for j in 0..=s.len() - 5 {
+                    let k = kmer_to_intval(&s[j..j + 5]).unwrap();
+                    kc.add_kmer(k, 1);
+                    let c = canon(k);
+                    *narrow_map.entry(c.lo).or_insert(0) += 1;
+                }
+                let _ = i;
+            }
+            let mut narrow = narrow_map;
+            let pruned_wide = prune_some_kmers(&mut kc, 2, 1.0, true, 0.005);
+            let pruned_narrow = prune_some_kmers_narrow(&mut narrow, 5, ds, 2, 1.0, true, 0.005);
+            assert_eq!(pruned_wide, pruned_narrow, "ds={ds}");
+            // 非零多重集一致（宽侧收集 / 窄侧收窄比较）
+            let mut w: Vec<(KmerId, u32)> = kc
+                .iter_nonzero()
+                .map(|(k, c)| (k, c))
+                .collect();
+            w.sort();
+            let mut n: Vec<(KmerId, u32)> = narrow
+                .iter()
+                .filter(|&(_, &c)| c > 0)
+                .map(|(&k, &c)| (KmerId { hi: 0, lo: k }, c))
+                .collect();
+            n.sort();
+            assert_eq!(w, n, "ds={ds}");
+        }
     }
 }

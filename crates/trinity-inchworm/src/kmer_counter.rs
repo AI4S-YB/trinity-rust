@@ -88,12 +88,38 @@ pub trait KmerCatalog {
     }
 }
 
+/// PARALLEL 贪心路径的目录约束: KmerCatalog + 并发安全惰性置零（内部
+/// 可变性; KC:420-436 语义——键存在才置 0, 不插入不删键。刀M8 引入,
+/// 供贪心核心泛型于宽/窄两种 Sync 目录）。
+pub trait ConcurrentClearCatalog: KmerCatalog {
+    fn clear_kmer_concurrent(&self, kmer: KmerId);
+}
+
+/// 独占上下文（prune_some_kmers）的惰性置零（刀M8: prune 泛型化约束）。
+pub trait ExclusiveClearCatalog: KmerCatalog {
+    fn clear_kmer_exclusive(&mut self, kmer: KmerId);
+
+    /// 全键快照（含 count=0 键——prune 的遍历域, KC:143 的 C++ map 迭代域
+    /// 镜像; 序 = 底层表迭代序, 与原版哈希序本就不同）。
+    fn snapshot_all_keys(&self) -> Vec<KmerId>;
+}
+
 /// 单线程 kmer 目录。PARALLEL 版见 counter_sync.rs（Task 6）。
 #[derive(Debug)]
 pub struct KmerCounter {
     kmer_length: usize,
     ds_mode: bool,
     counter: FxHashMap<KmerId, u32>,
+}
+
+impl ExclusiveClearCatalog for KmerCounter {
+    fn clear_kmer_exclusive(&mut self, kmer: KmerId) {
+        self.clear_kmer(kmer)
+    }
+
+    fn snapshot_all_keys(&self) -> Vec<KmerId> {
+        self.counter.keys().copied().collect()
+    }
 }
 
 impl KmerCounter {

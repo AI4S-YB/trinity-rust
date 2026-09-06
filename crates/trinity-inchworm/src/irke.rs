@@ -30,15 +30,17 @@ use std::path::Path;
 use std::time::Instant;
 
 use rayon::prelude::*;
-use rustc_hash::FxHashSet;
+use rustc_hash::{FxHashMap, FxHashSet};
 use trinity_common::error::CommonError;
 use trinity_common::fasta::{add_fasta_seq_line_breaks, FastaReader};
 use trinity_common::kmer::{compute_entropy, kmer_to_intval, revcomp_val, KmerId};
 use trinity_common::seq_hash::generate_hash;
 
-use crate::counter_sync::SyncKmerCounter;
+use crate::counter_sync::{NarrowCounter128, SyncKmerCounter, SyncKmerCounter128};
 use crate::glibc_rand::GlibcRand;
-use crate::kmer_counter::{KmerCatalog, KmerCounter};
+use crate::kmer_counter::{
+    ConcurrentClearCatalog, ExclusiveClearCatalog, KmerCatalog, KmerCounter,
+};
 use crate::visitor::KmerVisitor;
 
 /// C `atoi`（glibc 实现 = `(int)strtol(s, NULL, 10)`）语义，用于 dump header
@@ -161,13 +163,16 @@ pub fn write_kmer_count_report(path: &Path, kmer_count: usize) -> Result<(), Com
 /// 原版返回 bool(count_pruned > 0) 并打印 "Pruned N kmers from catalog."——
 /// 这里返回计数，monitor 日志由 CLI 层输出。
 ///
-/// 遍历域 = 全键含 0 值（C++ map 迭代域），序 = FxHashMap 迭代序（与原版哈希序
+/// 泛型于 [`ExclusiveClearCatalog`]（刀M8）: KmerCounter 宽表与
+/// NarrowCounter128 窄表适配器同一路径（k≤64 域内键数值恒等）。
+///
+/// 遍历域 = 全键含 0 值（C++ map 迭代域），序 = 表迭代序（与原版哈希序
 /// 不同）。min_count/entropy 段**即时置 0** 并 continue——会影响本趟后续 kmer 的
 /// 候选计数查询，该行为原样镜像；遍历序差异只在剪枝集合于遍历中途相交的极端
 /// 情况下使最终态偏离原版（两版哈希序本就不同，by-design）。错误 kmer 段的
 /// deletion_list 统一在遍历结束后置 0（幂等），镜像 KC:267-273。
-pub fn prune_some_kmers(
-    counter: &mut KmerCounter,
+pub fn prune_some_kmers<C: ExclusiveClearCatalog>(
+    counter: &mut C,
     min_count: u32,
     min_entropy: f32,
     prune_error_kmers: bool,
@@ -175,8 +180,8 @@ pub fn prune_some_kmers(
 ) -> usize {
     let k = counter.get_kmer_length();
     // 遍历域 = 全键含 0 值（C++ map 迭代域，KC:143）。剪枝只置值不增删键，
-    // 先快照键序等价于原版的活迭代；序为 FxHashMap 迭代序（≠原版哈希序）。
-    let keys: Vec<KmerId> = counter.iter_all().map(|(kmer, _)| kmer).collect();
+    // 先快照键序等价于原版的活迭代；序为表迭代序（≠原版哈希序）。
+    let keys: Vec<KmerId> = counter.snapshot_all_keys();
     let mut deletion_list: Vec<KmerId> = Vec::new();
     let mut count_pruned: usize = 0;
 
@@ -186,12 +191,12 @@ pub fn prune_some_kmers(
             continue; // KC:148-149
         }
         if count < min_count {
-            counter.clear_kmer(kmer); // KC:156 即时置 0（影响本趟后续候选查询）
+            counter.clear_kmer_exclusive(kmer); // KC:156 即时置 0（影响本趟后续候选查询）
             count_pruned += 1;
             continue;
         }
         if compute_entropy(kmer, k) < min_entropy {
-            counter.clear_kmer(kmer); // KC:164 即时置 0
+            counter.clear_kmer_exclusive(kmer); // KC:164 即时置 0
             count_pruned += 1;
             continue;
         }
@@ -230,10 +235,32 @@ pub fn prune_some_kmers(
 
     if count_pruned > 0 {
         for kmer in deletion_list {
-            counter.clear_kmer(kmer); // KC:267-273: 统一置 0（不缩表）
+            counter.clear_kmer_exclusive(kmer); // KC:267-273: 统一置 0（不缩表）
         }
     }
     count_pruned
+}
+
+/// u128 窄表的剪枝入口（刀M8 窄链）: 泛型 [`prune_some_kmers`] 经
+/// [`NarrowCounter128`] 适配器直作用窄表——k≤64 域内键数值与宽表恒等、
+/// canonical 折叠同式, 剪枝语义/结果与 KmerCounter 版一致。
+pub fn prune_some_kmers_narrow(
+    map: &mut FxHashMap<u128, u32>,
+    k: usize,
+    ds: bool,
+    min_count: u32,
+    min_entropy: f32,
+    prune_error_kmers: bool,
+    min_ratio_non_error: f32,
+) -> usize {
+    let mut catalog = NarrowCounter128::new(map, k, ds);
+    prune_some_kmers(
+        &mut catalog,
+        min_count,
+        min_entropy,
+        prune_error_kmers,
+        min_ratio_non_error,
+    )
 }
 
 /// 种子列表（KC:701-752 get_kmers_sort_descending_counts + IRKE.cpp:1332-1338）。
@@ -1002,6 +1029,100 @@ pub fn compute_sequence_assemblies_parallel<W: Write>(
         kmers.len()
     ); // IRKE.cpp:449
 
+    let kmer_length = sync.get_kmer_length();
+    // 组装级 min_connectivity 下传（覆盖 IrkeParams 同名字段——镜像原版数据流）
+    let effective = IrkeParams {
+        min_connectivity: aparams.min_connectivity,
+        ..*params
+    };
+    parallel_greedy_core(
+        &sync,
+        &kmers,
+        |kmer: KmerId| kmer,
+        &effective,
+        aparams,
+        two_phase,
+        monitor,
+        init_size,
+        num_threads,
+        kmer_length,
+        w,
+    )
+}
+
+/// PARALLEL 组装的 u128 窄链入口（刀M8, 2026-09-06 内存战役）: u128 计数表
+/// （trusted 注入 + 剪枝完成态）直入 [`SyncKmerCounter128`]——KmerId 宽 Fx
+/// 表（count 终点 widen, ~10.7GB）与宽 DashMap 重建（再 ~10.7GB）都不再
+/// 物化。日志序列/贪心语义与 [`compute_sequence_assemblies_parallel`] 恒等
+/// （目录查询同 canonical 折叠数值; 种子收集序 = DashMap 分片序）。
+pub fn compute_sequence_assemblies_parallel128<W: Write>(
+    counter_map: FxHashMap<u128, u32>,
+    kmer_length: usize,
+    ds_mode: bool,
+    params: &IrkeParams,
+    aparams: &AssemblyParams,
+    monitor: &Monitor,
+    two_phase: bool,
+    num_threads: Option<usize>,
+    w: &mut W,
+) -> Result<usize, CommonError> {
+    let sync = SyncKmerCounter128::from_narrow(counter_map, kmer_length, ds_mode);
+    let init_size = sync.size();
+
+    eprintln!("-populating the kmer seed candidate list."); // IRKE_run.cpp:521
+    eprintln!("Kcounter hash size: {init_size}"); // KC:716
+    let kmers = sync.nonzero_keys(); // KC:719-728
+    eprintln!(
+        "Processed {} non-zero abundance kmers in kcounter.",
+        kmers.len()
+    ); // KC:729
+    eprintln!("-Not sorting list of kmers, given parallel mode in effect."); // KC:732-737
+    eprintln!(
+        "Total kcounter hash size: {init_size} vs. sorted list size: {}",
+        kmers.len()
+    ); // IRKE.cpp:449
+
+    let effective = IrkeParams {
+        min_connectivity: aparams.min_connectivity,
+        ..*params
+    };
+    parallel_greedy_core(
+        &sync,
+        &kmers,
+        |kmer: u128| KmerId { hi: 0, lo: kmer },
+        &effective,
+        aparams,
+        two_phase,
+        monitor,
+        init_size,
+        num_threads,
+        kmer_length,
+        w,
+    )
+}
+
+/// PARALLEL 贪心公共核心（刀M8 拆出; 宽/窄两种 Sync 目录共用）: 池构建 +
+/// chunk 并行主循环 + 去重输出。种子逐条经 `widen` 送入 [`parallel_assemble_seed`]
+/// ——窄链种子保持 u128（QM4 ~2 亿 × 16B vs KmerId 32B）, 免物化宽种子表。
+#[allow(clippy::too_many_arguments)]
+fn parallel_greedy_core<S, C, W>(
+    sync: &C,
+    kmers: &[S],
+    widen: impl Fn(S) -> KmerId + Sync,
+    effective: &IrkeParams,
+    aparams: &AssemblyParams,
+    two_phase: bool,
+    monitor: &Monitor,
+    init_size: usize,
+    num_threads: Option<usize>,
+    kmer_length: usize,
+    w: &mut W,
+) -> Result<usize, CommonError>
+where
+    S: Copy + Send + Sync,
+    C: ConcurrentClearCatalog + Sync,
+    W: Write,
+{
     // IRKE.cpp:464-465: omp_set_num_threads(NUM_THREADS) → 自建 rayon 池
     let mut builder = rayon::ThreadPoolBuilder::new();
     if let Some(n) = num_threads {
@@ -1011,12 +1132,6 @@ pub fn compute_sequence_assemblies_parallel<W: Write>(
         .build()
         .map_err(|e| CommonError::Inchworm(format!("rayon thread pool build failed: {e}")))?;
     eprintln!("num threads set to: {}", pool.current_num_threads()); // IRKE.cpp:471-472（omp_get_max_threads）
-    let kmer_length = sync.get_kmer_length();
-    // 组装级 min_connectivity 下传（覆盖 IrkeParams 同名字段——镜像原版数据流）
-    let effective = IrkeParams {
-        min_connectivity: aparams.min_connectivity,
-        ..*params
-    };
 
     // ---- IRKE.cpp:504-620: chunk 并行主循环 ----
     // par_chunks 为带索引的并行迭代器 → collect 保序（全局种子序）；任一 chunk
@@ -1030,7 +1145,14 @@ pub fn compute_sequence_assemblies_parallel<W: Write>(
                 let mut buf: Vec<Option<IwormRecord>> = Vec::with_capacity(chunk.len());
                 for &kmer in chunk {
                     buf.push(parallel_assemble_seed(
-                        kmer, &sync, &effective, aparams, two_phase, monitor, init_size, &mut rng,
+                        widen(kmer),
+                        sync,
+                        effective,
+                        aparams,
+                        two_phase,
+                        monitor,
+                        init_size,
+                        &mut rng,
                     )?);
                 }
                 Ok(buf)
@@ -1073,9 +1195,9 @@ pub fn compute_sequence_assemblies_parallel<W: Write>(
 // 循环体依赖的 8 个量各自独立（目录/参数/开关/护栏/随机源），打包成上下文
 // 结构反而遮蔽与原版循环变量的对应——沿用 inchworm_step 的直译豁免
 #[allow(clippy::too_many_arguments)]
-fn parallel_assemble_seed(
+fn parallel_assemble_seed<C: ConcurrentClearCatalog + Sync>(
     kmer: KmerId,
-    sync: &SyncKmerCounter,
+    sync: &C,
     p: &IrkeParams,
     aparams: &AssemblyParams,
     two_phase: bool,
@@ -1142,7 +1264,7 @@ fn parallel_assemble_seed(
     // IRKE.cpp:597-618: 无论是否记录都清零路径 kmer（dashmap 原子置 0——弱一致，
     // 并发读者可能仍见非零，镜像原版无锁竞态）
     for path_kmer in &joined_path {
-        sync.clear_kmer(*path_kmer);
+        sync.clear_kmer_concurrent(*path_kmer);
     }
 
     Ok(record)

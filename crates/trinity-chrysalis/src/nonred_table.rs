@@ -75,6 +75,72 @@ impl NonRedKmerTable {
         }
     }
 
+    /// 平铺候选竞技场形态（刀M10, 2026-09-06 内存战役）: 候选 = 各竞技场的
+    /// `(off, len)` 跨度, 窗口偏移**直接指向竞技场**——phase1 的亿级短候选
+    /// （QM4 ~27B/条）免逐候选 Vec 分配（实测 Vec<Vec<u8>> 形态 11.7GB →
+    /// 竞技场 ~4.5GB）, 且免 set_up_templates 的内部窗口二次平铺（同窗
+    /// ~7.5GB）。排序/去重/产物与 Vec<Vec<u8>> 版恒等（同一窗口多重集、
+    /// 字节序排序、data 逐字节一致——表是内容寻址集合, 序仅经由排序键）。
+    /// 域: 单竞技场 < 4GB（窗口偏移 u32; QM4 2.8GB——超域断言报错）。
+    pub fn set_up_templates_flat(
+        arenas: &[(Vec<u8>, Vec<(usize, u32)>)],
+        k: usize,
+        no_ns: bool,
+    ) -> Self {
+        // 窗口描述符 = (竞技场下标 << 32) | 窗口偏移
+        fn window_of<'a>(
+            arenas: &'a [(Vec<u8>, Vec<(usize, u32)>)],
+            d: u64,
+            k: usize,
+        ) -> &'a [u8] {
+            let arena = &arenas[(d >> 32) as usize].0;
+            let off = (d & 0xFFFF_FFFF) as usize;
+            &arena[off..off + k]
+        }
+        let mut wdesc: Vec<u64> = Vec::new();
+        for (ai, (flat, spans)) in arenas.iter().enumerate() {
+            assert!(
+                flat.len() <= u32::MAX as usize,
+                "weldmer 竞技场 {} 字节超过 4GB——flat 变体域外",
+                flat.len()
+            );
+            for &(off, len) in spans {
+                let len = len as usize;
+                if len < k {
+                    continue; // 同 set_up_templates 的下溢护栏
+                }
+                for j in 0..=len - k {
+                    if no_ns
+                        && flat[off + j..off + j + k]
+                            .iter()
+                            .any(|&c| !matches!(c, b'A' | b'C' | b'G' | b'T'))
+                    {
+                        continue;
+                    }
+                    wdesc.push(((ai as u64) << 32) | ((off + j) as u64));
+                }
+            }
+        }
+        wdesc.sort_unstable_by(|&a, &b| window_of(arenas, a, k).cmp(window_of(arenas, b, k)));
+        let mut data: Vec<Vec<u8>> = Vec::with_capacity(wdesc.len());
+        let mut prev: Option<&[u8]> = None;
+        for &d in &wdesc {
+            let w = window_of(arenas, d, k);
+            if Some(w) == prev {
+                continue;
+            }
+            data.push(w.to_vec());
+            prev = Some(w);
+        }
+        let counts = vec![0i32; data.len()];
+        NonRedKmerTable {
+            k,
+            data,
+            counts,
+            hash_idx: std::sync::OnceLock::new(),
+        }
+    }
+
     /// 懒建 2bit 哈希索引（纯 GATC kmer; 含非 GATC 者不进索引, 由 `index`
     /// 字节二分兜底）。
     fn hash_index(&self) -> &FxHashMap<KmerId, u32> {
@@ -89,6 +155,12 @@ impl NonRedKmerTable {
 
     pub fn k(&self) -> usize {
         self.k
+    }
+
+    /// 测试访问: 模板序列有序表（flat 形态等价锁用）。
+    #[cfg(test)]
+    fn data_ref(&self) -> &[Vec<u8>] {
+        &self.data
     }
 
     /// 表内 k-mer 数。
@@ -246,6 +318,37 @@ impl NonRedKmerTable {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 刀M10: flat 竞技场形态与 Vec<Vec<u8>> 形态的模板表逐条一致
+    /// （同窗口多重集 → 同排序去重产物; 含短于 k 的跳过路径）。
+    #[test]
+    fn set_up_templates_flat_matches_vec_form() {
+        let templ: Vec<Vec<u8>> = vec![
+            b"ACGTTGCA".to_vec(),
+            b"ACGTTGC".to_vec(),
+            b"TTTTGGGGCC".to_vec(),
+            b"A".to_vec(),
+        ];
+        let arenas: Vec<(Vec<u8>, Vec<(usize, u32)>)> = templ
+            .iter()
+            .map(|v| {
+                let mut flat = Vec::new();
+                let mut spans = Vec::new();
+                if v.len() >= 4 {
+                    spans.push((0usize, v.len() as u32));
+                    flat.extend_from_slice(v);
+                }
+                (flat, spans)
+            })
+            .collect();
+        let a = NonRedKmerTable::set_up_templates(&templ, 4, false);
+        let b = NonRedKmerTable::set_up_templates_flat(&arenas, 4, false);
+        assert_eq!(a.len(), b.len());
+        assert_eq!(a.k(), b.k());
+        for (x, y) in a.data_ref().iter().zip(b.data_ref().iter()) {
+            assert_eq!(x, y);
+        }
+    }
 
     /// setUp：两模板窗口并集 → 字典序排序去重；counts 清零。
     /// ACGTTGCA → {ACGT,CGTT,GTTG,TTGC,TGCA}；ACGTTGC → {ACGT,CGTT,GTTG,TTGC}
