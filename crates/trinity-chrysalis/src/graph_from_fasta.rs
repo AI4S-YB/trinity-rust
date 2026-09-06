@@ -19,7 +19,6 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use rayon::prelude::*;
-use rustc_hash::FxHashMap;
 
 use crate::dna_vector::{is_simple, read_fasta, revcomp, simple_halves_with, DnaSeq};
 use crate::kmer_align::KmerAlignCore;
