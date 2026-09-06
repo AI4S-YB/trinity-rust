@@ -10,11 +10,14 @@ pub mod context;
 pub mod dfs;
 pub mod graph;
 pub mod graph_io;
+pub mod gtdecode;
+pub mod gtmodel;
 pub mod pair_paths;
 pub mod paths;
 pub mod pog;
 pub mod postprocess;
 pub mod prune;
+pub mod rnaspades;
 pub mod threading;
 
 pub use component::{run_component, ComponentParams, ComponentResult};
@@ -25,6 +28,11 @@ pub use graph_io::{
     build_new_graph_use_kmers, parse_graph_reads, pre_process_graph_file, write_dot_file,
     write_dot_string, BuildResult, RawRead, ReadParseError,
 };
+pub use gtdecode::{
+    build_gt_features, decode_component, pack_uv, parse_component_graph, run_component_gtasm,
+    EdgeSupport, GtGraph, GtasmParams, PairSupport, GTASM_DEFAULT_SEED, NB_STARTS,
+};
+pub use gtmodel::{GtModel, GT_HEADS};
 pub use pair_paths::{
     get_suff_stats_w_pairs, individual_paths_are_compatible, trim_sink_nodes, PairPath, SuffStats,
 };
@@ -49,6 +57,7 @@ pub use postprocess::{
     reduce_cdhit_like, run_em_reduce, run_path_expression_em, two_paths_are_too_similar,
     ContainedReads, PostProcessParams,
 };
+pub use rnaspades::{grow_paths, run_component_rnaspades, run_component_rnaspades_with, RnaSpadesParams};
 pub use prune::{
     calc_sub_components_stats, compact_linear_paths, fix_extremely_high_single_edges,
     remove_light_edges, remove_light_flow_edges, remove_light_in_edges, remove_light_out_edges,
@@ -64,6 +73,8 @@ pub use threading::{
 pub enum BflyError {
     #[error("graph 文件格式错误: {0}")]
     GraphFileFormat(String),
+    #[error("GT 权重错误: {0}")]
+    GtWeights(String),
 }
 
 pub type Result<T> = std::result::Result<T, BflyError>;

@@ -298,6 +298,8 @@ pub fn graph_from_fasta_files(
     let text = std::fs::read_to_string(reads_fasta)?;
     // DNAStringStreamFast 语义：首 header 前丢弃、空记录截断（dna_vector 模块）
     let reads = crate::dna_vector::stream_fasta_records(&text);
+    // reads 物化后原文不再被读——立即释放（QM4 3.9GB, 2026-09-05 内存战役）
+    drop(text);
     graph_from_fasta(&iworm, &reads, p)
 }
 
@@ -324,13 +326,28 @@ pub fn graph_from_fasta(
     let core = KmerAlignCore::build(iworm_seqs);
     let n = iworm_seqs.len();
     if std::env::var_os("GFF_PROFILE").is_some() {
-        eprintln!("[gff] build_core: {:?}", __t.elapsed());
+        eprintln!("[gff] build_core: {:?}, {}", __t.elapsed(), mem_dbg());
     }
+
+    // 共享 revcomp 表: 一次性物化全部 contig 的 revcomp（序列量级, QM4
+    // ~174MB）——取代原每任务独立 rc_cache（随机命中下各任务趋向缓存到
+    // 近全量, 32 任务最坏叠加数 GB; revcomp 是纯函数, 共享表与逐任务缓存
+    // 语义恒等, 2026-09-05 内存战役）。SS（strand）模式 RC 分支整体不走,
+    // 不物化。
+    let rc_seqs: Vec<Vec<u8>> = if p.strand {
+        Vec::new()
+    } else {
+        iworm_seqs.iter().map(|d| revcomp(&d.seq)).collect()
+    };
 
     // ---- Phase 1（:1304-1403）：收集候选 weldmers ----
     // 原版 omp critical push_back——本版 per-contig 局部收集 + 按索引序合并
     // （表构造前会排序去重，顺序只影响日志；仍取确定性）。
-    let crossover: Vec<Vec<u8>> = if p.no_welds {
+    // 刀M10（2026-09-06 内存战役）: 候选改平铺竞技场（flat + (off,len) 跨度）
+    // ——亿级短候选（QM4 ~27B/条）免逐候选 Vec 分配（实测 Vec<Vec<u8>> 形态
+    // 11.7GB → 竞技场 ~4.5GB）; set_up_templates_flat 的窗口偏移直接指向
+    // 竞技场, 免内部窗口二次平铺。候选多重集与 Vec 形态恒等。
+    let crossover_arenas: Vec<(Vec<u8>, Vec<(usize, u32)>)> = if p.no_welds {
         Vec::new()
     } else {
         // 显式 `-t` 池（原版 -t1 时也不该吃满全局核）。
@@ -338,12 +355,13 @@ pub fn graph_from_fasta(
             .num_threads(p.threads.max(1))
             .build()
             .map_err(|e| CommonError::Parse(format!("cannot build GFF thread pool: {e}")))?;
-        let per_contig: Vec<Vec<Vec<u8>>> = pool.install(|| {
+        pool.install(|| {
             (0..n)
                 .into_par_iter()
                 .map(|i| {
                     let d = &iworm_seqs[i].seq;
-                    let mut local: Vec<Vec<u8>> = Vec::new();
+                    let mut flat: Vec<u8> = Vec::new();
+                    let mut spans: Vec<(usize, u32)> = Vec::new();
                     if d.len() >= k {
                         for j in 0..=d.len() - k {
                             let sub = &d[j..j + k];
@@ -364,49 +382,67 @@ pub fn graph_from_fasta(
                                         continue;
                                     }
                                     // RC 命中：坐标换算到 revcomp(dna[c]) 系
-                                    // （:1370-1374；FW 直接用 hit pos）
-                                    let (dd, start): (Vec<u8>, i64) = if rc {
-                                        let dd = revcomp(&iworm_seqs[c].seq);
+                                    // （:1370-1374；FW 直接用 hit pos）。
+                                    // 借用共享 rc_seqs / 原序列（原逐命中
+                                    // clone/revcomp 物化是分配器 churn 大户）
+                                    let (dd, start): (&[u8], i64) = if rc {
+                                        let dd = &rc_seqs[c];
                                         let start = dd.len() as i64 - m.pos as i64 - k as i64;
-                                        (dd, start)
+                                        (dd.as_slice(), start)
                                     } else {
-                                        (iworm_seqs[c].seq.clone(), m.pos as i64)
+                                        (iworm_seqs[c].seq.as_slice(), m.pos as i64)
                                     };
                                     // 双向各试一次（:1358-1365）
                                     for (a, one, b, two) in [
-                                        (d.as_slice(), j as i64, dd.as_slice(), start),
-                                        (dd.as_slice(), start, d.as_slice(), j as i64),
+                                        (d.as_slice(), j as i64, dd, start),
+                                        (dd, start, d.as_slice(), j as i64),
                                     ] {
                                         let add = weldable_kmer(a, one, b, two, k, kk);
                                         if !add.is_empty()
                                             && !is_simple(&add)
                                             && !simple_halves_with(&add, p.disable_repeat_check)
                                         {
-                                            local.push(add);
+                                            spans.push((flat.len(), add.len() as u32));
+                                            flat.extend_from_slice(&add);
                                         }
                                     }
                                 }
                             }
                         }
                     }
-                    local
+                    (flat, spans)
                 })
                 .collect()
-        });
-        per_contig.into_iter().flatten().collect()
+        })
     };
 
     // ---- weldmer 计数（:1412-1427）----
     if std::env::var_os("GFF_PROFILE").is_some() {
-        eprintln!("[gff] phase1_crossover: {:?}", __t.elapsed());
+        eprintln!(
+            "[gff] phase1_crossover: {:?}, {} 条候选, {}",
+            __t.elapsed(),
+            crossover_arenas
+                .iter()
+                .map(|(_, s)| s.len())
+                .sum::<usize>(),
+            mem_dbg()
+        );
     }
-    let table = NonRedKmerTable::set_up_templates(&crossover, kk, false);
+    let table = NonRedKmerTable::set_up_templates_flat(&crossover_arenas, kk, false);
+    // 候选竞技场仅用于构造模板表——立即释放（刀M3 起语义; 竞技场形态
+    // QM4 ~4.5GB）
+    drop(crossover_arenas);
     if std::env::var_os("GFF_PROFILE").is_some() {
-        eprintln!("[gff] weldmer_templates: {:?}", __t.elapsed());
+        eprintln!(
+            "[gff] weldmer_templates: {:?}, {} 模板, {}",
+            __t.elapsed(),
+            table.len(),
+            mem_dbg()
+        );
     }
     let table = table.with_read_counts(reads);
     if std::env::var_os("GFF_PROFILE").is_some() {
-        eprintln!("[gff] weldmer_read_counts: {:?}", __t.elapsed());
+        eprintln!("[gff] weldmer_read_counts: {:?}, {}", __t.elapsed(), mem_dbg());
     }
 
     // ---- Phase 2（:1435-1754）：并行收集 + 串行有序应用 ----
@@ -443,9 +479,6 @@ pub fn graph_from_fasta(
                 return evs; // :1460-1467
             }
             let cov_i = coverage(&iworm_seqs[i].name);
-            // 线程局部 revcomp 缓存, 按命中 contig c 索引（每个 RC 命中的
-            // contig 至多物化一次; 与串行版 Vec<Option> 语义一致）
-            let mut rc_cache: FxHashMap<usize, Vec<u8>> = FxHashMap::default();
             for j in 0..=d.len() - k {
                 let sub = &d[j..j + k];
                 let matches_fw = core.get_matches(sub);
@@ -477,9 +510,8 @@ pub fn graph_from_fasta(
                         }
 
                         let (dd, start): (&[u8], i64) = if rc {
-                            let dd = rc_cache
-                                .entry(c)
-                                .or_insert_with(|| revcomp(&iworm_seqs[c].seq));
+                            // 共享 rc_seqs（rc_cache 的等价替换, 见其定义注记）
+                            let dd = &rc_seqs[c];
                             let start = dd.len() as i64 - m.pos as i64 - k as i64;
                             (dd.as_slice(), start)
                         } else {
@@ -546,7 +578,12 @@ pub fn graph_from_fasta(
         })
         .collect();
     if std::env::var_os("GFF_PROFILE").is_some() {
-        eprintln!("[gff] phase2_collect: {:?}", __t.elapsed());
+        eprintln!(
+            "[gff] phase2_collect: {:?}, events {} 条, {}",
+            __t.elapsed(),
+            events.iter().map(|e| e.len()).sum::<usize>(),
+            mem_dbg()
+        );
     }
 
     // 串行应用（严格按收集序 = 原迭代序）
@@ -569,15 +606,25 @@ pub fn graph_from_fasta(
         }
     }
     if std::env::var_os("GFF_PROFILE").is_some() {
-        eprintln!("[gff] phase2_apply: {:?}", __t.elapsed());
+        eprintln!("[gff] phase2_apply: {:?}, {}", __t.elapsed(), mem_dbg());
     }
 
     // ---- report（:672-747）----
     let out = report_iworm_graph(&pools, &toasted, &iworm_lengths, &weld_support);
     if std::env::var_os("GFF_PROFILE").is_some() {
-        eprintln!("[gff] report+total: {:?}", __t.elapsed());
+        eprintln!("[gff] report+total: {:?}, {}", __t.elapsed(), mem_dbg());
     }
     Ok(out)
+}
+
+/// GFF_PROFILE 行尾的进程内存快照（VmRSS/VmHWM, MB）。
+fn mem_dbg() -> String {
+    let rd = |f: &str| {
+        trinity_common::timer::vm_field_kb(f)
+            .map(|kb| format!("{}", kb / 1024))
+            .unwrap_or_else(|| "x".into())
+    };
+    format!("rss {}MB/hwm {}MB", rd("VmRSS:"), rd("VmHWM:"))
 }
 
 /// `add_iworm_link`（:998-1014）+ `add_reciprocal_iworm_link`（:1036-1058）：

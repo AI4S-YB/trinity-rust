@@ -17,14 +17,15 @@ use std::path::{Path, PathBuf};
 use trinity_chrysalis::pipeline::{run_chrysalis_pipeline, ChrysalisParams};
 use trinity_common::error::CommonError;
 use trinity_inchworm::irke::{
-    compute_sequence_assemblies_parallel, prune_some_kmers, write_kmer_count_report,
-    AssemblyParams, IrkeParams, Monitor,
+    compute_sequence_assemblies_parallel, compute_sequence_assemblies_parallel128,
+    prune_some_kmers, prune_some_kmers_narrow, write_kmer_count_report, AssemblyParams, IrkeParams,
+    Monitor,
 };
-use trinity_kmer::counter::{estimate_hash_size, KmerCountTable};
+use trinity_kmer::counter::estimate_hash_size;
 use trinity_kmer::diginorm::{self, DigiNormParams, ReadsInput};
 
-use crate::args::{MultiK, SeqType, TrinityArgs};
-use crate::butterfly_pool::{run_butterfly_pool, ButterflyPoolParams};
+use crate::args::{MultiK, PathEngine, SeqType, TrinityArgs};
+use crate::butterfly_pool::{run_butterfly_pool, ButterflyPoolParams, GtasmShared};
 use crate::checkpoint::{checkpoint_exists, run_with_checkpoint};
 use crate::harvest::harvest;
 use crate::prep::prep_reads;
@@ -37,9 +38,9 @@ const SR_FLAG: &str = "asm";
 // --max_memory 护栏（P1 审查 I2）
 // ---------------------------------------------------------------------------
 
-/// k-mer 哈希单条目的保守字节下限（u128 key + u32 count + 槽位开销;
-/// KmerId u64→u128 扩容（2026-08-30）后由 18 调整为 26）。
-pub const KMER_ENTRY_BYTES: u64 = 26;
+/// k-mer 哈希单条目的保守字节下限（U256 key + u32 count + 槽位开销;
+/// KmerId u64→u128→U256 扩容沿革: 18 → 26 → 42）。
+pub const KMER_ENTRY_BYTES: u64 = 42;
 
 /// 归一化 / k-mer 计数阶段的**硬护栏**估算（保守代理公式）:
 /// 输入文件需整读进内存（`input_bytes`），计数哈希按"文件量级 distinct
@@ -273,6 +274,16 @@ pub fn run_trinity(args: &TrinityArgs) -> Result<PathBuf, CommonError> {
     let ss = args.ss_lib_type.as_deref();
     let ds = ss.is_none();
     let mut a = args.clone();
+    // stitch 的 reads 快照（v1）: 归一化会稀释断点横跨 read（max_cov cap）,
+    // 缝合 pass 扫**原始** reads; no_normalize 时两者相同。
+    let stitch_reads: Vec<std::path::PathBuf> = args
+        .left
+        .iter()
+        .chain(&args.right)
+        .chain(&args.single)
+        .cloned()
+        .collect();
+    let stitch_seq_type = args.seq_type;
 
     // rayon 全局池按 --CPU 设一次（局部需不同线程数的入口——inchworm/
     // chrysalis GFF/RTT/quantify/butterfly 池——各自显式 scoped pool 覆盖;
@@ -284,10 +295,18 @@ pub fn run_trinity(args: &TrinityArgs) -> Result<PathBuf, CommonError> {
     // ---- multi-k 轮次解析（rnaSPAdes 式多 k 迭代 + trusted contig 注入,
     // 机制调研见 docs/opt-log.md「rnaSPAdes 构图机制调研」）:
     // None → 单 k classic（k = --KMER_SIZE; --no-multi-k / 单独 --KMER_SIZE /
-    // recursive 特例回退, 见 args::resolve_multi_k）;
+    // gtasm·recursive 特例回退, 见 args::resolve_multi_k）;
     // auto → 读长抽样 + rna_k_values 公式 + 支持域钳制（multik.rs）。
     // 启动即打印生效 k 序列（"multi-k: auto → [..]" / "single-k: N"）,
-    // 让用户一眼确认模式。k = 最后一轮的 k（单 k 时即唯一轮）。----
+    // 让用户一眼确认模式。k = 最后一轮的 k（单 k 时即唯一轮）。
+    // 读长抽样只做一次: multi-k auto 公式与 weld-min-glue auto（mg1 分界）
+    // 共用（multik::detect_read_length, 每文件前 1000 条）。----
+    let need_rl = matches!(args.multi_k, Some(MultiK::Auto)) || args.weld_min_glue == 0;
+    let detected_rl = if need_rl {
+        Some(crate::multik::detect_read_length(args)?)
+    } else {
+        None
+    };
     let k_list: Vec<usize> = match &args.multi_k {
         None => {
             eprintln!("single-k: {}", args.kmer_size);
@@ -298,17 +317,46 @@ pub fn run_trinity(args: &TrinityArgs) -> Result<PathBuf, CommonError> {
             ks.clone()
         }
         Some(MultiK::Auto) => {
-            let rl = crate::multik::detect_read_length(args)?;
+            let rl = detected_rl
+                .expect("need_rl 守卫: multi-k auto 必已抽样读长");
             let raw = crate::multik::rna_k_values(rl);
-            let ks = crate::multik::clamp_k_list(raw.clone());
+            let ks = crate::multik::clamp_auto_k_list(raw.clone());
             eprintln!(
-                "multi-k: auto → {ks:?}（读长 RL={rl}, 各文件前 1000 条抽样取 max 跨文件取 min; rnaSPAdes 公式 {raw:?} 经支持域钳制）"
+                "multi-k: auto → {ks:?}（读长 RL={rl}, 各文件前 1000 条抽样取 max 跨文件取 min; rnaSPAdes 公式 {raw:?} 经实测钳制 AUTO_K_CAP={} + 支持域）",
+                crate::multik::AUTO_K_CAP
             );
             ks
         }
     };
     // 恒非空: None→[kmer_size]; List 解析校验非空; auto 公式恒非空。
     let k = *k_list.last().unwrap();
+
+    // ---- 2026-09-04 转正: 两个 QM4(150bp) 验证项默认生效 ----
+    // rtt-multi-kmer 默认开（dev1/dev3 零回退 + QM4 R+0.3/召回+99）,
+    // --no-rtt-multi-kmer 回退; weld-min-glue 默认 auto（RL≥150 → 1/mg1,
+    // 短读 → 2/原版）, 显式值覆盖。启动打印让用户确认生效值。----
+    let weld_min_glue = crate::multik::resolve_weld_min_glue(args, detected_rl)?;
+    eprintln!(
+        "rtt-multi-kmer: {}（默认开, --no-rtt-multi-kmer 回退）; weld-min-glue: {}（{}）",
+        if args.rtt_multi_kmer { "on" } else { "off" },
+        weld_min_glue,
+        if args.weld_min_glue != 0 {
+            format!("显式 --weld-min-glue {}", args.weld_min_glue)
+        } else {
+            format!(
+                "auto: 读长 RL={} {} → {}",
+                detected_rl
+                    .map(|rl| rl.to_string())
+                    .unwrap_or_else(|| "未抽样".into()),
+                if detected_rl.is_some_and(|rl| rl >= crate::multik::WELD_MG1_READ_LEN_MIN) {
+                    "≥150"
+                } else {
+                    "<150"
+                },
+                if weld_min_glue == 1 { "mg1" } else { "原版 2" }
+            )
+        },
+    );
 
     // ---- 1. 归一化（L1441-1453; checkpoint insilico_read_normalization/normalization.ok）----
     // fa_direct（fq 输入直出归一化 fa）时: 下游按 fa 消费, 且 SS revcomp 已在
@@ -493,6 +541,13 @@ pub fn run_trinity(args: &TrinityArgs) -> Result<PathBuf, CommonError> {
                         min_contig_length: args.min_contig_length,
                         max_reads: args.max_reads_per_graph,
                         threads: args.cpu.max(1),
+                        graph_clean_rnaspades: args.graph_clean_rnaspades,
+                        rtt_multi_kmer: args.rtt_multi_kmer,
+                        weld_glue_factor: args.weld_glue_factor,
+                        weld_min_glue,
+                        cluster_max_size: args.cluster_max_size,
+                        weld_reads_path: None,
+                        gap_close_spades: args.gap_close_spades,
                         ..Default::default()
                     },
                 )?;
@@ -515,6 +570,96 @@ pub fn run_trinity(args: &TrinityArgs) -> Result<PathBuf, CommonError> {
         ));
     }
 
+    // ---- 5.5 gtasm 边支持 pass（仅 --path-engine gtasm; 读 Component_bins
+    // 建 k2v, 扫**原始** reads（归一化前）, 产物 gtasm_edge_support.bin;
+    // checkpoint .gtasm_support.ok 保护, 重跑直接加载不重扫）----
+    let gtasm_shared: Option<std::sync::Arc<GtasmShared>> = if args.path_engine
+        == PathEngine::Gtasm
+    {
+        let weights = args.gt_weights.as_ref().ok_or_else(|| {
+            CommonError::Parse("--path-engine gtasm 需要 --gt-weights".to_string())
+        })?;
+        // 模型先加载（廉价）——坏权重在昂贵的 reads 扫描之前报错
+        let model = trinity_butterfly::GtModel::load(weights)
+            .map_err(|e| CommonError::Parse(format!("GT 权重加载失败: {e}")))?;
+        eprintln!(
+            "-gtasm: 模型 {} 加载完成（hidden={}, {} 层）",
+            weights.display(),
+            model.hidden,
+            model.n_layers()
+        );
+        let sup_bin = round_dir.join("gtasm_edge_support.bin");
+        let sup_ok = round_dir.join(".gtasm_support.ok");
+        trinity_common::timer::timed(&round_dir, "gtasm_support", || {
+            run_with_checkpoint(&sup_ok, "GTasm edge support (raw reads)", || {
+                let raw_reads: Vec<PathBuf> = if paired {
+                    args.left.iter().chain(args.right.iter()).cloned().collect()
+                } else {
+                    args.single.clone()
+                };
+                let st = crate::gt_support::run_support_pass(
+                    &listing,
+                    &raw_reads,
+                    args.seq_type,
+                    &sup_bin,
+                )?;
+                eprintln!(
+                    "-gtasm support: reads {}, 有支持转移 {}, 有支持边 {}",
+                    st.reads, st.pairs, st.edges_with_support
+                );
+                Ok(())
+            })
+        })?;
+        let support = trinity_butterfly::EdgeSupport::load(&sup_bin)?;
+        // ---- 5.6 gtasm read pair 分支支持 pass（仅 --gtasm-pair-support;
+        // R1/R2 同序 lockstep 配对, 产物 gtasm_pair_support.bin（GTP1
+        // sidecar）; checkpoint .gtasm_pair_support.ok 保护）----
+        let pair_support = if args.gtasm_pair_support {
+            if paired {
+                let pair_bin = round_dir.join("gtasm_pair_support.bin");
+                let pair_ok = round_dir.join(".gtasm_pair_support.ok");
+                trinity_common::timer::timed(&round_dir, "gtasm_pair_support", || {
+                    run_with_checkpoint(&pair_ok, "GTasm pair support (raw reads)", || {
+                        let st = crate::gt_support::run_pair_support_pass(
+                            &listing,
+                            &args.left,
+                            &args.right,
+                            args.seq_type,
+                            &pair_bin,
+                        )?;
+                        eprintln!(
+                            "-gtasm pair support: pairs {}, 跨分支证据 {}, 有支持分支出边 {}{}",
+                            st.pairs,
+                            st.branch_hits,
+                            st.edges_with_support,
+                            if st.name_mismatches > 0 {
+                                format!("（WARNING: {} 对 read 名不匹配, 文件可能错序）", st.name_mismatches)
+                            } else {
+                                String::new()
+                            }
+                        );
+                        Ok(())
+                    })
+                })?;
+                trinity_butterfly::PairSupport::load(&pair_bin)?
+            } else {
+                eprintln!(
+                    "WARNING: --gtasm-pair-support 需要双端 reads（--left/--right）, 单端输入下跳过"
+                );
+                trinity_butterfly::PairSupport::new()
+            }
+        } else {
+            trinity_butterfly::PairSupport::new()
+        };
+        Some(std::sync::Arc::new(GtasmShared {
+            model,
+            support,
+            pair_support,
+        }))
+    } else {
+        None
+    };
+
     // ---- 6. butterfly 组件池（checkpoint .butterfly.ok; L1934-1936）----
     warn_memory(args.max_memory, file_len(&iworm_fa), "Butterfly");
     trinity_common::timer::timed(&round_dir, "butterfly", || {
@@ -530,6 +675,14 @@ pub fn run_trinity(args: &TrinityArgs) -> Result<PathBuf, CommonError> {
                         min_contig_length: args.min_contig_length,
                         group_pairs_distance: args.group_pairs_distance,
                         stack_size_mb: args.bfly_stack_mb,
+                        path_engine: args.path_engine,
+                        gtasm: gtasm_shared.clone(),
+                        gtasm_visited_walk: args.gtasm_visited_walk,
+                        gtasm_bulge_dual: args.gtasm_bulge_dual,
+                        gtasm_pair_support: args.gtasm_pair_support,
+                        no_path_merging: args.bfly_no_path_merging,
+                        min_read_support: 2,
+                        empty_retry: args.bfly_empty_retry,
                     },
                 )
             },
@@ -537,14 +690,115 @@ pub fn run_trinity(args: &TrinityArgs) -> Result<PathBuf, CommonError> {
     })?;
 
     // ---- 7. 汇总（无 checkpoint; 每次重写 Trinity.tmp.fasta, L1916/L1943）----
+    // --gtasm-frag-merge（仅 gtasm 引擎 + 双端）: harvest 前加组件内碎片
+    // pair-guided 合并 pass（contig 末端 × 末端的 mate 链接 ≥2 → OLC/N 保守
+    // 拼接, 机制见 frag_merge 模块文档）; 扫描的是**原始** reads（args.left/
+    // args.right, 与 gtasm 支持 pass 同源——归一化后深度被稀释）。统计行落
+    // .stage_timings（第二列非数值 → bench 的 Top-stages 解析自动跳过）。
     let trinity_tmp = round_dir.join("Trinity.tmp.fasta");
-    let n_transcripts = trinity_common::timer::timed(&round_dir, "harvest", || {
-        harvest(&listing, args.min_contig_length, &trinity_tmp)
-    })?;
+    let frag_merge_on = args.gtasm_frag_merge && args.path_engine == PathEngine::Gtasm;
+    let n_transcripts = if frag_merge_on && paired {
+        let outcome = trinity_common::timer::timed(&round_dir, "gtasm_frag_merge", || {
+            crate::frag_merge::harvest_with_frag_merge(
+                &listing,
+                args.min_contig_length,
+                &trinity_tmp,
+                &args.left,
+                &args.right,
+                args.seq_type,
+            )
+        })?;
+        let st = &outcome.stats;
+        eprintln!(
+            "-gtasm frag merge: pairs {}, 候选链接 {}（达阈值 {}）, OLC 合 {} + N 连 {}（短拒 {}）, contigs {} → {}{}",
+            st.pairs,
+            st.links_total,
+            st.links_kept,
+            st.merged_olc,
+            st.merged_n,
+            st.rejected_short,
+            st.contigs_in,
+            st.contigs_out,
+            if st.name_mismatches > 0 {
+                format!("（WARNING: {} 对 read 名不匹配, 文件可能错序）", st.name_mismatches)
+            } else {
+                String::new()
+            }
+        );
+        if let Ok(mut fh) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(round_dir.join(".stage_timings"))
+        {
+            use std::io::Write;
+            let _ = writeln!(
+                fh,
+                "gtasm_frag_merge_detail\tlinks={} kept={} olc={} nj={} rejected_short={} contigs={}->{}",
+                st.links_total, st.links_kept, st.merged_olc, st.merged_n, st.rejected_short,
+                st.contigs_in, st.contigs_out
+            );
+        }
+        outcome.n_transcripts
+    } else {
+        if frag_merge_on && !paired {
+            eprintln!(
+                "WARNING: --gtasm-frag-merge 需要双端 reads（--left/--right）, 单端输入下跳过"
+            );
+        }
+        trinity_common::timer::timed(&round_dir, "harvest", || {
+            harvest(&listing, args.min_contig_length, &trinity_tmp)
+        })?
+    };
     if n_transcripts == 0 {
         return Err(CommonError::Parse(
             "WARNING: no transcripts harvested from butterfly output".to_string(),
         ));
+    }
+
+    // ---- 7.5 输出层 split-read 缝合（Rust 版扩展, --stitch 开启）----
+    // v1 起扫**原始** reads（归一化的 max_cov cap 会把断点横跨 read 稀释到
+    // 阈值边缘）; 整文件读入 + rayon 分块并行扫描（stitch_reads/stitch_seq_type
+    // 在归一化前快照）。统计行落 .stage_timings。
+    if args.stitch {
+        // v2 端部延伸候选: 最终轮 chrysalis 入口的 min100 集（bundle 闸丢弃的
+        // 孤立短组件在此复活为延伸片段——进图已证净负, 只在输出层消费）
+        let iworm_name = format!("inchworm.DS.fa");
+        let extra = chrysalis_dir.join(format!("{iworm_name}.min100"));
+        let st = trinity_common::timer::timed(&round_dir, "stitch", || {
+            crate::stitch::stitch_fasta(
+                &trinity_tmp,
+                Some(&extra),
+                &stitch_reads,
+                stitch_seq_type,
+                &crate::stitch::StitchParams::default(),
+            )
+        })?;
+        eprintln!(
+            "-stitch: contigs {} → {}（桥 {} 达标 {}/采纳 {}, 链 {}, 存活锚 {}; 延伸候选 {}（含于主 {}）/延伸链 {}）",
+            st.contigs_in,
+            st.contigs_out,
+            st.bridges_total,
+            st.bridges_kept,
+            st.bridges_applied,
+            st.chains,
+            st.anchors_live,
+            st.ext_candidates,
+            st.ext_contained,
+            st.extended
+        );
+        if let Ok(mut fh) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(round_dir.join(".stage_timings"))
+        {
+            use std::io::Write;
+            let _ = writeln!(
+                fh,
+                "stitch_detail\tbridges={} kept={} applied={} chains={} contigs={}->{}",
+                st.bridges_total, st.bridges_kept, st.bridges_applied, st.chains,
+                st.contigs_in, st.contigs_out
+            );
+        }
     }
 
     // 最终命名: `<outdir 绝对路径>.Trinity.fasta`（L1512）+ gene_trans_map。
@@ -594,6 +848,14 @@ pub fn run_trinity(args: &TrinityArgs) -> Result<PathBuf, CommonError> {
 ///
 /// 返回 inchworm 产物 fasta 路径（可能指向空文件——判定归调用方: 主线报错,
 /// multi-k 中间轮降级）。
+/// 一轮 k-mer 计数的内存形态（刀M8, 2026-09-06 内存战役）: 33≤k≤64 走
+/// u128 窄链（save/注入/剪枝/PARALLEL 目录全程 u128, KmerId 宽表不物化）;
+/// 其余 k 与 resume 回退（counts_bin 读回 = 全宽记录）走 CountMap 宽链。
+enum RoundCounts {
+    Wide(trinity_kmer::counter::CountMap),
+    Narrow128(rustc_hash::FxHashMap<u128, u32>),
+}
+
 fn run_count_and_inchworm(
     round_dir: &Path,
     target_fa: &Path,
@@ -608,13 +870,17 @@ fn run_count_and_inchworm(
         args.min_kmer_count
     ));
     let counts_bin = round_dir.join(format!("mer_counts.{k}.{SR_FLAG}.rs.bin"));
-    // 性能: 计数刚算出的内存表直接透传到 kmer_load（同进程同型 CountMap,
+    // 性能: 计数刚算出的内存表直接透传到 kmer_load（同进程同型,
     // 跳过 4GB 级 counts_bin 的读回+重建; bin 照写供 resume）。
     // resume（count_ok 已存在）时 None, kmer_load 回退 load_counts。
+    // 刀M8（2026-09-06 内存战役）: 33≤k≤64 透传 u128 窄表——终点 widen 的
+    // KmerId 宽表（QM4 ~2 亿键 × 40B/槽 ≈ 10.7GB）不再物化, counts_bin 由
+    // 窄表流式按记录 to_wide 落盘（字节与宽链恒等）; both.fa 计数后即释
+    // （旧版持有到闭包尾, 与落盘/widen 瞬时叠加）。
     let counts_mem = trinity_common::timer::timed(
         round_dir,
         "kmer_count",
-        || -> Result<Option<trinity_kmer::counter::CountMap>, CommonError> {
+        || -> Result<Option<RoundCounts>, CommonError> {
             if !checkpoint_exists(&count_ok) {
                 eprintln!("-- Trinity (rust) | Jellyfish count (K={k})");
                 // 硬护栏: target_fa 整读进内存 + 计数哈希。
@@ -629,9 +895,25 @@ fn run_count_and_inchworm(
                 // 避免增长期 rehash 内存峰值。
                 let estimate = estimate_hash_size(args.max_memory, data.len() as u64);
                 let per_thread = (estimate / KMER_ENTRY_BYTES / args.cpu.max(1) as u64) as usize;
+                // 分层窄键计数（k≤32 u64 / k≤64 u128）, 键值多重集与 KmerId
+                // 直计相等（counter::count_layered_matches_wide）
                 let counts =
-                    KmerCountTable::count_fasta_data_with_capacity(&data, k, ds, per_thread);
-                save_counts(&counts_bin, &counts, k, ds)?;
+                    match trinity_kmer::counter::count_fasta_data_layered128(
+                        &data, k, ds, per_thread,
+                    ) {
+                        Some(m) => {
+                            trinity_kmer::counter::save_counts_bin128(&counts_bin, &m, k, ds)?;
+                            RoundCounts::Narrow128(m)
+                        }
+                        None => {
+                            let c = trinity_kmer::counter::count_fasta_data_layered(
+                                &data, k, ds, per_thread,
+                            );
+                            save_counts(&counts_bin, &c, k, ds)?;
+                            RoundCounts::Wide(c)
+                        }
+                    };
+                drop(data); // 计数后无消费方（trusted 另读; 落盘已流式）
                 fs::write(&count_ok, b"")?;
                 return Ok(Some(counts));
             }
@@ -651,55 +933,62 @@ fn run_count_and_inchworm(
     let iworm_ok = round_dir.join(format!(".iworm.{k}.{SR_FLAG}.ok"));
     trinity_common::timer::timed(round_dir, "inchworm", || {
         run_with_checkpoint(&iworm_ok, "Inchworm (linear contig construction)", || {
-            // M7 直桥: 计数表（checkpoint 二进制或重算）直接构建 counter,
-            // 跳过 jellyfish dump 文本往返; 原 dump 的 -L min_cov 过滤由
-            // 下方 prune_some_kmers 等价承担。
-            let (mut counter, _parsed) = trinity_common::timer::timed(
+            // M7 直桥: 计数表（checkpoint 二进制或重算）统一在此汇合, trusted
+            // 注入（presence-only）先于剪枝; 宽/窄两链分派到各自的
+            // report/剪枝/PARALLEL 目录构建（窄链语义同宽——k≤64 域内键数值
+            // 恒等, canonical 折叠同式）。
+            let counts = trinity_common::timer::timed(
                 round_dir,
                 "kmer_load",
-                || -> Result<(trinity_inchworm::kmer_counter::KmerCounter, usize), CommonError> {
+                || -> Result<RoundCounts, CommonError> {
                     let mut counts = match counts_mem {
                         Some(c) => c,
                         None if checkpoint_exists(&counts_bin) => {
-                            load_counts(&counts_bin, k, ds)?
+                            RoundCounts::Wide(load_counts(&counts_bin, k, ds)?)
                         }
                         None => {
                             let data = fs::read(target_fa)?;
                             let estimate = estimate_hash_size(args.max_memory, data.len() as u64);
                             let per_thread =
                                 (estimate / KMER_ENTRY_BYTES / args.cpu.max(1) as u64) as usize;
-                            KmerCountTable::count_fasta_data_with_capacity(&data, k, ds, per_thread)
+                            match trinity_kmer::counter::count_fasta_data_layered128(
+                                &data,
+                                k,
+                                ds,
+                                per_thread,
+                            ) {
+                                Some(m) => RoundCounts::Narrow128(m),
+                                None => RoundCounts::Wide(
+                                    trinity_kmer::counter::count_fasta_data_layered(
+                                        &data,
+                                        k,
+                                        ds,
+                                        per_thread,
+                                    ),
+                                ),
+                            }
                         }
                     };
                     // multi-k trusted contig 注入（presence-only）: 计数表两条
                     // 构建路径汇合后的统一注入点, 先于 populate/剪枝。
                     if let Some(t) = trusted {
                         let tdata = fs::read(t)?;
-                        let inserted =
-                            trinity_kmer::counter::inject_trusted_kmers(&mut counts, &tdata, k, ds);
+                        let inserted = match &mut counts {
+                            RoundCounts::Wide(c) => {
+                                trinity_kmer::counter::inject_trusted_kmers(c, &tdata, k, ds)
+                            }
+                            RoundCounts::Narrow128(m) => {
+                                trinity_kmer::counter::inject_trusted_kmers128(m, &tdata, k, ds)
+                            }
+                        };
                         eprintln!(
                             "-multi-k: trusted contigs {} → 新注入 {inserted} 个 k-mer（count=1, presence-only）",
                             t.display()
                         );
                     }
-                    // 计数表 move 直构（键已 canonical 且唯一, 与逐条 add_kmer 等价）
-                    let n = counts.len();
-                    Ok((
-                        trinity_inchworm::kmer_counter::KmerCounter::from_count_map(
-                            counts, k, ds,
-                        ),
-                        n,
-                    ))
+                    Ok(counts)
                 },
             )?;
-            write_kmer_count_report(&round_dir.join("inchworm.kmer_count"), counter.size())?;
-            // 主线实参: --min_any_entropy 1.0 --no_prune_error_kmers（L1050/L2707）
-            // + dump -L 已按 min_kmer_cov 过滤（minKmerCount 此处为等价二次过滤）。
-            eprintln!(
-                "Pruning kmers (min_kmer_count={} min_any_entropy=1 min_ratio_non_error=0.005)",
-                args.min_kmer_count
-            );
-            prune_some_kmers(&mut counter, args.min_kmer_count, 1.0, false, 0.005);
             let params = IrkeParams::default();
             // -L = MIN_IWORM_LEN = KMER_SIZE（L1064/L2698）
             let aparams = AssemblyParams {
@@ -708,15 +997,58 @@ fn run_count_and_inchworm(
             };
             let monitor = Monitor::new(1);
             let mut buf = Vec::new();
-            compute_sequence_assemblies_parallel(
-                counter,
-                &params,
-                &aparams,
-                &monitor,
-                true, // TWO_PHASE 默认开（IRKE.cpp:59）
-                Some(args.inchworm_cpu),
-                &mut buf,
-            )?;
+            match counts {
+                RoundCounts::Wide(counts) => {
+                    // 计数表 move 直构（键已 canonical 且唯一, 与逐条 add_kmer 等价）
+                    let mut counter = trinity_inchworm::kmer_counter::KmerCounter::from_count_map(
+                        counts, k, ds,
+                    );
+                    write_kmer_count_report(&round_dir.join("inchworm.kmer_count"), counter.size())?;
+                    // 主线实参: --min_any_entropy 1.0 --no_prune_error_kmers（L1050/L2707）
+                    // + dump -L 已按 min_kmer_cov 过滤（minKmerCount 此处为等价二次过滤）。
+                    eprintln!(
+                        "Pruning kmers (min_kmer_count={} min_any_entropy=1 min_ratio_non_error=0.005)",
+                        args.min_kmer_count
+                    );
+                    prune_some_kmers(&mut counter, args.min_kmer_count, 1.0, false, 0.005);
+                    compute_sequence_assemblies_parallel(
+                        counter,
+                        &params,
+                        &aparams,
+                        &monitor,
+                        true, // TWO_PHASE 默认开（IRKE.cpp:59）
+                        Some(args.inchworm_cpu),
+                        &mut buf,
+                    )?;
+                }
+                RoundCounts::Narrow128(mut narrow) => {
+                    write_kmer_count_report(&round_dir.join("inchworm.kmer_count"), narrow.len())?;
+                    eprintln!(
+                        "Pruning kmers (min_kmer_count={} min_any_entropy=1 min_ratio_non_error=0.005)",
+                        args.min_kmer_count
+                    );
+                    prune_some_kmers_narrow(
+                        &mut narrow,
+                        k,
+                        ds,
+                        args.min_kmer_count,
+                        1.0,
+                        false,
+                        0.005,
+                    );
+                    compute_sequence_assemblies_parallel128(
+                        narrow,
+                        k,
+                        ds,
+                        &params,
+                        &aparams,
+                        &monitor,
+                        true, // TWO_PHASE 默认开（IRKE.cpp:59）
+                        Some(args.inchworm_cpu),
+                        &mut buf,
+                    )?;
+                }
+            }
             fs::write(&iworm_tmp, &buf)?;
             Ok(())
         })
@@ -796,6 +1128,14 @@ fn run_recursive(
                     max_reads: args.max_reads_per_graph,
                     threads: args.cpu.max(1),
                     graphs_per_partition: 1000,
+                    graph_clean_rnaspades: false, // 递归 phase-1 跳过 quantify, 清理不生效
+                    rtt_multi_kmer: args.rtt_multi_kmer,
+                    weld_glue_factor: args.weld_glue_factor,
+                    // auto（哨兵 0）同样在递归线生效: 现场抽样读长 resolve
+                    weld_min_glue: crate::multik::resolve_weld_min_glue(args, None)?,
+                    cluster_max_size: args.cluster_max_size,
+                    weld_reads_path: None,
+                    gap_close_spades: false,      // 递归 phase-1 跳过 quantify, 缝合不生效
                 },
             )?;
             listing_opt = Some(listing);
@@ -941,7 +1281,7 @@ mod tests {
         let g = 1024 * 1024 * 1024u64;
         let msg = memory_guard_error(g, g, "k-mer counting").expect("should error");
         assert!(msg.contains("1.2x input"), "{msg}");
-        assert!(msg.contains("distinct k-mers x 26 B"), "{msg}");
+        assert!(msg.contains("distinct k-mers x 42 B"), "{msg}");
         assert!(msg.contains("increase --max_memory"), "{msg}");
         assert!(msg.contains("k-mer counting"), "{msg}");
     }

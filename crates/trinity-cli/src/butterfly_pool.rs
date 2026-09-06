@@ -17,15 +17,30 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use rayon::prelude::*;
-use trinity_butterfly::{run_component, ComponentParams};
+use trinity_butterfly::{
+    run_component, run_component_gtasm, run_component_rnaspades, ComponentParams, EdgeSupport,
+    GtModel,
+};
 use trinity_chrysalis::pack::{
     read_at, PackIndex, PackWriter, BUTTERFLY_PACK, GRAPHS_PACK, KIND_ALL_PROB_PATHS,
     KIND_GRAPH_OUT, KIND_GRAPH_READS,
 };
 use trinity_common::error::CommonError;
+
+use crate::args::PathEngine;
+
+/// gtasm 引擎的池级共享上下文（模型 + 原始 reads 边支持表 + read pair 分支
+/// 支持表; 逐 comp 只读）。
+#[derive(Debug)]
+pub struct GtasmShared {
+    pub model: GtModel,
+    pub support: EdgeSupport,
+    /// read pair 分支支持（--gtasm-pair-support 关时为空表, 解码零开销）。
+    pub pair_support: trinity_butterfly::PairSupport,
+}
 
 /// 组件池参数（从 TrinityArgs 收敛）。
 #[derive(Debug, Clone)]
@@ -38,6 +53,29 @@ pub struct ButterflyPoolParams {
     pub group_pairs_distance: usize,
     /// 专用组件线程栈（--bfly_stack_mb）。
     pub stack_size_mb: usize,
+    /// 路径引擎（classic 默认 = 现状逐字节; gtasm = GT 打分 + GTasm 解码;
+    /// rnaspades = rnaSPAdes MultiExtender 核心规则复刻）。
+    pub path_engine: PathEngine,
+    /// gtasm 共享上下文（path_engine == Gtasm 时必有）。
+    pub gtasm: Option<Arc<GtasmShared>>,
+    /// gtasm 解码的 visited 穿越（--no-gtasm-visited-walk 关闭; 默认开,
+    /// 机制见 trinity-butterfly gtdecode 模块文档）。仅 gtasm 引擎消费。
+    pub gtasm_visited_walk: bool,
+    /// gtasm 解码的简单 bulge 双臂产出（--gtasm-bulge-dual 开; 默认关,
+    /// 机制见 gtdecode 模块文档）。仅 gtasm 引擎消费。
+    pub gtasm_bulge_dual: bool,
+    /// gtasm 解码的 read pair 分支证据乘性消费（--gtasm-pair-support 开;
+    /// 默认关）。仅 gtasm 引擎消费。
+    pub gtasm_pair_support: bool,
+    /// classic 引擎的 cd-hit 式去冗余开关（--bfly-no-path-merging 开 =
+    /// 跳过两处 twoPathsAreTooSimilar 去冗余; 默认关 = 原版语义）。
+    /// 实验旗标: QM4 缺失解剖显示 1,245 条缺失转录本死在搜索/去冗余层。
+    pub no_path_merging: bool,
+    /// `-R`：最小 read 支持（默认 2 = 原版）。实验: 381 档死因之一——
+    /// 低 read 分量分叉处 support<2 全拒（QM4 案例验证 R=1 可救）。
+    pub min_read_support: i64,
+    /// **Rust 版扩展**: 搜索 0 产出的分量以 R=1 重试（定向豁免, 默认关）。
+    pub empty_retry: bool,
 }
 
 /// 原版 butterfly 命令实参（L2363-2388）:
@@ -57,6 +95,9 @@ fn component_params(base: &Path, p: &ButterflyPoolParams) -> ComponentParams {
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| "component".to_string()),
         stack_size: p.stack_size_mb.saturating_mul(1024 * 1024),
+        no_path_merging: p.no_path_merging,
+        min_read_support: p.min_read_support,
+        empty_retry: p.empty_retry,
         ..Default::default()
     }
 }
@@ -169,13 +210,55 @@ fn run_one(
         String::from_utf8(bytes)
             .map_err(|e| CommonError::Parse(format!("non-UTF8 record in {}: {e}", pack.display())))
     };
-    let g = read_rec(KIND_GRAPH_OUT)?;
-    let r = read_rec(KIND_GRAPH_READS)?;
-    let result = run_component(&g, &r, &component_params(base, params))?;
-    writer.lock().unwrap().append(
-        id,
-        KIND_ALL_PROB_PATHS,
-        result.all_prob_paths_fasta.as_bytes(),
-    )?;
+    let fasta = match params.path_engine {
+        PathEngine::Classic => {
+            let g = read_rec(KIND_GRAPH_OUT)?;
+            let r = read_rec(KIND_GRAPH_READS)?;
+            run_component(&g, &r, &component_params(base, params))?.all_prob_paths_fasta
+        }
+        PathEngine::Gtasm => {
+            // gtasm 只需 graph.out（支持来自原始 reads 支持表, 不读 graph.reads）
+            let g = read_rec(KIND_GRAPH_OUT)?;
+            let shared = params.gtasm.as_ref().ok_or_else(|| {
+                CommonError::Parse("gtasm 模式缺少共享上下文（模型/支持表）".to_string())
+            })?;
+            let name = base
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "component".to_string());
+            run_component_gtasm(
+                &g,
+                id,
+                &name,
+                &shared.model,
+                &shared.support,
+                &shared.pair_support,
+                &trinity_butterfly::GtasmParams {
+                    min_len: params.min_contig_length,
+                    seed: trinity_butterfly::GTASM_DEFAULT_SEED,
+                    allow_visited_walk: params.gtasm_visited_walk,
+                    bulge_dual: params.gtasm_bulge_dual,
+                    pair_boost: params.gtasm_pair_support,
+                },
+            )
+            .map_err(|e| CommonError::Parse(format!("gtasm 组件 {id} 失败: {e}")))?
+        }
+        PathEngine::RnaSpades => {
+            // rnaspades 只需 graph.out（简化点: 不做 PE 权重, 不读 graph.reads;
+            // 长度过滤走自身 path_cleaning 110bp/cov≥2, harvest 再按
+            // --min_contig_length 收口）
+            let g = read_rec(KIND_GRAPH_OUT)?;
+            let name = base
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "component".to_string());
+            run_component_rnaspades(&g, &name)
+                .map_err(|e| CommonError::Parse(format!("rnaspades 组件 {id} 失败: {e}")))?
+        }
+    };
+    writer
+        .lock()
+        .unwrap()
+        .append(id, KIND_ALL_PROB_PATHS, fasta.as_bytes())?;
     Ok(())
 }

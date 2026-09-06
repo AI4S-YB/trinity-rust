@@ -1,4 +1,6 @@
 mod bench;
+mod export_candidates;
+mod junction;
 
 use std::env;
 use std::path::{Path, PathBuf};
@@ -18,6 +20,7 @@ fn main() {
         Some("xcheck-butterfly") => xcheck_butterfly(&args[1..]),
         Some("eval-trinity") => eval_trinity_cmd(&args[1..]),
         Some("bench") => std::process::exit(crate::bench::run(&args[1..])),
+        Some("export-candidates") => std::process::exit(crate::export_candidates::run(&args[1..])),
         Some("xcheck-trinity") => xcheck_trinity(&args[1..]),
         Some(other) => {
             eprintln!(

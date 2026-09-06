@@ -25,7 +25,8 @@ const T_MASK: u8 = 2;
 const C_MASK: u8 = 1;
 
 fn base_mask(code: KmerId) -> u8 {
-    match code {
+    // code 恒为单碱基编码（0..3, 已 &3 或移位截断后）
+    match code.lo as u8 & 3 {
         0 => G_MASK, // G
         1 => A_MASK, // A
         2 => T_MASK, // T
@@ -82,17 +83,19 @@ impl DeBruijnKmer {
 
     /// DeBruijnGraph.cpp:214 add_next_kmer — 取 k 的**末碱基**置位。
     fn add_next_kmer(&mut self, k: KmerId) {
-        let last = k & 3;
+        let last = k & KmerId::from(3u8);
         self.next |= base_mask(last);
     }
 
     /// DeBruijnGraph.cpp:105 get_prev_kmers — 候选 = 首碱基拼上 k 的后缀
     /// （k >> 2）；序 G,A,T,C（只产掩码位非零者）。
-    /// u128 扩容: 位移量 2k-2 ≤ 126（k≤64）恒安全。
+    /// U256 扩容: 位移量 2k-2 ≤ 254（k≤128）恒安全。
     pub fn get_prev_kmers(&self, kmer_length: usize) -> Vec<KmerId> {
         let reverse_suffix = self.kmer >> 2;
         let mut prev_kmers = Vec::new();
-        for (mask, code) in [(G_MASK, 0u128), (A_MASK, 1), (T_MASK, 2), (C_MASK, 3)] {
+        for (mask, code) in
+            [(G_MASK, KmerId::from(0u8)), (A_MASK, 1u8.into()), (T_MASK, 2u8.into()), (C_MASK, 3u8.into())]
+        {
             if self.prev & mask != 0 {
                 prev_kmers.push((code << (kmer_length * 2 - 2)) | reverse_suffix);
             }
@@ -104,10 +107,13 @@ impl DeBruijnKmer {
     /// 首碱基）拼上末碱基；序 G,A,T,C。
     pub fn get_next_kmers(&self, kmer_length: usize) -> Vec<KmerId> {
         // 原版 (k << (33-K)*2) >> (32-K)*2 == (k & 低 2K-2 位) << 2
-        // （截掉首碱基的高 2 位后整体左移一个碱基; u128 下 2K-2 ≤ 126 恒安全）
-        let forward_prefix = (self.kmer & ((1u128 << (kmer_length * 2 - 2)) - 1)) << 2;
+        // （截掉首碱基的高 2 位后整体左移一个碱基; U256 下 2K-2 ≤ 254 恒安全）
+        let forward_prefix =
+            (self.kmer & KmerId::low_bits((kmer_length * 2 - 2) as u32)) << 2;
         let mut next_kmers = Vec::new();
-        for (mask, code) in [(G_MASK, 0u128), (A_MASK, 1), (T_MASK, 2), (C_MASK, 3)] {
+        for (mask, code) in
+            [(G_MASK, KmerId::from(0u8)), (A_MASK, 1u8.into()), (T_MASK, 2u8.into()), (C_MASK, 3u8.into())]
+        {
             if self.next & mask != 0 {
                 next_kmers.push(forward_prefix | code);
             }

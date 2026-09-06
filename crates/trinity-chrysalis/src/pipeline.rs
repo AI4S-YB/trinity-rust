@@ -48,6 +48,29 @@ pub struct ChrysalisParams {
     /// 跳过 QuantifyGraph（phase-2 分割点）：止于分区，保留 c*.graph.tmp /
     /// c*.reads.tmp 供递归模式逐分区消费（默认 false，行为不变）。
     pub skip_quantify: bool,
+    /// `--graph-clean-rnaspades`：QuantifyGraph 之后对 graph.out 做 rnaSPAdes
+    /// 式相对覆盖清理（tip/EC/rcc, 见 graph_clean 模块）。默认 false = 逐字节不变。
+    pub graph_clean_rnaspades: bool,
+    /// `--rtt-multi-kmer`（Rust 版扩展, 默认 false = 原版语义）：ReadsToTranscripts
+    /// 的 25-mer 索引多值化——共享 kmer 记全部组件。救跨 weld 口 read 被
+    /// 其他组件抢占导致的断口无桥（见 RttParams::multi_kmer 文档）。
+    pub rtt_multi_kmer: bool,
+    /// GraphFromFasta 的 weld 证据门槛 `glue_factor`（默认 0.05 = 原版）:
+    /// min_cov = clamp(max(cov_i,cov_c) * glue_factor, min_glue, max_glue)。
+    /// 实验: 聚类割裂档（missing tx 物理相邻组件被拆）的放宽方向。
+    pub weld_glue_factor: f64,
+    /// weld 最小 read 支持数 `min_glue_required`（默认 2 = 原版）。
+    pub weld_min_glue: u32,
+    /// BubbleUpClustering 的 `-max_cluster_size`（默认 25 = 原版）。
+    pub cluster_max_size: usize,
+    /// **Rust 版扩展**: weld（GraphFromFasta）阶段专用 reads 文件路径——
+    /// None = 用管线 reads_fa（原版语义）。分级归一化实验: weld 用
+    /// max_cov 更高的归一化版本（低/中表达区保留更多桥 read 证据）,
+    /// RTT/quantify 仍用默认归一化（控图规模）。
+    pub weld_reads_path: Option<PathBuf>,
+    /// `--gap-close-spades`：清理之后对 graph.out 做 SPAdes 式 tip 对 tip
+    /// overlap 缝合（PE 证据排序候选, 见 gap_close 模块）。默认 false = 逐字节不变。
+    pub gap_close_spades: bool,
 }
 
 impl Default for ChrysalisParams {
@@ -60,6 +83,13 @@ impl Default for ChrysalisParams {
             max_reads: 200_000,
             threads: 1,
             skip_quantify: false,
+            graph_clean_rnaspades: false,
+            rtt_multi_kmer: false,
+            weld_glue_factor: 0.05,
+            weld_min_glue: 2,
+            cluster_max_size: 25,
+            weld_reads_path: None,
+            gap_close_spades: false,
         }
     }
 }
@@ -80,15 +110,30 @@ pub fn run_chrysalis_pipeline(
     // 1. GraphFromFasta → weld 图 → sort
     println!("-running GraphFromFasta...");
     let (iworm_seqs, welds_sorted) = timed(out_dir, "gff", || {
-        let iworm_seqs = read_fasta_bytes(iworm_fa, false);
-        let reads_text = String::from_utf8_lossy(reads_fa).into_owned();
+        // from_utf8_lossy 的 Cow 借用语义: 合法 UTF-8（fasta 恒 ASCII）零拷贝
+        // ——旧 into_owned() 无条件复制全量 reads（QM4 3.9GB, 2026-09-05
+        // 内存战役）; weld_reads_path 分支的 bytes 需与 Cow 同存活。
+        let weld_bytes: Option<Vec<u8>> = match &p.weld_reads_path {
+            Some(path) => Some(std::fs::read(path).map_err(|e| {
+                CommonError::Parse(format!("weld reads {}: {e}", path.display()))
+            })?),
+            None => None,
+        };
+        let reads_text = match &weld_bytes {
+            Some(b) => String::from_utf8_lossy(b),
+            None => String::from_utf8_lossy(reads_fa),
+        };
         let reads_streamed = stream_fasta_records(&reads_text);
+        drop(reads_text);
+        let iworm_seqs = read_fasta_bytes(iworm_fa, false);
         let welds = graph_from_fasta(
             &iworm_seqs,
             &reads_streamed,
             &GffParams {
                 strand: p.strand,
                 threads: p.threads.max(1),
+                glue_factor: p.weld_glue_factor,
+                min_glue_required: p.weld_min_glue,
                 ..Default::default()
             },
         )?;
@@ -104,13 +149,17 @@ pub fn run_chrysalis_pipeline(
             &welds_sorted,
             &BubbleParams {
                 min_contig_length: p.min_contig_length,
+                max_cluster_size: p.cluster_max_size,
                 ..Default::default()
             },
         )
     })?;
     let (bundle, bundle_path) = timed(out_dir, "bundle", || {
         println!("-running CreateIwormFastaBundle...");
-        let bundle = create_iworm_fasta_bundle(&comps, 200)?;
+        // 2026-09-03: 原版此处硬编码 200; 改为随 --min_contig_length 联动——
+        // QM4 端部截断解剖显示孤立 100-200bp 组件在此被整体丢弃（TPM≥20 截断
+        // 缺口的 42% 归因于该档, 见 opt-log「端部截断全景」）。
+        let bundle = create_iworm_fasta_bundle(&comps, p.min_contig_length)?;
         let bundle_path = out_dir.join("bundled_iworm_contigs.fasta");
         std::fs::write(&bundle_path, &bundle)?;
         Ok::<_, CommonError>((bundle, bundle_path))
@@ -128,6 +177,7 @@ pub fn run_chrysalis_pipeline(
                 strand: p.strand,
                 pct_required: p.pct_required,
                 threads: p.threads.max(1),
+                multi_kmer: p.rtt_multi_kmer,
                 ..Default::default()
             },
         )?;
@@ -179,6 +229,12 @@ pub fn run_chrysalis_pipeline(
             max_reads: p.max_reads as i64,
             ..Default::default()
         };
+        // rnaSPAdes 图清理的跨组件统计与耗时累计（各组件并行, 锁合并）
+        let clean_stats: Mutex<crate::graph_clean::CleanStats> = Mutex::new(Default::default());
+        let clean_nanos = std::sync::atomic::AtomicU64::new(0);
+        // SPAdes 式 gap 缝合的跨组件统计与耗时累计（同清理的合并模式）
+        let gap_stats: Mutex<crate::gap_close::GapCloseStats> = Mutex::new(Default::default());
+        let gap_nanos = std::sync::atomic::AtomicU64::new(0);
         let mut writers: HashMap<PathBuf, Mutex<PackWriter>> = HashMap::new();
         let mut tmp_indexes: HashMap<PathBuf, PackIndex> = HashMap::new();
         for (_, base) in &listing {
@@ -209,7 +265,19 @@ pub fn run_chrysalis_pipeline(
                             let dir = base.parent().map(|d| d.to_path_buf()).unwrap_or_default();
                             let w = writers.get(&dir).expect("writer per Cbin pre-created");
                             let idx = tmp_indexes.get(&dir).expect("tmp index per Cbin loaded");
-                            match run_quantify_packed(*id, &dir, idx, w, &qg) {
+                            match run_quantify_packed(
+                                *id,
+                                &dir,
+                                idx,
+                                w,
+                                &qg,
+                                p.graph_clean_rnaspades,
+                                &clean_stats,
+                                &clean_nanos,
+                                p.gap_close_spades,
+                                &gap_stats,
+                                &gap_nanos,
+                            ) {
                                 Ok(()) => None,
                                 Err(e) => Some(format!("{}: {e}", base.display())),
                             }
@@ -220,6 +288,78 @@ pub fn run_chrysalis_pipeline(
         )?;
         for w in writers.values() {
             w.lock().unwrap().finish()?;
+        }
+        if crate::quantify::qg_profile_enabled() {
+            use std::sync::atomic::Ordering::Relaxed;
+            let q = &crate::quantify::QG_STATS;
+            eprintln!(
+                "[qg-profile] CPU 累计: parse(read_fasta) {:.1}s, add_kmers(生成+排序) {:.1}s, join(扫图+收集+输出) {:.1}s, pipe_read(tmp.pack) {:.1}s, pipe_write(锁内写) {:.1}s",
+                q.parse_nanos.load(Relaxed) as f64 / 1e9,
+                q.add_nanos.load(Relaxed) as f64 / 1e9,
+                q.join_nanos.load(Relaxed) as f64 / 1e9,
+                PIPE_READ_NANOS.load(Relaxed) as f64 / 1e9,
+                PIPE_WRITE_NANOS.load(Relaxed) as f64 / 1e9,
+            );
+        }
+        // 清理统计行 + 落 .stage_timings（CPU 时间累计: 各组件并行清理的耗时和）
+        if p.graph_clean_rnaspades {
+            let st = clean_stats.lock().unwrap();
+            println!(
+                "-graph-clean-rnaspades: {} components, tip chains {} (g1 {} + g2 {}, {} nodes), ec chains {} ({} nodes), rcc components {} ({} nodes), lines removed {}, dangling repaired {}, reverted {}",
+                st.components,
+                st.tip_g1_chains + st.tip_g2_chains,
+                st.tip_g1_chains,
+                st.tip_g2_chains,
+                st.tip_nodes,
+                st.ec_chains,
+                st.ec_nodes,
+                st.rcc_components,
+                st.rcc_nodes,
+                st.lines_removed,
+                st.repaired_dangling,
+                st.reverted_components,
+            );
+            drop(st);
+            let secs = clean_nanos.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e9;
+            if let Ok(mut fh) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(out_dir.join(".stage_timings"))
+            {
+                use std::io::Write;
+                let _ = writeln!(fh, "graph_clean\t{secs:.3}");
+            }
+        }
+        // 缝合统计行 + 落 .stage_timings（CPU 时间累计: 各组件并行缝合的耗时和）
+        if p.gap_close_spades {
+            let st = gap_stats.lock().unwrap();
+            println!(
+                "-gap-close-spades: {} components, tips (out {} + in {}), tip reads {}, pair votes {}, candidates {}, checked {}, closed {} (perfect {} + corrected {}), rejected (low-complexity {} + hamming {} + kmer-clash {}), bridge nodes {}",
+                st.components,
+                st.out_tips,
+                st.in_tips,
+                st.tip_reads,
+                st.pair_votes,
+                st.candidate_pairs,
+                st.pairs_checked,
+                st.gaps_closed,
+                st.closed_perfect,
+                st.closed_corrected,
+                st.rejected_low_complexity,
+                st.rejected_hamming,
+                st.rejected_kmer_clash,
+                st.bridge_nodes,
+            );
+            drop(st);
+            let secs = gap_nanos.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e9;
+            if let Ok(mut fh) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(out_dir.join(".stage_timings"))
+            {
+                use std::io::Write;
+                let _ = writeln!(fh, "gap_close\t{secs:.3}");
+            }
         }
         if !failures.is_empty() {
             return Err(CommonError::Parse(format!(
@@ -269,26 +409,81 @@ fn read_tmp_record(dir: &Path, idx: &PackIndex, id: u64, kind: u64) -> Result<Ve
 
 /// 逐组件 QuantifyGraph: 从 Cbin 的 tmp 包读 graph.tmp/reads.tmp 记录,
 /// 产物追加进 graphs 包。输入的删除由调用方在整阶段成功后整包完成。
+/// `graph_clean`：开启时对 graph.out 文本做 rnaSPAdes 式清理（tip→EC→rcc,
+/// 见 graph_clean 模块）; `gap_close`：清理之后做 SPAdes 式 tip 对 tip
+/// overlap 缝合（PE 证据来自 reads.tmp, 见 gap_close 模块）。统计/耗时
+/// 分别并入对应 Mutex/原子量。
+#[allow(clippy::too_many_arguments)]
 fn run_quantify_packed(
     id: u64,
     dir: &Path,
     tmp_idx: &PackIndex,
     writer: &Mutex<PackWriter>,
     p: &QgParams,
+    graph_clean: bool,
+    clean_stats: &Mutex<crate::graph_clean::CleanStats>,
+    clean_nanos: &std::sync::atomic::AtomicU64,
+    gap_close: bool,
+    gap_stats: &Mutex<crate::gap_close::GapCloseStats>,
+    gap_nanos: &std::sync::atomic::AtomicU64,
 ) -> Result<(), String> {
-    let graph = read_tmp_record(dir, tmp_idx, id, KIND_GRAPH_TMP)?;
-    let reads = read_tmp_record(dir, tmp_idx, id, KIND_READS_TMP)?;
-    let graph = String::from_utf8(graph).map_err(|e| e.to_string())?;
-    let (gout, rout) = quantify_graph_mem(&graph, &reads, p).map_err(|e| e.to_string())?;
+    let graph = {
+        let t = std::time::Instant::now();
+        let g = read_tmp_record(dir, tmp_idx, id, KIND_GRAPH_TMP)?;
+        let r = read_tmp_record(dir, tmp_idx, id, KIND_READS_TMP)?;
+        let g = String::from_utf8(g).map_err(|e| e.to_string())?;
+        if crate::quantify::qg_profile_enabled() {
+            PIPE_READ_NANOS.fetch_add(
+                t.elapsed().as_nanos() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
+        (g, r)
+    };
+    let (gout, rout) = quantify_graph_mem(&graph.0, &graph.1, p).map_err(|e| e.to_string())?;
+    let gout = if graph_clean {
+        let t0 = std::time::Instant::now();
+        let (cleaned, st) = crate::graph_clean::clean_graph_rnaspades(&gout);
+        clean_nanos
+            .fetch_add(t0.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+        clean_stats.lock().unwrap().add_assign(&st);
+        cleaned
+    } else {
+        gout
+    };
+    // SPAdes 流程里 gap closer 在 simplification 之后跑（config.info
+    // after_simplify=true）——此处清理之后缝合, 顺序一致。
+    let gout = if gap_close {
+        let t0 = std::time::Instant::now();
+        let (closed, st) = crate::gap_close::close_gaps_spades(&gout, &graph.1, p.strand);
+        gap_nanos
+            .fetch_add(t0.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+        gap_stats.lock().unwrap().add_assign(&st);
+        closed
+    } else {
+        gout
+    };
     {
+        let t = std::time::Instant::now();
         let mut w = writer.lock().unwrap();
         w.append(id, KIND_GRAPH_OUT, gout.as_bytes())
             .map_err(|e| e.to_string())?;
         w.append(id, KIND_GRAPH_READS, rout.as_bytes())
             .map_err(|e| e.to_string())?;
+        drop(w);
+        if crate::quantify::qg_profile_enabled() {
+            PIPE_WRITE_NANOS.fetch_add(
+                t.elapsed().as_nanos() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
     }
     Ok(())
 }
+
+/// QG_PROFILE 分段（管线层: tmp.pack 读 + writer 锁内写）。
+static PIPE_READ_NANOS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static PIPE_WRITE_NANOS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 #[cfg(test)]
 mod tests {

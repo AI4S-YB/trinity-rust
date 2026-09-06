@@ -75,6 +75,72 @@ impl NonRedKmerTable {
         }
     }
 
+    /// 平铺候选竞技场形态（刀M10, 2026-09-06 内存战役）: 候选 = 各竞技场的
+    /// `(off, len)` 跨度, 窗口偏移**直接指向竞技场**——phase1 的亿级短候选
+    /// （QM4 ~27B/条）免逐候选 Vec 分配（实测 Vec<Vec<u8>> 形态 11.7GB →
+    /// 竞技场 ~4.5GB）, 且免 set_up_templates 的内部窗口二次平铺（同窗
+    /// ~7.5GB）。排序/去重/产物与 Vec<Vec<u8>> 版恒等（同一窗口多重集、
+    /// 字节序排序、data 逐字节一致——表是内容寻址集合, 序仅经由排序键）。
+    /// 域: 单竞技场 < 4GB（窗口偏移 u32; QM4 2.8GB——超域断言报错）。
+    pub fn set_up_templates_flat(
+        arenas: &[(Vec<u8>, Vec<(usize, u32)>)],
+        k: usize,
+        no_ns: bool,
+    ) -> Self {
+        // 窗口描述符 = (竞技场下标 << 32) | 窗口偏移
+        fn window_of<'a>(
+            arenas: &'a [(Vec<u8>, Vec<(usize, u32)>)],
+            d: u64,
+            k: usize,
+        ) -> &'a [u8] {
+            let arena = &arenas[(d >> 32) as usize].0;
+            let off = (d & 0xFFFF_FFFF) as usize;
+            &arena[off..off + k]
+        }
+        let mut wdesc: Vec<u64> = Vec::new();
+        for (ai, (flat, spans)) in arenas.iter().enumerate() {
+            assert!(
+                flat.len() <= u32::MAX as usize,
+                "weldmer 竞技场 {} 字节超过 4GB——flat 变体域外",
+                flat.len()
+            );
+            for &(off, len) in spans {
+                let len = len as usize;
+                if len < k {
+                    continue; // 同 set_up_templates 的下溢护栏
+                }
+                for j in 0..=len - k {
+                    if no_ns
+                        && flat[off + j..off + j + k]
+                            .iter()
+                            .any(|&c| !matches!(c, b'A' | b'C' | b'G' | b'T'))
+                    {
+                        continue;
+                    }
+                    wdesc.push(((ai as u64) << 32) | ((off + j) as u64));
+                }
+            }
+        }
+        wdesc.sort_unstable_by(|&a, &b| window_of(arenas, a, k).cmp(window_of(arenas, b, k)));
+        let mut data: Vec<Vec<u8>> = Vec::with_capacity(wdesc.len());
+        let mut prev: Option<&[u8]> = None;
+        for &d in &wdesc {
+            let w = window_of(arenas, d, k);
+            if Some(w) == prev {
+                continue;
+            }
+            data.push(w.to_vec());
+            prev = Some(w);
+        }
+        let counts = vec![0i32; data.len()];
+        NonRedKmerTable {
+            k,
+            data,
+            counts,
+            hash_idx: std::sync::OnceLock::new(),
+        }
+    }
+
     /// 懒建 2bit 哈希索引（纯 GATC kmer; 含非 GATC 者不进索引, 由 `index`
     /// 字节二分兜底）。
     fn hash_index(&self) -> &FxHashMap<KmerId, u32> {
@@ -89,6 +155,12 @@ impl NonRedKmerTable {
 
     pub fn k(&self) -> usize {
         self.k
+    }
+
+    /// 测试访问: 模板序列有序表（flat 形态等价锁用）。
+    #[cfg(test)]
+    fn data_ref(&self) -> &[Vec<u8>] {
+        &self.data
     }
 
     /// 表内 k-mer 数。
@@ -134,13 +206,15 @@ impl NonRedKmerTable {
     }
 
     /// **并行版** `add_counts_from_reads`（镜像 NonRedKmerTable.cc:161-200
-    /// `AddData(DNAStringStreamFast&)` 的 omp atomic 语义）：分块局部计数 +
-    /// 按块序合并——整数累加，与原版原子累加/与单线程版结果完全一致。
+    /// `AddData(DNAStringStreamFast&)` 的 omp atomic 语义）：共享原子计数
+    /// fetch_add 累加——与原版原子累加/单线程版结果完全一致。
     /// 消费方（`graph_from_fasta`）等价于原版 `#pragma omp parallel` 抢读。
     ///
     /// 性能（2026-09-01）: 滚动 2-bit 编码 + 哈希查询（`hash_index`）替换
     /// 逐窗二分+整段大写拷贝; 含非 GATC 的窗走字节二分回退（原版 toupper
     /// 后字节匹配语义）。read 长度 < k 的跳过语义不变。
+    /// 内存（2026-09-05）: 原分块局部稠密表（每块 n×4B × collect 全保留）
+    /// 在 n≈亿级时瞬时 60~100GB——改回共享原子单份计数（omp atomic 本义）。
     pub fn add_counts_from_reads_par(&mut self, reads: &[Vec<u8>]) {
         use rayon::prelude::*;
         let n = self.data.len();
@@ -149,56 +223,57 @@ impl NonRedKmerTable {
         }
         let hidx = self.hash_index(); // 先建索引（OnceLock, 一次）
         let k = self.k;
-        let mask: KmerId = if k >= 64 { KmerId::MAX } else { (1 << (2 * k)) - 1 };
+        let mask: KmerId = KmerId::low_bits(2 * k as u32);
         let data = &self.data;
+        // 共享原子计数（镜像原版 NonRedKmerTable.cc 的 `#pragma omp atomic`,
+        // 2026-09-05 内存战役改回）: 旧分块局部稠密表 `partials: Vec<Vec<i32>>`
+        // 每块 n×4B、collect 全程保留——n≈亿级 × 块数（128~512）实测瞬时
+        // 60~100GB（gff 段峰值主体）。整数 fetch_add 累加与分块求和/原版
+        // 原子累加结果恒等; for_each 无结果保留, 内存 = 单份 n×4B。
+        let atomic_counts: Vec<std::sync::atomic::AtomicI32> = (0..n)
+            .map(|_| std::sync::atomic::AtomicI32::new(0))
+            .collect();
         let chunk = (reads.len() / (rayon::current_num_threads() * 4)).max(1);
-        let partials: Vec<Vec<i32>> = reads
-            .par_chunks(chunk)
-            .map(|ch| {
-                let mut local = vec![0i32; n];
-                for r in ch {
-                    if r.len() < k {
+        reads.par_chunks(chunk).for_each(|ch| {
+            for r in ch {
+                if r.len() < k {
+                    continue;
+                }
+                let mut val: KmerId = KmerId::ZERO;
+                let mut run = 0usize;
+                for j in 0..r.len() {
+                    match base_to_int(r[j]) {
+                        Some(v) => {
+                            val = ((val << 2) | KmerId::from(v)) & mask;
+                            run += 1;
+                        }
+                        None => {
+                            val = KmerId::ZERO;
+                            run = 0;
+                        }
+                    }
+                    if j + 1 < k {
                         continue;
                     }
-                    let mut val: KmerId = 0;
-                    let mut run = 0usize;
-                    for j in 0..r.len() {
-                        match base_to_int(r[j]) {
-                            Some(v) => {
-                                val = ((val << 2) | v as KmerId) & mask;
-                                run += 1;
-                            }
-                            None => {
-                                val = 0;
-                                run = 0;
-                            }
+                    if run >= k {
+                        if let Some(&i) = hidx.get(&val) {
+                            atomic_counts[i as usize].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         }
-                        if j + 1 < k {
-                            continue;
-                        }
-                        if run >= k {
-                            if let Some(&i) = hidx.get(&val) {
-                                local[i as usize] += 1;
-                            }
-                        } else {
-                            // 含非 GATC 窗: 大写后字节二分回退（原版语义）
-                            let ws = j + 1 - k;
-                            let w: Vec<u8> =
-                                r[ws..ws + k].iter().map(|c| c.to_ascii_uppercase()).collect();
-                            let i = data.partition_point(|x| x.as_slice() < w.as_slice());
-                            if i < data.len() && data[i].as_slice() == w.as_slice() {
-                                local[i] += 1;
-                            }
+                    } else {
+                        // 含非 GATC 窗: 大写后字节二分回退（原版语义）
+                        let ws = j + 1 - k;
+                        let w: Vec<u8> =
+                            r[ws..ws + k].iter().map(|c| c.to_ascii_uppercase()).collect();
+                        let i = data.partition_point(|x| x.as_slice() < w.as_slice());
+                        if i < data.len() && data[i].as_slice() == w.as_slice() {
+                            atomic_counts[i].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         }
                     }
                 }
-                local
-            })
-            .collect();
-        for p in &partials {
-            for (i, &c) in p.iter().enumerate() {
-                self.counts[i] += c;
             }
+        });
+        for (dst, src) in self.counts.iter_mut().zip(atomic_counts) {
+            *dst = src.into_inner();
         }
     }
 
@@ -243,6 +318,37 @@ impl NonRedKmerTable {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 刀M10: flat 竞技场形态与 Vec<Vec<u8>> 形态的模板表逐条一致
+    /// （同窗口多重集 → 同排序去重产物; 含短于 k 的跳过路径）。
+    #[test]
+    fn set_up_templates_flat_matches_vec_form() {
+        let templ: Vec<Vec<u8>> = vec![
+            b"ACGTTGCA".to_vec(),
+            b"ACGTTGC".to_vec(),
+            b"TTTTGGGGCC".to_vec(),
+            b"A".to_vec(),
+        ];
+        let arenas: Vec<(Vec<u8>, Vec<(usize, u32)>)> = templ
+            .iter()
+            .map(|v| {
+                let mut flat = Vec::new();
+                let mut spans = Vec::new();
+                if v.len() >= 4 {
+                    spans.push((0usize, v.len() as u32));
+                    flat.extend_from_slice(v);
+                }
+                (flat, spans)
+            })
+            .collect();
+        let a = NonRedKmerTable::set_up_templates(&templ, 4, false);
+        let b = NonRedKmerTable::set_up_templates_flat(&arenas, 4, false);
+        assert_eq!(a.len(), b.len());
+        assert_eq!(a.k(), b.k());
+        for (x, y) in a.data_ref().iter().zip(b.data_ref().iter()) {
+            assert_eq!(x, y);
+        }
+    }
 
     /// setUp：两模板窗口并集 → 字典序排序去重；counts 清零。
     /// ACGTTGCA → {ACGT,CGTT,GTTG,TTGC,TGCA}；ACGTTGC → {ACGT,CGTT,GTTG,TTGC}

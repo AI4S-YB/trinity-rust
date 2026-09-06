@@ -5,8 +5,8 @@ use thiserror::Error;
 #[derive(Debug, Error)]
 pub enum CommonError {
     /// sequenceUtil.cpp:260-261 "error, kmer length exceeds 32"（原版 u64 上限;
-    /// 本实现 KmerId=u128, 上限 64, 消息数字同步为新上限）
-    #[error("error, kmer length exceeds 64: {len}")]
+    /// 本实现 KmerId=U256, 上限 128, 消息数字同步为新上限）
+    #[error("error, kmer length exceeds 128: {len}")]
     KmerTooLong { len: usize },
 
     /// sequenceUtil.cpp:276-280 "error, kmer contains nongatc: {kmer}"

@@ -45,6 +45,9 @@ pub struct ComponentParams {
     pub name: String,
     /// 专用线程栈大小（递归逃生口；默认 256MB）。
     pub stack_size: usize,
+    /// **Rust 版扩展**: 搜索 0 产出的分量以 min_read_support=1 重试
+    /// （定向豁免, 默认 false = 原版; 见 PathSearchParams::retry_empty_comp）。
+    pub empty_retry: bool,
 }
 
 impl Default for ComponentParams {
@@ -59,6 +62,7 @@ impl Default for ComponentParams {
             path_reinforcement_distance: None,
             name: "component".to_string(),
             stack_size: 256 * 1024 * 1024,
+            empty_retry: false,
         }
     }
 }
@@ -148,6 +152,7 @@ fn run_component_inner(
         min_output_seq: params.min_len,
         min_read_support_thr: params.min_read_support,
         path_reinforcement_distance,
+        retry_empty_comp: params.empty_retry,
         ..PathSearchParams::default()
     };
     let post = PostProcessParams {

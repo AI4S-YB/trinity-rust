@@ -21,6 +21,7 @@ F2DB 串行段并行化 → 中期 checkpoint → 按探针数据定向取用优
 | **RTT + F2DB + partition** | **24.3 min** | 55% |
 | QuantifyGraph | 1.5 min | 3% |
 | butterfly + harvest | ~3 min | 7% |
+| 蛋白 stage | 0.7 min | 2% |
 
 已知结构问题：F2DB（`graph_per_record`）移植时被串行化（原版 OpenMP 并行）;
 RTT 已并行但仅 8 线程; dump 是 计数表→落盘→inchworm 读回 的三重浪费。
@@ -76,8 +77,8 @@ RTT 已并行但仅 8 线程; dump 是 计数表→落盘→inchworm 读回 的�
 
 - **Gate**: real-classic（10M PE, --CPU 8, 冷跑）wall ≤ 15 min
 - **护栏**:
-  - real-classic 的 R/P/F1/P_full 对比基线 ±0.1pp
-    （基线: 3.5/82.8/6.7/40.1/52.6）
+  - real-classic 与 real-pogflow 的 R/P/F1/P_full 对比基线 ±0.1pp
+    （基线: classic 3.5/82.8/6.7/40.1/52.6; pogflow 3.5/84.2/6.7/40.1/52.5）
   - dev1 classic 复跑指标持平
   - workspace 测试全绿
 - 速度与指标入档 opt-log「M7 性能」段

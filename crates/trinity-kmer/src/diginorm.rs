@@ -37,11 +37,12 @@ use std::path::{Path, PathBuf};
 
 use rayon::prelude::*;
 use trinity_common::error::CommonError;
+use rustc_hash::FxHashMap;
 use trinity_common::io_util::open_maybe_gz;
-use trinity_common::kmer::get_ds_kmer_val;
+use trinity_common::kmer::{KmerId, RollingKey};
 
-use crate::counter::{CountMap, KmerCountTable};
-use crate::coverage_stats::{coverage_stats_rows, CoverageStatsRow};
+use crate::counter::CountMap;
+use crate::coverage_stats::{coverage_stats_rows_of, CoverageStatsRow};
 use crate::drand48::Drand48;
 use crate::nbkc::{merge_pairs, select, MergedRow, NbkcParams, StatsRow};
 use crate::read_names::{core_read_name, fq_records_to_fa, ReadType};
@@ -174,18 +175,17 @@ pub fn run(
     let __t = std::time::Instant::now();
     match reads {
         ReadsInput::Paired(left_paths, right_paths) => {
-            // 两侧解压并行（IO 密集; 各侧独立, 汇合后语义不变）
-            let (l, r) = std::thread::scope(|s| {
-                let hl = s.spawn(|| read_side(left_paths));
-                let hr = s.spawn(|| read_side(right_paths));
-                (
-                    hl.join().expect("read_side left panic"),
-                    hr.join().expect("read_side right panic"),
-                )
-            });
-            let (left_raw, lf) = l?;
-            let (right_raw, rf) = r?;
-            lap!("read_side", __t);
+            // 读写+prep 按侧串行（刀M9, 2026-09-06 内存战役）: 旧形态双侧
+            // 解压并行 + 双侧 prep 并行使两侧 raw fq 缓冲（QM4 13.8GB）与
+            // 两侧 fa 产物（7.4GB）全程并存 ≈ 21-24GB——diginorm 段最终
+            // 约束; 串行峰值 = 在制侧 raw+fa + 已完成侧 fa ≈ 14GB。
+            // 墙钟代价 ≈ 解压/转换串行 ~+50s（内存战役口径下换取）。
+            // need_raw 判定提前到读右册之前——左册 raw 在不需要时先释放。
+            let (left_raw, lf) = read_side(left_paths)?;
+            let need_raw = !(params.fa_direct && lf == SeqFormat::Fq) || params.keep_fq;
+            let left_fa = prep_side(&left_raw, lf, ReadType::R1, params.ss_revcomp_left)?;
+            let left_raw = need_raw.then_some(left_raw);
+            let (right_raw, rf) = read_side(right_paths)?;
             let fmt = if lf != rf {
                 return Err(CommonError::FastqFormat(format!(
                     "Error, left is {lf:?} but right is {rf:?}; seqType must agree"
@@ -193,49 +193,44 @@ pub fn run(
             } else {
                 lf
             };
-            // 两侧 prep 并行（fq→fa 转换与命名规范, 各侧独立）
-            let (l, r) = std::thread::scope(|s| {
-                let hl =
-                    s.spawn(|| prep_side(&left_raw, fmt, ReadType::R1, params.ss_revcomp_left));
-                let hr =
-                    s.spawn(|| prep_side(&right_raw, fmt, ReadType::R2, params.ss_revcomp_right));
-                (hl.join().expect("prep left panic"), hr.join().expect("prep right panic"))
-            });
-            let left_fa = l?;
-            let right_fa = r?;
+            let right_fa = prep_side(&right_raw, fmt, ReadType::R2, params.ss_revcomp_right)?;
+            let right_raw = need_raw.then_some(right_raw);
+            lap!("read_side", __t);
             lap!("prep_side", __t);
             // both.fa 拼接语义 → 两侧分别计数再合并（计数多重集等价: ds 路径
             // 键已 canonical, 非 ds 的 canonical_merge_sum 是线性计数相加——
             // 分侧合并 = 拼接合并; 省全量拷贝与一次性大分配）。
-            // 两侧计数并行（各占 rayon 池一半, 中间表内存峰值 ~2× 单侧）:
-            // stats_query_table 是归一化最大段（QM4 663s/82%）。
-            let (tl, tr) = std::thread::scope(|s| {
-                let hl = s.spawn(|| stats_query_table(&left_fa, params));
-                let hr = s.spawn(|| stats_query_table(&right_fa, params));
-                (
-                    hl.join().expect("count left panic"),
-                    hr.join().expect("count right panic"),
-                )
-            });
-            let mut table = tl;
-            for (k2, c) in tr {
-                *table.entry(k2).or_insert(0) += c;
-            }
+            // 侧计数串行（刀M7a, 2026-09-06 内存战役）: 并行两侧时两套片表+
+            // 折叠输出同时在场（片表 hashbrown pow2 容量浪费 ~2.2×/侧, QM4
+            // 计数段棘轮实测 24.6GiB）; 串行下每侧独占 rayon 池, 总墙钟持平,
+            // 峰值减半。语义不变——两侧表本就各自构建后 merge_other。
+            let mut table = stats_query_table(&left_fa, params);
+            table.merge_other(stats_query_table(&right_fa, params));
             lap!("stats_query_table", __t);
             let left_rows = sorted_stats_rows(&left_fa, &table, params)?;
             let right_rows = sorted_stats_rows(&right_fa, &table, params)?;
             lap!("sorted_stats_rows", __t);
+            // 计数表此后无消费方（行选择/索引/抽取均不查表）——立即释放
+            // （QM4 合并表 ~4.1GB; 刀M7b）
+            drop(table);
             let merged = merge_pairs(&left_rows, &right_rows);
             let final_rows = merged_to_stats_rows(&merged);
             let selected = select_rows(&final_rows, params)?;
             lap!("select_rows", __t);
             let index = index_keys(&selected);
             lap!("index_keys", __t);
+            // 行集与中间产物此后无消费方（emit 只用 index）——释放
+            // （QM4 双侧行集+merged+selected ~3GB; 刀M7b）
+            drop(left_rows);
+            drop(right_rows);
+            drop(merged);
+            drop(final_rows);
+            drop(selected);
             // 两侧输出并行（抽取+写盘, 各侧独立）
             let (l, r) = std::thread::scope(|s| {
                 let hl = s.spawn(|| {
                     emit_side(
-                        &left_raw,
+                        left_raw.as_deref(),
                         &left_fa,
                         fmt,
                         params,
@@ -249,7 +244,7 @@ pub fn run(
                 });
                 let hr = s.spawn(|| {
                     emit_side(
-                        &right_raw,
+                        right_raw.as_deref(),
                         &right_fa,
                         fmt,
                         params,
@@ -276,12 +271,18 @@ pub fn run(
         ReadsInput::Single(paths) => {
             let (raw, fmt) = read_side(paths)?;
             let fa = prep_side(&raw, fmt, ReadType::R1, params.ss_revcomp_left)?;
+            // 同双侧: fa_direct+fq 且不 keep_fq 时 raw 提前释放
+            let need_raw = !(params.fa_direct && fmt == SeqFormat::Fq) || params.keep_fq;
+            let raw = need_raw.then_some(raw);
             let table = stats_query_table(&fa, params);
             let rows = sorted_stats_rows(&fa, &table, params)?;
+            drop(table); // 同双侧: 行阶段后无消费方（刀M7b）
             let selected = select_rows(&rows, params)?;
             let index = index_keys(&selected);
+            drop(rows); // emit 只用 index（刀M7b）
+            drop(selected);
             let (out, out_fmt) = emit_side(
-                &raw,
+                raw.as_deref(),
                 &fa,
                 fmt,
                 params,
@@ -307,8 +308,11 @@ pub fn run(
 /// 名字规范/SS revcomp 在 prep 阶段已完成, 抽取产物与 fq→fa 往返逐字节一致）;
 /// `keep_fq` 时额外再写一份原格式 fq（trinity-cli --no_cleanup 语义）。
 /// 返回（主产物长名路径, 实际格式）。
+///
+/// `raw` 为 None = 调用方已按"fa_direct+fq 且不 keep_fq"判定提前释放
+/// （该形态 emit 不读 raw; 需要 raw 的分支上 None 即编程错误）。
 fn emit_side(
-    raw: &[u8],
+    raw: Option<&[u8]>,
     fa: &[u8],
     fmt: SeqFormat,
     params: &DigiNormParams,
@@ -321,13 +325,23 @@ fn emit_side(
         write_convenience(&out, dst.dir, dst.side, SeqFormat::Fa)?;
         if params.keep_fq {
             let fq = normalized_out_path(dst.dir, dst.base, SeqFormat::Fq, params);
-            extract_to_file(raw, fmt, index, &fq)?;
+            extract_to_file(
+                raw.expect("keep_fq 形态 emit 需要 raw（need_raw 判定不一致）"),
+                fmt,
+                index,
+                &fq,
+            )?;
             write_convenience(&fq, dst.dir, dst.side, SeqFormat::Fq)?;
         }
         Ok((out, SeqFormat::Fa))
     } else {
         let out = normalized_out_path(dst.dir, dst.base, fmt, params);
-        extract_to_file(raw, fmt, index, &out)?;
+        extract_to_file(
+            raw.expect("非 fa_direct+fq 形态 emit 需要 raw（need_raw 判定不一致）"),
+            fmt,
+            index,
+            &out,
+        )?;
         write_convenience(&out, dst.dir, dst.side, fmt)?;
         Ok((out, fmt))
     }
@@ -496,16 +510,144 @@ fn revcomp_fasta_mirror(data: &[u8]) -> Vec<u8> {
 
 // ---------------------------------------------------------------- 计数（dump -L 语义）
 
+/// 归一化计数表三分派（性能分层, 2026-09-02; 2026-09-04 加 u64 层）:
+/// k≤32 走 u64 最紧凑键（diginorm k=25 主路径, 键带宽减半）, k≤64 走 u128
+/// （24B/槽 vs KmerId 表 40B/槽）, k>64 落 KmerId 全宽。表只活在 diginorm
+/// 内部（计数→过滤→canonical 合并→逐 read 查表）, 键不外泄到管线其他环节。
+#[derive(PartialEq, Debug)]
+enum CountTable {
+    S(FxHashMap<u64, u32>),
+    N(FxHashMap<u128, u32>),
+    W(CountMap),
+}
+
+impl CountTable {
+    fn build(both_fa: &[u8], params: &DigiNormParams) -> Self {
+        // 分片共享表计数 + 折叠过滤（刀2 分片化, 2026-09-05; 刀M12 折叠带
+        // min_kmer_cov 过滤——与全量折叠后 retain_min 恒等, 输出表免为
+        // 单例错误 k-mer（QM4 ~30-40% distinct）付容量, 侧折叠瞬时同步降）。
+        if params.k <= 32 {
+            CountTable::S(crate::counter::count_fasta_data_of_sharded_min::<u64>(
+                both_fa,
+                params.k,
+                params.ds,
+                0,
+                params.min_kmer_cov_const,
+            ))
+        } else if params.k <= 64 {
+            CountTable::N(crate::counter::count_fasta_data_of_sharded_min::<u128>(
+                both_fa,
+                params.k,
+                params.ds,
+                0,
+                params.min_kmer_cov_const,
+            ))
+        } else {
+            CountTable::W(crate::counter::count_fasta_data_of_sharded_min::<KmerId>(
+                both_fa,
+                params.k,
+                params.ds,
+                0,
+                params.min_kmer_cov_const,
+            ))
+        }
+    }
+
+    /// 同 k 构建 → 变体恒同; 跨变体合并在此为编程错误（debug_assert 兜底丢弃）。
+    fn merge_other(&mut self, other: CountTable) {
+        match (self, other) {
+            (CountTable::S(a), CountTable::S(b)) => {
+                for (k2, c) in b {
+                    *a.entry(k2).or_insert(0) += c;
+                }
+            }
+            (CountTable::N(a), CountTable::N(b)) => {
+                for (k2, c) in b {
+                    *a.entry(k2).or_insert(0) += c;
+                }
+            }
+            (CountTable::W(a), CountTable::W(b)) => {
+                for (k2, c) in b {
+                    *a.entry(k2).or_insert(0) += c;
+                }
+            }
+            (this, other) => {
+                debug_assert!(false, "CountTable 变体不一致（k 约定被破坏）");
+                let _ = (this, other);
+            }
+        }
+    }
+
+    fn retain_min(&mut self, min: u32) {
+        match self {
+            CountTable::S(m) => m.retain(|_, c| *c >= min),
+            CountTable::N(m) => m.retain(|_, c| *c >= min),
+            CountTable::W(m) => m.retain(|_, c| *c >= min),
+        }
+    }
+
+    fn canonical_merge_sum(self, k: usize) -> Self {
+        match self {
+            CountTable::S(m) => CountTable::S(canonical_merge_sum_of(m, k)),
+            CountTable::N(m) => CountTable::N(canonical_merge_sum_of(m, k)),
+            CountTable::W(m) => CountTable::W(canonical_merge_sum_of(m, k)),
+        }
+    }
+
+    /// stats 阶段恒 DS（见模块文档）
+    fn coverage_rows(
+        &self,
+        reads_fa: &[u8],
+        k: usize,
+    ) -> Result<Vec<CoverageStatsRow>, CommonError> {
+        match self {
+            CountTable::S(m) => coverage_stats_rows_of::<u64>(reads_fa, m, k, true),
+            CountTable::N(m) => coverage_stats_rows_of::<u128>(reads_fa, m, k, true),
+            CountTable::W(m) => coverage_stats_rows_of::<KmerId>(reads_fa, m, k, true),
+        }
+    }
+
+    /// 测试访问器: 以全宽键查计数（u64/u128 分支要求高位为 0, 域内恒真）
+    #[cfg(test)]
+    fn get(&self, key: &KmerId) -> Option<u32> {
+        match self {
+            CountTable::S(m) => {
+                debug_assert!(key.hi == 0 && key.lo <= u64::MAX as u128);
+                m.get(&(key.lo as u64)).copied()
+            }
+            CountTable::N(m) => {
+                debug_assert!(key.hi == 0);
+                m.get(&key.lo).copied()
+            }
+            CountTable::W(m) => m.get(key).copied(),
+        }
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        match self {
+            CountTable::S(m) => m.len(),
+            CountTable::N(m) => m.len(),
+            CountTable::W(m) => m.len(),
+        }
+    }
+
+    #[cfg(test)]
+    fn contains_key(&self, key: &KmerId) -> bool {
+        self.get(key).is_some()
+    }
+}
+
 /// stats 查表（对齐原版管道 "jellyfish count → dump -L → fastaToKmerCoverageStats 装载" 三步）:
 /// 计数 → -L 过滤 → SS 模式再做 canonical 合并求和。DS 计数的表已 canonical，合并为
 /// 恒等映射，直接原样返回（等价于只对 literal 计数表做 [`canonical_merge_sum`]）。
-/// 时序推理见 [`canonical_merge_sum`] 的注记。
-fn stats_query_table(both_fa: &[u8], params: &DigiNormParams) -> CountMap {
+/// 时序推理见 [`canonical_merge_sum_of`] 的注记。
+fn stats_query_table(both_fa: &[u8], params: &DigiNormParams) -> CountTable {
     let filtered = filtered_counts(both_fa, params);
     if params.ds {
         filtered // 已是 canonical 键（jellyfish --canonical），add_kmer 合并为恒等映射
     } else {
-        canonical_merge_sum(filtered, params.k)
+        filtered.canonical_merge_sum(params.k)
     }
 }
 
@@ -517,24 +659,29 @@ fn stats_query_table(both_fa: &[u8], params: &DigiNormParams) -> CountMap {
 /// M7-norm: 过滤用 retain 原地删（避免重建第二张表）; 预留 per-thread 槽位
 /// （count_fasta_data_with_capacity）减少生长 rehash。两者与旧路径多重集等价
 /// （KmerCountTable::count_fasta_data_with_capacity 的等价测试）。
-fn filtered_counts(both_fa: &[u8], params: &DigiNormParams) -> CountMap {
-    let mut table = KmerCountTable::count_fasta_data_with_capacity(both_fa, params.k, params.ds, 0);
-    table.retain(|_, c| *c >= params.min_kmer_cov_const);
+fn filtered_counts(both_fa: &[u8], params: &DigiNormParams) -> CountTable {
+    let mut table = CountTable::build(both_fa, params);
+    table.retain_min(params.min_kmer_cov_const);
     table
 }
 
-/// KmerCounter.cpp:476-487 add_kmer 的 DS 装载语义: 键 canonical 化（get_DS_kmer_val）
-/// 后 `_kmer_counter[kmer_val] += count` 求和——两条互补链的计数在此合并。
+/// KmerCounter.cpp:476-487 add_kmer 的 DS 装载语义: 键 canonical 化（get_DS_kmer_val
+/// 等价式 max(key, revcomp)）后 `_kmer_counter[kmer_val] += count` 求和——两条互补
+/// 链的计数在此合并。
 ///
 /// **先 -L 过滤、后合并**（时序承重）: 原版管道序是 `dump -L` 过滤计数表 → stats 工具
 /// add_kmer 求和装载。DS 下 canonical 计数就是合并后的计数（jellyfish 计数时已合并），
 /// 两种时序等价; SS 下两条链各 literal 计数 1 的 kmer 先被 dump -L 丢弃、**不参与**合并
 /// （canonical 键缺失 → 查表侧 clamp 1）; 若先合并再过滤会错得计数 2。
 /// fixtures/p1/diginorm 的 ssB1（左 1 份 + 右 2 份互补，正确 median 2）锁定该序。
-fn canonical_merge_sum(table: CountMap, k: usize) -> CountMap {
-    let mut merged: CountMap = CountMap::default();
+fn canonical_merge_sum_of<K: RollingKey>(
+    table: FxHashMap<K, u32>,
+    k: usize,
+) -> FxHashMap<K, u32> {
+    let mut merged: FxHashMap<K, u32> = FxHashMap::default();
     for (key, count) in table {
-        let canon = get_ds_kmer_val(key, k);
+        let rc = key.revcomp(k);
+        let canon = if rc > key { rc } else { key };
         *merged.entry(canon).or_insert(0) += count;
     }
     merged
@@ -554,10 +701,10 @@ fn canonical_merge_sum(table: CountMap, k: usize) -> CountMap {
 /// stats 阶段恒 DS。SS 模式的 canonical 化已在 [`stats_query_table`] 的表侧完成。
 fn sorted_stats_rows(
     reads_fa: &[u8],
-    counts: &CountMap,
+    counts: &CountTable,
     params: &DigiNormParams,
 ) -> Result<Vec<StatsRow>, CommonError> {
-    let rows = coverage_stats_rows(reads_fa, counts, params.k, true)?;
+    let rows = counts.coverage_rows(reads_fa, params.k)?;
     let mut lines = stats_lines(&rows);
     // M7-norm: 并行排序 + 并行 parse 回（行序由比较器全序决定，acc 唯一 → 结果确定）。
     lines.par_sort_by(|a, b| {
@@ -671,22 +818,30 @@ fn is_word_byte(b: u8) -> bool {
 
 /// 扫描原始输入抽取命中记录写入 out 文件。返回后校验名单全部命中
 /// （原版 die "not all specified records have been retrieved"，文件已写出，镜像）。
+///
+/// 流式写（刀M7c, 2026-09-06 内存战役）: 旧实现把全部输出先攒进 `out: Vec<u8>`
+/// （QM4 每侧 ~2GB, 双侧 emit 并行叠加）且 fq 路径每命中另拷一条记录 Vec
+/// （再 +一整份输出）——改 BufWriter 边扫边写（命中记录从 data 原位切片,
+/// 零拷贝）。与旧版字节序一致; 错误路径（fq 格式错）下会留下部分写出文件
+/// （旧版不落文件）——调用方错误即中止, 无消费方。
 fn extract_to_file(
     data: &[u8],
     fmt: SeqFormat,
     index: &HashSet<String>,
     out_path: &Path,
 ) -> Result<(), CommonError> {
-    let mut out = Vec::new();
-    let mut found: HashSet<String> = HashSet::new();
-    match fmt {
-        SeqFormat::Fq => extract_fq_records(data, index, &mut out, &mut found)?,
-        SeqFormat::Fa => extract_fa_records(data, index, &mut out, &mut found)?,
-    }
+    use std::io::Write;
     if let Some(parent) = out_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(out_path, &out)?;
+    let file = std::fs::File::create(out_path)?;
+    let mut w = std::io::BufWriter::with_capacity(1 << 22, file);
+    let mut found: HashSet<String> = HashSet::new();
+    match fmt {
+        SeqFormat::Fq => extract_fq_records(data, index, &mut w, &mut found)?,
+        SeqFormat::Fa => extract_fa_records(data, index, &mut w, &mut found)?,
+    }
+    w.flush()?;
     let missing: Vec<&String> = index.difference(&found).collect();
     if !missing.is_empty() {
         return Err(CommonError::FastqFormat(format!(
@@ -702,18 +857,21 @@ fn extract_to_file(
     Ok(())
 }
 
-/// fq 抽取 — Fastq_reader.pm 的字节级 4 行扫描（**不做 UTF-8 校验、原始字节透传**，
+/// fq 抽取 — Fastq_reader.pm 的字节级 4 行扫描（**不做 UTF-8 校验、原始字节透传**,
 /// P5 字节路径的前置）: 每次取 4 条原始行（空行也是一行、\r 保留、末行可无 \n）;
 /// 首 token（'@' 后、kseq isspace 前）经 [`core_read_name`] 查名单; 命中输出原始 4 行。
 /// 错误镜像 Perl confess: 少于 4 行 / 首行不以 '@' 开始。
 ///
 /// M7-norm: 记录互独立 → 先串行定位各记录起点（行扫描），再 rayon 并行逐记录
-/// 判定/拷贝，最后按原顺序串行拼接（out 字节序、found 集合与串行版恒等;
+/// 判定, 最后按原顺序串行拼接（out 字节序、found 集合与串行版恒等;
 /// 错误取最低记录序——rayon Result collect 的 leftmost 语义）。
+/// 刀M7c（2026-09-06）: 命中产物从 `(String, Vec<u8>)`（每命中整条记录拷贝,
+/// QM4 21.5M 命中 ≈ 再攒一整份输出）改为 `(String, span)`——输出字节由
+/// data[pos..end] 原位切片流出, 逐命中写 BufWriter。
 fn extract_fq_records(
     data: &[u8],
     index: &HashSet<String>,
-    out: &mut Vec<u8>,
+    w: &mut impl std::io::Write,
     found: &mut HashSet<String>,
 ) -> Result<(), CommonError> {
     // pass 1: 记录起点（每记录 4 行; 残尾也是一条记录 → 错误路径）
@@ -734,8 +892,8 @@ fn extract_fq_records(
         }
         pos = p;
     }
-    // pass 2: 并行逐记录（逻辑与串行版逐行同构）
-    type MaybeHit = Option<(String, Vec<u8>)>;
+    // pass 2: 并行逐记录（逻辑与串行版逐行同构）; 命中 = (acc, 记录区间)
+    type MaybeHit = Option<(String, usize, usize)>;
     let hits: Result<Vec<MaybeHit>, CommonError> = starts
         .par_iter()
         .map(|&pos| {
@@ -774,18 +932,16 @@ fn extract_fq_records(
             let token = first_token(&name_line[1..]);
             let acc = core_read_name(&String::from_utf8_lossy(token));
             if index.contains(&acc) {
-                let mut bytes = Vec::with_capacity(record.iter().map(|l| l.len()).sum());
-                for l in record {
-                    bytes.extend_from_slice(l);
-                }
-                Ok(Some((acc, bytes)))
+                // 记录区间 [pos, p) = 原始 4 行（含行尾; 末行可无 \n）——
+                // 与旧版逐行 concat 的输出字节恒等
+                Ok(Some((acc, pos, p)))
             } else {
                 Ok(None)
             }
         })
         .collect();
-    for (acc, bytes) in hits?.into_iter().flatten() {
-        out.extend_from_slice(&bytes);
+    for (acc, start, end) in hits?.into_iter().flatten() {
+        w.write_all(&data[start..end])?;
         found.insert(acc);
     }
     Ok(())
@@ -799,7 +955,7 @@ fn extract_fq_records(
 fn extract_fa_records(
     data: &[u8],
     index: &HashSet<String>,
-    out: &mut Vec<u8>,
+    w: &mut impl std::io::Write,
     found: &mut HashSet<String>,
 ) -> Result<(), CommonError> {
     // 分块: "\n>" 为界（首块 = 首个 "\n>" 前）
@@ -844,11 +1000,11 @@ fn extract_fa_records(
         let acc = strip_pair_suffix(&String::from_utf8_lossy(token));
         if index.contains(&acc) {
             found.insert(acc);
-            out.extend_from_slice(b">");
-            out.extend_from_slice(header);
-            out.push(b'\n');
-            out.extend_from_slice(&sequence);
-            out.push(b'\n');
+            w.write_all(b">")?;
+            w.write_all(header)?;
+            w.write_all(b"\n")?;
+            w.write_all(&sequence)?;
+            w.write_all(b"\n")?;
         }
     }
     Ok(())
@@ -1033,12 +1189,12 @@ mod tests {
         let fa = b">a\nAAAA\n>b\nAAAA\n>c\nCCCC\n";
         let t = filtered_counts(fa, &p);
         use trinity_common::kmer::kmer_to_intval;
-        assert_eq!(t[&kmer_to_intval(b"AAAA").unwrap()], 2);
+        assert_eq!(t.get(&kmer_to_intval(b"AAAA").unwrap()).unwrap(), 2);
         assert!(!t.contains_key(&kmer_to_intval(b"CCCC").unwrap()));
         // min_kmer_cov_const=1 → 全表（"count>=1 全在表 + 查表缺失按 1"的等价路径 sanity）
         p.min_kmer_cov_const = 1;
         assert_eq!(
-            filtered_counts(fa, &p)[&kmer_to_intval(b"CCCC").unwrap()],
+            filtered_counts(fa, &p).get(&kmer_to_intval(b"CCCC").unwrap()).unwrap(),
             1
         );
     }
@@ -1060,10 +1216,10 @@ mod tests {
         let fa = b">a\nACGA\n>b\nACGA\n>c\nTCGT\n";
         let table = stats_query_table(fa, &p);
         assert_eq!(table.len(), 1);
-        assert_eq!(table[&kmer_to_intval(b"TCGT").unwrap()], 2);
+        assert_eq!(table.get(&kmer_to_intval(b"TCGT").unwrap()).unwrap(), 2);
         // 对照: dump -L 表（未合并）仍是 literal 键
         let dump = filtered_counts(fa, &p);
-        assert_eq!(dump[&kmer_to_intval(b"ACGA").unwrap()], 2);
+        assert_eq!(dump.get(&kmer_to_intval(b"ACGA").unwrap()).unwrap(), 2);
         assert!(!dump.contains_key(&kmer_to_intval(b"TCGT").unwrap()));
         // DS 路径: 表已 canonical，stats_query_table 与 filtered_counts 恒等
         let pds = DigiNormParams {
@@ -1086,7 +1242,7 @@ mod tests {
         };
         let fa = b">r\nACGA\n>r2\nACGA\n>s\nTCGT\n>s2\nTCGT\n";
         let table = stats_query_table(fa, &p);
-        assert_eq!(table[&kmer_to_intval(b"TCGT").unwrap()], 4);
+        assert_eq!(table.get(&kmer_to_intval(b"TCGT").unwrap()).unwrap(), 4);
         let rows = sorted_stats_rows(fa, &table, &p).unwrap();
         // 两 read 的全部窗口查同一 canonical 键 → median 4（buggy 版: r 命中 literal 2、
         // s 查 literal 缺失 clamp 1）

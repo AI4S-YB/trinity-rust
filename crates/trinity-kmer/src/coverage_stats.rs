@@ -13,9 +13,10 @@
 use std::io::{BufReader, Write};
 
 use rayon::prelude::*;
+use rustc_hash::FxHashMap;
 use trinity_common::error::CommonError;
 use trinity_common::fasta::FastaReader;
-use trinity_common::kmer::{base_to_int, get_ds_kmer_val, kmer_to_intval, KmerId};
+use trinity_common::kmer::{base_to_int, get_ds_kmer_val, kmer_to_intval, KmerId, RollingKey};
 
 use crate::counter::CountMap;
 
@@ -66,8 +67,20 @@ pub fn stdev_f32(vals: &[u32]) -> f32 {
 
 /// cpp L300-335 compute_kmer_coverage。`seq` 应已过 Fasta_reader 预处理
 /// （大写 + 去空白）; 小写 gatc 仍按同码接受，其余字符使所在窗口计数按 1。
-/// 序列长度 < k 时返回空向量（并对 stderr 发原版逐字警告——seq 与 "is" 间无空格）。
+/// 性能分层: 泛型核心 [`kmer_coverage_vector_of`]（u128 紧凑键 / KmerId）,
+/// 本函数 = KmerId 实例化。
 pub fn kmer_coverage_vector(seq: &[u8], counts: &CountMap, k: usize, ds: bool) -> Vec<u32> {
+    kmer_coverage_vector_of::<KmerId>(seq, counts, k, ds)
+}
+
+/// 逐 read k-mer 覆盖查表泛型核心（diginorm 热路径: 每条 read 每 kmer 一次
+/// get; u128 表 24B/槽 vs KmerId 表 40B/槽, 表 footprint 缩 40%）。
+pub fn kmer_coverage_vector_of<K: RollingKey>(
+    seq: &[u8],
+    counts: &FxHashMap<K, u32>,
+    k: usize,
+    ds: bool,
+) -> Vec<u32> {
     if seq.len() < k {
         eprintln!(
             "Sequence: {}is smaller than {} base pairs, skipping",
@@ -76,33 +89,28 @@ pub fn kmer_coverage_vector(seq: &[u8], counts: &CountMap, k: usize, ds: bool) -
         );
         return Vec::new();
     }
-    let mask: KmerId = if k >= trinity_common::kmer::MAX_KMER_LENGTH {
-        KmerId::MAX
-    } else {
-        (1u128 << (2 * k as u32)) - 1
-    };
+    let mask: K = K::low_mask(k);
     let mut coverage = Vec::with_capacity(seq.len() - k + 1);
-    let mut kmer: KmerId = 0;
+    let mut kmer: K = K::zero();
     let mut valid = 0usize; // 当前位置为止连续 gatc 计数; < k ⇒ 窗口含非 gatc
                             // M7-norm: 滚动 revcomp（数值恒等见 counter::for_each_kmer 注记）。
-                            // u128 扩容: rev_shift = 2k-2 ≤ 126（k≤64）恒安全, 不再限 k≤32。
     let use_rolling = ds && k <= trinity_common::kmer::MAX_KMER_LENGTH;
     let rev_shift: u32 = (2 * k - 2) as u32;
-    let mut rev: KmerId = 0;
+    let mut rev: K = K::zero();
     for (i, &c) in seq.iter().enumerate() {
         match base_to_int(c) {
             Some(v) => {
-                kmer = ((kmer << 2) | v as KmerId) & mask;
+                kmer = kmer.roll_forward(v, mask);
                 if use_rolling {
-                    rev = ((rev >> 2) | (((v ^ 3) as KmerId) << rev_shift)) & mask;
+                    rev = rev.roll_rev(v, rev_shift, mask);
                 }
                 if valid < k {
                     valid += 1;
                 }
             }
             None => {
-                kmer = 0;
-                rev = 0;
+                kmer = K::zero();
+                rev = K::zero();
                 valid = 0;
             }
         }
@@ -116,7 +124,8 @@ pub fn kmer_coverage_vector(seq: &[u8], counts: &CountMap, k: usize, ds: bool) -
                         kmer
                     }
                 } else if ds {
-                    get_ds_kmer_val(kmer, k)
+                    let rc = kmer.revcomp(k);
+                    if rc > kmer { rc } else { kmer }
                 } else {
                     kmer
                 };
@@ -188,6 +197,19 @@ pub fn coverage_stats_rows(
     k: usize,
     ds: bool,
 ) -> Result<Vec<CoverageStatsRow>, CommonError> {
+    coverage_stats_rows_of::<KmerId>(reads_fa, counts, k, ds)
+}
+
+/// 泛型核心（u128 紧凑键 / KmerId）; 并行 rayon 路径与串行回落同构。
+pub fn coverage_stats_rows_of<K>(
+    reads_fa: &[u8],
+    counts: &FxHashMap<K, u32>,
+    k: usize,
+    ds: bool,
+) -> Result<Vec<CoverageStatsRow>, CommonError>
+where
+    K: RollingKey + Sync,
+{
     match split_fasta_line_records(reads_fa) {
         Some(records) => Ok(records
             .par_iter()
@@ -202,7 +224,7 @@ pub fn coverage_stats_rows(
                 if seq.is_empty() {
                     return None; // 空 seq 记录跳过（原版 continue）
                 }
-                let cov = kmer_coverage_vector(&seq, counts, k, ds);
+                let cov = kmer_coverage_vector_of::<K>(&seq, counts, k, ds);
                 // cpp median_coverage 按值传参——排序发生在副本上; mean/stDev 用**原序**向量
                 // （f32 累加对顺序敏感，先排序会改变 stdev 舍入，实测 3 ulp 差异）
                 let mut sorted = cov.clone();
@@ -215,7 +237,7 @@ pub fn coverage_stats_rows(
                 })
             })
             .collect()),
-        None => coverage_stats_rows_serial(reads_fa, counts, k, ds),
+        None => coverage_stats_rows_serial_of::<K>(reads_fa, counts, k, ds),
     }
 }
 
@@ -290,20 +312,22 @@ fn fasta_accession(header_line: &[u8]) -> String {
         .to_string()
 }
 
-/// 串行原路径（错误逐字保真 + oracle 对拍基准）。
-fn coverage_stats_rows_serial(
+fn coverage_stats_rows_serial_of<K>(
     reads_fa: &[u8],
-    counts: &CountMap,
+    counts: &FxHashMap<K, u32>,
     k: usize,
     ds: bool,
-) -> Result<Vec<CoverageStatsRow>, CommonError> {
+) -> Result<Vec<CoverageStatsRow>, CommonError>
+where
+    K: RollingKey,
+{
     let mut rows = Vec::new();
     let mut reader = FastaReader::new(BufReader::new(reads_fa));
     while let Some(rec) = reader.next_record()? {
         if rec.sequence.is_empty() {
             continue;
         }
-        let cov = kmer_coverage_vector(rec.sequence.as_bytes(), counts, k, ds);
+        let cov = kmer_coverage_vector_of::<K>(rec.sequence.as_bytes(), counts, k, ds);
         let mut sorted = cov.clone();
         rows.push(CoverageStatsRow {
             acc: rec.accession,
@@ -539,4 +563,14 @@ mod tests {
         assert_eq!(par, ser);
         assert_eq!(par.len(), 1);
     }
+}#[cfg(test)]
+fn coverage_stats_rows_serial(
+    reads_fa: &[u8],
+    counts: &CountMap,
+    k: usize,
+    ds: bool,
+) -> Result<Vec<CoverageStatsRow>, CommonError> {
+    coverage_stats_rows_serial_of::<KmerId>(reads_fa, counts, k, ds)
 }
+
+

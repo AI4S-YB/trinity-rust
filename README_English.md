@@ -22,9 +22,9 @@ Common options (same names as the upstream `Trinity` script):
 | `--left/--right` | PE reads (comma-separated for multiple files); `--single` for SE |
 | `--SS_lib_type F\|R\|RF\|FR` | Strand-specific library (RF/FR = PE) |
 | `--CPU/--max_memory` | Thread count / memory guardrail |
-| `--KMER_SIZE` (alias `__KMER_SIZE`, default 25) | inchworm k-mer size (**ignored when multi-k is on**) |
-| `--multi-k auto\|k1,k2,...` (default auto) | **Multi-k iterative assembly**: trusted contigs from lower-k rounds are injected into higher-k rounds (k chosen by the rnaSPAdes formula, supported up to k≤63); `--no-multi-k` falls back to single-k |
-| `--inchworm_cpu` (default min(6,CPU)) | inchworm parallelism (upstream-faithful default; raise it on many-core machines) |
+| `--KMER_SIZE` (alias `__KMER_SIZE`, default 25) | inchworm k-mer size; given alone (without `--multi-k`/`--no-multi-k`) implies single-k mode with a warning |
+| `--multi-k auto\|k1,k2,...` (extension, **default `auto`**) | rnaSPAdes-style multi-k iteration + trusted contig injection; `auto` picks k from read length (RL=76 → [29,37]); explicit lists must be strictly increasing, k∈[15,63] |
+| `--no-multi-k` (extension) | Fall back to classic single-k (k = `--KMER_SIZE`); mutually exclusive with explicit `--multi-k` |
 | `--min_kmer_cov` (alias `--min_kmer_count`) | k-mer count cutoff |
 | `--normalize_max_read_cov` / `--no_normalize_reads` | Normalization cap / skip normalization |
 | `--bfly_stack_mb` | Butterfly thread stack (extension of this port; defaults to match upstream JVM stack behavior) |
@@ -87,7 +87,11 @@ Longer reads and more complex transcriptomes benefit more; on 150bp real data th
 
 **Option aliases**: `__KMER_SIZE` → `--KMER_SIZE`, `--min_kmer_cov` → `--min_kmer_count` (both spellings accepted, compatible with the upstream main program).
 
-**Extension**: `--bfly_stack_mb` explicitly controls the Butterfly worker thread stack limit (upstream derives this implicitly from the JVM `-Xss` setting).
+**Extension**: `--bfly_stack_mb` explicitly controls the Butterfly worker thread stack limit (upstream derives this implicitly from the JVM `-Xss` setting). `--multi-k` (rnaSPAdes-style multi-k iteration + trusted contig injection) **is the default since 2026-08-30** (absent any flag it resolves to `auto`); `--no-multi-k` falls back to classic single-k. Special case: with `--path-engine gtasm` and no explicit `--multi-k`, the run is forced to single-k with a warning (gtasm has only been validated on k=25 graphs; an explicit `--multi-k` overrides, also with a warning). The pipeline logs the effective k sequence at startup (`multi-k: auto → [29, 37]` / `single-k: 25`).
+
+**Intermediate layout (performance, accepted difference)**: `chrysalis/Component_bins/Cbin*/` no longer holds per-component `cN.graph.out` / `cN.graph.reads` / `cN.graph.allProbPaths.fasta` files (28k components ≈ 85k small files — prohibitive metadata round-trips on NFS). Instead each Cbin has two packed stores: `graphs.pack`/`graphs.idx` (QuantifyGraph output) and `butterfly.pack`/`butterfly.idx` (Butterfly output); the `.idx` is a fixed-size 32-byte record stream (component id / kind / offset / len, little-endian). The normalization `left.norm.*` convenience names are hard links to the long-named files (upstream uses symlinks) instead of physical duplicate writes.
+
+**Normalization output format (fq input)**: fq input now yields normalized **fa** directly (`left.norm.fa` / `{name}.normalized_K….fa`), skipping the full materialization of `norm.fq` and the downstream fq→fa pass — normalization already converts fq→fa internally, so selected records are extracted from the in-memory fa, byte-identical to "write fq then convert" (locked by tests). Upstream leaves the normalized fq for the user; this port **no longer keeps norm.fq by default** — use `--no_cleanup` if you need it (both fq and fa are then written).
 
 **Intermediate layout (performance, accepted difference)**: `chrysalis/Component_bins/Cbin*/` no longer holds per-component `cN.graph.out` / `cN.graph.reads` / `cN.graph.allProbPaths.fasta` files (28k components ≈ 85k small files — prohibitive metadata round-trips on NFS). Instead each Cbin has two packed stores: `graphs.pack`/`graphs.idx` (QuantifyGraph output) and `butterfly.pack`/`butterfly.idx` (Butterfly output); the `.idx` is a fixed-size 32-byte record stream (component id / kind / offset / len, little-endian). The normalization `left.norm.*` convenience names are hard links to the long-named files (upstream uses symlinks) instead of physical duplicate writes.
 
@@ -101,80 +105,24 @@ Longer reads and more complex transcriptomes benefit more; on 150bp real data th
 
 ## Performance summary
 
-See `docs/benchmarks.md` (per-stage cross-checks and thread scaling) and `docs/opt-log.md` (end-to-end optimization log) for full records.
+See `docs/benchmarks.md` (per-stage cross-checks) and `docs/opt-log.md` (end-to-end optimization log) for details.
 
-**End-to-end (real data: Arabidopsis DRR095137 prefix subset, 10M PE reads, ~1.1 GB gz):**
+**Compared to upstream Trinity v2.15.2 (C++/Perl/Java toolchain):**
 
-| Version | 8 threads | 64 threads | Notes |
-|---|---|---|---|
-| v0.0.1 (straight port) | ~54 min | not measured | porting baseline, metrics anchored to upstream |
-| v0.3.0 | ~17 min | 12:29 | algorithmic optimizations (see below) |
-| v0.4.0 | 11:20 (-79%) | 7:37 | IO/system-overhead optimizations |
-| **v0.5.0** | see note below | — | multi-k by default + hotspot optimizations |
+- k-mer count+dump: ~3.2× faster than jellyfish count+dump at ~1/7 peak memory, with byte-equivalent output multisets (sample_data PE 100k reads, 4 threads).
+- inchworm: ~2× faster, ~14% lower peak RSS (single-threaded).
+- chrysalis full chain: ~1/3.2 peak RSS (147 MB vs 466 MB).
+- butterfly: nearly an order of magnitude faster on small components with ~27× lower peak RSS (no JVM startup/baseline overhead).
+- End-to-end full sample_data run (30575 PE reads, 8 threads): this port ~9 s vs upstream (incl. Perl/JVM) ~26 s.
 
-**v0.5.0 end-to-end (larger real data: 21.35M pairs of 150bp PE reads, ~436Mb-genome species, 32 threads):**
+**Compared to this project's v0.0.1 straight port (end-to-end speed work in the current version):**
 
-| Version | wall | key changes |
-|---|---|---|
-| v0.4.0 basis | ~137 min | — |
-| **v0.5.0** | **~31 min (4.2×)** | multi-k [49,63] iteration + hotspot optimizations below |
-
-v0.5.0 hotspot optimizations (all verified byte-identical or golden-file equivalent; assembly metrics unchanged):
-
-- **kmer_load elimination**: the inchworm count table is passed in-memory and move-constructed (skipping the ~4 GB counts_bin read-back and a second hash-table build; ~10 min → ~0 per round).
-- **GraphFromFasta**: zero-clone two-pointer candidate intersection; the deliberately single-threaded Phase 2 split into "parallel collection of pure-function events + serial in-order application" (order-sensitive toasted/pools semantics preserved); weldmer counting via a 2-bit hash index (2.7 G binary searches → hash lookups, 314 s → 74 s); flattened template collection. Total 20 min → 2.9 min.
-- **FastaToDeBruijn**: per-bundle independent graph construction parallelized (95 s → 5 s).
-- **Normalization**: two-sided parallel decompress/prep/emit + copy-free counting (both.fa copy eliminated, smaller-into-larger merges), 52 min → 12.5 min.
-- **inchworm threads**: `--inchworm_cpu` (default min(6,CPU), upstream-faithful) should be raised on many-core machines — two extension rounds 26.5 → 6 min.
-
-Small-set end-to-end (upstream sample_data, full 30575 PE reads, 8 threads): this port ~9 s vs upstream (incl. Perl/JVM) ~26 s.
-
-**Per-stage vs upstream Trinity v2.15.2 (equal thread counts, best-of-3):**
-
-| Stage | Upstream wall / peak RSS | This port wall / peak RSS | Speedup | Memory |
-|---|---|---|---|---|
-| k-mer count+dump (100k reads, 4 threads) | jellyfish 0.95 s / 626 MB | 0.30 s / 86 MB | ~3.2× | ~1/7 |
-| inchworm (288k kmers, single-threaded) | 0.72 s / 26.1 MB | 0.37 s / 22.5 MB | ~2.0× | -14% |
-| chrysalis full chain (55 components, single-threaded) | 11.6 s / 466 MB | 9.9 s / 147 MB | ~1.2× | ~1/3.2 |
-| butterfly small component (c0, N=4342) | 1.15 s / 244 MB | 0.03 s / 9.2 MB | ~40× | ~1/27 |
-| butterfly mid components (c1/c2, N≈10k) | 1.7 s / ~420 MB | 0.6 s / ~380 MB | ~2.5× | on par |
-
-Note: the chrysalis ReadsToTranscripts stage initially did not scale with threads (slower than upstream at `-t 4`); its query structure was rebuilt in v0.3.0 (16.3×). The dramatic small-component butterfly gap is mostly upstream JVM startup and baseline overhead.
-
-**Thread scaling (v0.4.0, real data, `--max_memory 64G`):**
-
-| Threads | Wall | Peak RSS | Speedup |
-|---|---|---|---|
-| 8 | 11:20 | 22.7 GB | 1.00× |
-| 16 | 9:12 | 28.5 GB | 1.23× |
-| 32 | 8:00 | 33.7 GB | 1.42× |
-| 64 | 7:37 | 37.2 GB | 1.49× |
-
-Scaling saturates beyond 32 threads (32→64 yields only 1.05×); peak RSS grows with thread count (k-mer counter concurrent-accumulator effect). At this data scale, 16-32 threads is the sweet spot.
-
-**Optimization breakdown:**
-
-- v0.3.0 (algorithmic): k-mer dump elimination (direct binary bridge, saves ~8 min), ReadsToTranscripts packed hash index + sliding-window entropy (16.3×), parallel coverage statistics + rolling revcomp normalization (3.6×), batched component partition writes (5.5× — the original issued ~45M raw per-line syscalls).
-- v0.4.0 (IO/system overhead): normalization double-write elimination via hard links (-2.6 GB written), intermediates on a local scratch dir by default (`--scratch` is now the default; output dir stays clean), full component-data packing (~140k per-component files eliminated, butterfly stage 136 s → 31 s), direct fa emission from normalization, mimalloc as the global allocator (sys time -85%, page faults -96%).
-
-**IO overhead work (v0.4.0, before/after on real data at 64 threads):**
-
-| Metric | v0.3.0 | v0.4.0 | Change |
-|---|---|---|---|
-| Intermediate write volume | ~13.4 GB | ~9.6 GB | -29% |
-| Per-component small files | ~140k files | 4-6 pack files per Cbin | ≈ eliminated |
-| sys time share | 2056 s (31%) | 561 s (13%) | -73% |
-| Minor page faults | 197M | 35.4M | -82% |
-| butterfly stage wall | 136 s | 31 s | -77% |
-| wall (scratch is default) | 12:29 | 7:23 | -41% |
-
-Background: assembly output directories often live on network storage (NFS), where the upstream-style "one set of small files per component + full-dataset file handoff between stages" turns every create/write/close into a network metadata round-trip. v0.4.0 attacks this three ways: moving all intermediates off the network disk (`--scratch` by default, see "Default location of intermediates" above), packing small files into sequentially-written pack files with fixed-size offset indexes, and hard-linking duplicate content. Peak RSS is unaffected (flat before/after mimalloc).
-
-All optimizations carry oracle/byte-level equivalence verification; assembly metrics are identical to the porting baseline (see the tie-break divergence band above).
+- Arabidopsis real data (PE, `--CPU 8`) end-to-end wall time **54 min → 17 min (-69%)**, with assembly metrics identical to baseline.
+- Four optimizations: k-mer dump elimination (direct binary bridge, saves ~8 min), ReadsToTranscripts query structure 16.3×, normalization 3.6×, component partition writing 5.5× — all verified oracle/byte-level equivalent.
 
 ## Validation
 
-- `cargo test --workspace`: 566 unit tests / component cross-checks, all green.
+- `cargo test --workspace`: 553 unit tests / component cross-checks, all green.
 - Three-layer cross-validation (`cargo xtask`):
   - `xcheck-kmer / xcheck-inchworm / xcheck-chrysalis / xcheck-butterfly` — layers 1 and 2 (unit/pipeline level, checked against upstream binaries or goldens);
   - `xcheck-trinity [--full]` — layer 3 end-to-end: truncated (default 50000 PE reads) / full-scale full-pipeline cross-checks in both directions + eval statistics + both.fa cross-feed spot checks + SS(RF) synthetic small set; decision thresholds and calibration rationale in `docs/xcheck-trinity-report.md`;
@@ -188,4 +136,4 @@ Upstream toolchain environment (for cross-checking): `TRINITY_SRC` (upstream sou
 - `docs/benchmarks.md` — benchmark records
 - `docs/backlog.md` — backlog and decision log
 - `docs/setup.md` — environment and upstream toolchain preparation
-- `docs/plans/` / `docs/specs/` — stage implementation plans and design documents (P0–P5 porting, M0/M1 benchmarking & recursive partitioning, M7 speed optimization)
+- `docs/superpowers/plans/` / `docs/superpowers/specs/` — stage implementation plans and design documents (P0–P5 porting, M0/M1 benchmarking & recursive partitioning, M7 speed optimization)
