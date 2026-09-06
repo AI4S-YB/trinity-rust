@@ -91,10 +91,6 @@ target/release/trinity-cli \
 
 **归一化产物格式（fq 输入时）**：fq 输入直接产出归一化 **fa**（`left.norm.fa` / `{名}.normalized_K…​.fa`），跳过 `norm.fq` 的全量物化与下游 fq→fa 往返——归一化内部本就要做 fq→fa，选中记录直接从内存 fa 抽取，与"写 fq 再转 fa"逐字节等价（有测试锁定）。原版会把归一化 fq 留给用户；本实现**默认不再保留 norm.fq**，需要时用 `--no_cleanup`（此时 fq 与 fa 都写）。
 
-**中间产物布局（性能优化，既定差异）**：`chrysalis/Component_bins/Cbin*/` 下不再逐组件写 `cN.graph.out` / `cN.graph.reads` / `cN.graph.allProbPaths.fasta` 小文件（2.8 万组件 ≈ 8.5 万个文件，NFS 上元数据往返极贵），改为每个 Cbin 两个打包文件 `graphs.pack`/`graphs.idx`（QuantifyGraph 产物）与 `butterfly.pack`/`butterfly.idx`（Butterfly 产物）；`.idx` 为定长 32B 记录（component id / kind / offset / len，小端）。归一化的 `left.norm.*` 便捷名是长名文件的硬链接（原版为符号链接），不再物理双写。
-
-**归一化产物格式（fq 输入时）**：fq 输入直接产出归一化 **fa**（`left.norm.fa` / `{名}.normalized_K…​.fa`），跳过 `norm.fq` 的全量物化与下游 fq→fa 往返——归一化内部本就要做 fq→fa，选中记录直接从内存 fa 抽取，与"写 fq 再转 fa"逐字节等价（有测试锁定）。原版会把归一化 fq 留给用户；本实现**默认不再保留 norm.fq**，需要时用 `--no_cleanup`（此时 fq 与 fa 都写）。
-
 **已知 tie-break 差异（既定差异带）**：
 
 - inchworm 并行种子平局序与原版 `--PARALLEL_IWORM` 一样非确定——同实现两次跑的转录本多重集也会漂移（实测覆盖率带 78~94%）；跨实现端到端双向覆盖率实测 57~71%（见 `docs/xcheck-trinity-report.md` 阈值校准说明）。差异主体是端部截断的同序列（100% 一致的包含关系），非移植错位。
@@ -125,7 +121,7 @@ target/release/trinity-cli \
 - quantify 阶段随 rtt-multi-kmer 放大的耗时已由物化键排序优化压回（间接寻址 memcmp → ACGT 2bit u64 主群 + 含 N 次群，微基准 3.5×，产物逐字节一致）。
 - diginorm 计数表 k≤32 键层再降一档（u128→u64，键带宽/哈希域减半）：QM4 全量微基准 602→562s（热段 −15%），产物逐字节一致。
 - inchworm 轮 kmer_count 分层窄键计数（k≤32 u64 / k≤64 u128 + 终点 widen 回 KmerId，消费方接口不变）：微基准 k=49 1.38×，QM4 端到端 34:07→**29:48**（kmer_count 两轮 -241s，峰值 RSS 118→88GB），计数表亿键逐键对拍等价。
-- diginorm 计数改分片共享表（256 片 Mutex 片表 + 终点精确容量折叠，仅 diginorm 形态；轮计数维持局部表+reduce——交错 A/B 裁定分片对 32 线程单调用形态有锁护航回退）：diginorm 同负载 677→516s（-24%），产物逐字节一致。
+- diginorm 计数改分片共享表（Mutex 片表 + 终点精确容量折叠）：diginorm 同负载 677→516s（-24%），产物逐字节一致。当时"锁护航"裁定轮计数维持局部表+reduce——后被内存战役证实系分片缓冲病污染的误判，轮计数已统一切分片（见下方内存战役节）。
 - mimalloc 全局分配器补 `PURGE_DELAY=0`（程序内默认）：分片归一化前置 + 轮计数大表翻倍在默认滞留下全量 QM4 必现 OOM（45s 内 35→455GB），置 0 后全程通过（峰值 85GB）；mimalloc 相对 glibc 切片口径快 22%。
 
 **内存战役（2026-09-05/06 两期，QM4 峰值 83→21.1GB，目标 32→达成后压至 ~20G 档）**：
