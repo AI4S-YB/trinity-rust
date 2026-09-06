@@ -205,6 +205,12 @@ pub fn run(
             let left_fa = l?;
             let right_fa = r?;
             lap!("prep_side", __t);
+            // raw 仅在 emit 的 keep_fq / 非 fa_direct 分支被读（见 emit_side）。
+            // fa_direct+fq 主产物只碰 fa 侧 → 提前释放解压 fq（QM4 形态
+            // 13.8GB, 否则白扛过整个计数/查表/行阶段; 2026-09-05 内存战役）。
+            let need_raw = !(params.fa_direct && fmt == SeqFormat::Fq) || params.keep_fq;
+            let left_raw = need_raw.then_some(left_raw);
+            let right_raw = need_raw.then_some(right_raw);
             // both.fa 拼接语义 → 两侧分别计数再合并（计数多重集等价: ds 路径
             // 键已 canonical, 非 ds 的 canonical_merge_sum 是线性计数相加——
             // 分侧合并 = 拼接合并; 省全量拷贝与一次性大分配）。
@@ -234,7 +240,7 @@ pub fn run(
             let (l, r) = std::thread::scope(|s| {
                 let hl = s.spawn(|| {
                     emit_side(
-                        &left_raw,
+                        left_raw.as_deref(),
                         &left_fa,
                         fmt,
                         params,
@@ -248,7 +254,7 @@ pub fn run(
                 });
                 let hr = s.spawn(|| {
                     emit_side(
-                        &right_raw,
+                        right_raw.as_deref(),
                         &right_fa,
                         fmt,
                         params,
@@ -275,12 +281,15 @@ pub fn run(
         ReadsInput::Single(paths) => {
             let (raw, fmt) = read_side(paths)?;
             let fa = prep_side(&raw, fmt, ReadType::R1, params.ss_revcomp_left)?;
+            // 同双侧: fa_direct+fq 且不 keep_fq 时 raw 提前释放
+            let need_raw = !(params.fa_direct && fmt == SeqFormat::Fq) || params.keep_fq;
+            let raw = need_raw.then_some(raw);
             let table = stats_query_table(&fa, params);
             let rows = sorted_stats_rows(&fa, &table, params)?;
             let selected = select_rows(&rows, params)?;
             let index = index_keys(&selected);
             let (out, out_fmt) = emit_side(
-                &raw,
+                raw.as_deref(),
                 &fa,
                 fmt,
                 params,
@@ -306,8 +315,11 @@ pub fn run(
 /// 名字规范/SS revcomp 在 prep 阶段已完成, 抽取产物与 fq→fa 往返逐字节一致）;
 /// `keep_fq` 时额外再写一份原格式 fq（trinity-cli --no_cleanup 语义）。
 /// 返回（主产物长名路径, 实际格式）。
+///
+/// `raw` 为 None = 调用方已按"fa_direct+fq 且不 keep_fq"判定提前释放
+/// （该形态 emit 不读 raw; 需要 raw 的分支上 None 即编程错误）。
 fn emit_side(
-    raw: &[u8],
+    raw: Option<&[u8]>,
     fa: &[u8],
     fmt: SeqFormat,
     params: &DigiNormParams,
@@ -320,13 +332,23 @@ fn emit_side(
         write_convenience(&out, dst.dir, dst.side, SeqFormat::Fa)?;
         if params.keep_fq {
             let fq = normalized_out_path(dst.dir, dst.base, SeqFormat::Fq, params);
-            extract_to_file(raw, fmt, index, &fq)?;
+            extract_to_file(
+                raw.expect("keep_fq 形态 emit 需要 raw（need_raw 判定不一致）"),
+                fmt,
+                index,
+                &fq,
+            )?;
             write_convenience(&fq, dst.dir, dst.side, SeqFormat::Fq)?;
         }
         Ok((out, SeqFormat::Fa))
     } else {
         let out = normalized_out_path(dst.dir, dst.base, fmt, params);
-        extract_to_file(raw, fmt, index, &out)?;
+        extract_to_file(
+            raw.expect("非 fa_direct+fq 形态 emit 需要 raw（need_raw 判定不一致）"),
+            fmt,
+            index,
+            &out,
+        )?;
         write_convenience(&out, dst.dir, dst.side, fmt)?;
         Ok((out, fmt))
     }

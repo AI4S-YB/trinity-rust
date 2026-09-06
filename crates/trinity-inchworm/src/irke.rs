@@ -253,12 +253,22 @@ pub fn sorted_seed_list(counter: &KmerCounter, sort: bool) -> Vec<(KmerId, u32)>
 /// 迭代序。compute_sequence_assemblies 需要在收集与排序之间插入 monitor 行，
 /// 故拆出。
 pub fn collect_nonzero_seeds(counter: &KmerCounter) -> Vec<(KmerId, u32)> {
-    counter.iter_nonzero().collect()
+    // 精确容量预留（上界 = 表长; 剪枝是惰性置零, count=0 键占比极小）——
+    // iter().collect() 的倍增生长使新旧两份并存: QM4 1.95 亿种子 × 40B 末次
+    // 翻倍 +11.7GB 瞬时, 实测把 inchworm 时代顶到 33.5GB（2026-09-05 内存
+    // 战役; 与排序暂存同属该段峰值构成, 值序不变仅分配方式变化）。
+    let mut out = Vec::with_capacity(counter.size());
+    out.extend(counter.iter_nonzero());
+    out
 }
 
 /// KC:739-743 排序阶段 + KC:823-831（_DEBUG 比较器）: count 降序，平局 kmer 值降序。
+/// sort_unstable（2026-09-05 内存战役）: 计数表键唯一 → 比较器为全序、
+/// 无并列 → unstable 与 stable 输出恒等; 且 unstable（pdqsort）不分配
+/// n/2 暂存（QM4 1.95 亿种子下稳定排序实测 +7.4GB 峰、把 inchworm 段
+/// 顶过 32GB 预算线）。
 fn sort_seeds_desc(kmer_list: &mut [(KmerId, u32)]) {
-    kmer_list.sort_by(|&(kmer_a, count_a), &(kmer_b, count_b)| {
+    kmer_list.sort_unstable_by(|&(kmer_a, count_a), &(kmer_b, count_b)| {
         count_b.cmp(&count_a).then(kmer_b.cmp(&kmer_a))
     });
 }
@@ -966,10 +976,20 @@ pub fn compute_sequence_assemblies_parallel<W: Write>(
     num_threads: Option<usize>,
     w: &mut W,
 ) -> Result<usize, CommonError> {
-    // ---- 种子列表（不排序: KC:732-737，收集序 = FxHashMap 迭代序） ----
+    // ---- 目录转入并发结构（此后组装期只读 + 原子置 0，不增不删键）。
+    // 刀M6（2026-09-06 内存战役）: from_counter 是整表重建（旧 Fx 表与新
+    // DashMap 并存 ≈ 2×表 瞬时）——原先发生在亿级种子列表在场之后, 三者
+    // 叠加把 QM4 inchworm 时代顶到 33.8GB; 转换提前到种子收集前的空窗期,
+    // 重建瞬时只剩两份表。种子改从 DashMap 快照且**只取键**（count 字段
+    // 主循环不参与——实时重查, IRKE.cpp:546）, 迭代序 = DashMap 分片序
+    // （种子收集序本就是非确定源之一, 平局序 backlog 已立案）。
+    let sync = SyncKmerCounter::from_counter(counter);
+    let init_size = sync.size();
+
+    // ---- 种子列表（不排序: KC:732-737，收集序 = 分片迭代序） ----
     eprintln!("-populating the kmer seed candidate list."); // IRKE_run.cpp:521
-    eprintln!("Kcounter hash size: {}", counter.size()); // KC:716
-    let kmers = collect_nonzero_seeds(&counter); // KC:719-728
+    eprintln!("Kcounter hash size: {init_size}"); // KC:716
+    let kmers = sync.nonzero_keys(); // KC:719-728
     eprintln!(
         "Processed {} non-zero abundance kmers in kcounter.",
         kmers.len()
@@ -977,7 +997,6 @@ pub fn compute_sequence_assemblies_parallel<W: Write>(
     eprintln!("-Not sorting list of kmers, given parallel mode in effect."); // KC:732-737
 
     // ---- IRKE.cpp:441-449: 组装中哈希只减不增的护栏基线 ----
-    let init_size = counter.size();
     eprintln!(
         "Total kcounter hash size: {init_size} vs. sorted list size: {}",
         kmers.len()
@@ -992,9 +1011,6 @@ pub fn compute_sequence_assemblies_parallel<W: Write>(
         .build()
         .map_err(|e| CommonError::Inchworm(format!("rayon thread pool build failed: {e}")))?;
     eprintln!("num threads set to: {}", pool.current_num_threads()); // IRKE.cpp:471-472（omp_get_max_threads）
-
-    // 目录转入并发结构（此后组装期只读 + 原子置 0，不增不删键）
-    let sync = SyncKmerCounter::from_counter(counter);
     let kmer_length = sync.get_kmer_length();
     // 组装级 min_connectivity 下传（覆盖 IrkeParams 同名字段——镜像原版数据流）
     let effective = IrkeParams {
@@ -1012,7 +1028,7 @@ pub fn compute_sequence_assemblies_parallel<W: Write>(
                 // 每 chunk 独立 srand(1)（见函数文档 rand 决策）
                 let mut rng = GlibcRand::new(1);
                 let mut buf: Vec<Option<IwormRecord>> = Vec::with_capacity(chunk.len());
-                for &(kmer, _cached_count) in chunk {
+                for &kmer in chunk {
                     buf.push(parallel_assemble_seed(
                         kmer, &sync, &effective, aparams, two_phase, monitor, init_size, &mut rng,
                     )?);

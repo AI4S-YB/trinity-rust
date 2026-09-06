@@ -134,13 +134,15 @@ impl NonRedKmerTable {
     }
 
     /// **并行版** `add_counts_from_reads`（镜像 NonRedKmerTable.cc:161-200
-    /// `AddData(DNAStringStreamFast&)` 的 omp atomic 语义）：分块局部计数 +
-    /// 按块序合并——整数累加，与原版原子累加/与单线程版结果完全一致。
+    /// `AddData(DNAStringStreamFast&)` 的 omp atomic 语义）：共享原子计数
+    /// fetch_add 累加——与原版原子累加/单线程版结果完全一致。
     /// 消费方（`graph_from_fasta`）等价于原版 `#pragma omp parallel` 抢读。
     ///
     /// 性能（2026-09-01）: 滚动 2-bit 编码 + 哈希查询（`hash_index`）替换
     /// 逐窗二分+整段大写拷贝; 含非 GATC 的窗走字节二分回退（原版 toupper
     /// 后字节匹配语义）。read 长度 < k 的跳过语义不变。
+    /// 内存（2026-09-05）: 原分块局部稠密表（每块 n×4B × collect 全保留）
+    /// 在 n≈亿级时瞬时 60~100GB——改回共享原子单份计数（omp atomic 本义）。
     pub fn add_counts_from_reads_par(&mut self, reads: &[Vec<u8>]) {
         use rayon::prelude::*;
         let n = self.data.len();
@@ -151,54 +153,55 @@ impl NonRedKmerTable {
         let k = self.k;
         let mask: KmerId = KmerId::low_bits(2 * k as u32);
         let data = &self.data;
+        // 共享原子计数（镜像原版 NonRedKmerTable.cc 的 `#pragma omp atomic`,
+        // 2026-09-05 内存战役改回）: 旧分块局部稠密表 `partials: Vec<Vec<i32>>`
+        // 每块 n×4B、collect 全程保留——n≈亿级 × 块数（128~512）实测瞬时
+        // 60~100GB（gff 段峰值主体）。整数 fetch_add 累加与分块求和/原版
+        // 原子累加结果恒等; for_each 无结果保留, 内存 = 单份 n×4B。
+        let atomic_counts: Vec<std::sync::atomic::AtomicI32> = (0..n)
+            .map(|_| std::sync::atomic::AtomicI32::new(0))
+            .collect();
         let chunk = (reads.len() / (rayon::current_num_threads() * 4)).max(1);
-        let partials: Vec<Vec<i32>> = reads
-            .par_chunks(chunk)
-            .map(|ch| {
-                let mut local = vec![0i32; n];
-                for r in ch {
-                    if r.len() < k {
+        reads.par_chunks(chunk).for_each(|ch| {
+            for r in ch {
+                if r.len() < k {
+                    continue;
+                }
+                let mut val: KmerId = KmerId::ZERO;
+                let mut run = 0usize;
+                for j in 0..r.len() {
+                    match base_to_int(r[j]) {
+                        Some(v) => {
+                            val = ((val << 2) | KmerId::from(v)) & mask;
+                            run += 1;
+                        }
+                        None => {
+                            val = KmerId::ZERO;
+                            run = 0;
+                        }
+                    }
+                    if j + 1 < k {
                         continue;
                     }
-                    let mut val: KmerId = KmerId::ZERO;
-                    let mut run = 0usize;
-                    for j in 0..r.len() {
-                        match base_to_int(r[j]) {
-                            Some(v) => {
-                                val = ((val << 2) | KmerId::from(v)) & mask;
-                                run += 1;
-                            }
-                            None => {
-                                val = KmerId::ZERO;
-                                run = 0;
-                            }
+                    if run >= k {
+                        if let Some(&i) = hidx.get(&val) {
+                            atomic_counts[i as usize].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         }
-                        if j + 1 < k {
-                            continue;
-                        }
-                        if run >= k {
-                            if let Some(&i) = hidx.get(&val) {
-                                local[i as usize] += 1;
-                            }
-                        } else {
-                            // 含非 GATC 窗: 大写后字节二分回退（原版语义）
-                            let ws = j + 1 - k;
-                            let w: Vec<u8> =
-                                r[ws..ws + k].iter().map(|c| c.to_ascii_uppercase()).collect();
-                            let i = data.partition_point(|x| x.as_slice() < w.as_slice());
-                            if i < data.len() && data[i].as_slice() == w.as_slice() {
-                                local[i] += 1;
-                            }
+                    } else {
+                        // 含非 GATC 窗: 大写后字节二分回退（原版语义）
+                        let ws = j + 1 - k;
+                        let w: Vec<u8> =
+                            r[ws..ws + k].iter().map(|c| c.to_ascii_uppercase()).collect();
+                        let i = data.partition_point(|x| x.as_slice() < w.as_slice());
+                        if i < data.len() && data[i].as_slice() == w.as_slice() {
+                            atomic_counts[i].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         }
                     }
                 }
-                local
-            })
-            .collect();
-        for p in &partials {
-            for (i, &c) in p.iter().enumerate() {
-                self.counts[i] += c;
             }
+        });
+        for (dst, src) in self.counts.iter_mut().zip(atomic_counts) {
+            *dst = src.into_inner();
         }
     }
 

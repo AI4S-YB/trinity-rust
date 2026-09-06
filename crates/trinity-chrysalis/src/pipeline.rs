@@ -110,16 +110,21 @@ pub fn run_chrysalis_pipeline(
     // 1. GraphFromFasta → weld 图 → sort
     println!("-running GraphFromFasta...");
     let (iworm_seqs, welds_sorted) = timed(out_dir, "gff", || {
-        let reads_text: String = match &p.weld_reads_path {
-            Some(path) => {
-                let bytes = std::fs::read(path).map_err(|e| {
-                    CommonError::Parse(format!("weld reads {}: {e}", path.display()))
-                })?;
-                String::from_utf8_lossy(&bytes).into_owned()
-            }
-            None => String::from_utf8_lossy(reads_fa).into_owned(),
+        // from_utf8_lossy 的 Cow 借用语义: 合法 UTF-8（fasta 恒 ASCII）零拷贝
+        // ——旧 into_owned() 无条件复制全量 reads（QM4 3.9GB, 2026-09-05
+        // 内存战役）; weld_reads_path 分支的 bytes 需与 Cow 同存活。
+        let weld_bytes: Option<Vec<u8>> = match &p.weld_reads_path {
+            Some(path) => Some(std::fs::read(path).map_err(|e| {
+                CommonError::Parse(format!("weld reads {}: {e}", path.display()))
+            })?),
+            None => None,
+        };
+        let reads_text = match &weld_bytes {
+            Some(b) => String::from_utf8_lossy(b),
+            None => String::from_utf8_lossy(reads_fa),
         };
         let reads_streamed = stream_fasta_records(&reads_text);
+        drop(reads_text);
         let iworm_seqs = read_fasta_bytes(iworm_fa, false);
         let welds = graph_from_fasta(
             &iworm_seqs,

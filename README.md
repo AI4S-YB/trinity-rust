@@ -108,11 +108,17 @@ target/release/trinity-cli \
 - inchworm 轮 kmer_count 分层窄键计数（k≤32 u64 / k≤64 u128 + 终点 widen 回 KmerId，消费方接口不变）：微基准 k=49 1.38×，QM4 端到端 34:07→**29:48**（kmer_count 两轮 -241s，峰值 RSS 118→88GB），计数表亿键逐键对拍等价。
 - diginorm 计数改分片共享表（256 片 Mutex 片表 + 终点精确容量折叠，仅 diginorm 形态；轮计数维持局部表+reduce——交错 A/B 裁定分片对 32 线程单调用形态有锁护航回退）：diginorm 同负载 677→516s（-24%），产物逐字节一致。
 - mimalloc 全局分配器补 `PURGE_DELAY=0`（程序内默认）：分片归一化前置 + 轮计数大表翻倍在默认滞留下全量 QM4 必现 OOM（45s 内 35→455GB），置 0 后全程通过（峰值 85GB）；mimalloc 相对 glibc 切片口径快 22%。
+
+**内存战役（2026-09-05/06，QM4 峰值 83→28.7GB，目标 <32GB 达成）**：
+
+- 峰值画像（`.stage_memory` 阶段边界 + CNT/GFF_PROFILE 行尾 VmHWM + 2s 采样器）：83GB 归属 = diginorm 分片计数缓冲病（细粒度任务永不冲刷，键流隐式全量缓存 ~60GB）+ 轮计数 32 局部表（75.6/70.3GB）+ gff read_counts 分块稠密 partials（47GB）+ inchworm 种子收集/排序/DashMap 转换三叠瞬态（33.5-33.8GB）。
+- 六刀（全部语义无损，等价性实测）：①分片冲刷字节定界（1MB/键宽）+`with_min_len` 钳任务数；②轮计数统一切片（旧"锁护航回退"裁定被缓冲病污染，作废——count_bench k49 249→**87s** 且单段峰值 ~13GB）；③gff 改回原版 omp atomic 共享计数 + crossover 即时释放 + `from_utf8_lossy` Cow 借用 + 共享 rc_seqs（gff_profile 301s/102.8GB→**198s/24.1GB**，weld 图逐字节一致）；④种子排序 `sort_unstable`（键唯一→比较器全序，免 n/2 暂存）；⑤种子收集精确容量预留（免末次翻倍 +11.7GB）；⑥DashMap 整表重建提前到种子收集前的空窗 + 种子只取键（count 实时重查）。
+- 附带收益：diginorm 432→207s、两轮计数 490→100s、gff 175→169s、`save_counts_bin` 流式（-7GB 瞬时）；QM4 端到端 34:57→**25:23**，产物 n/N50 带内一致（117,722-118,195，平局非确定带宽）。
 - `--bfly-no-path-merging` / `--bfly-empty-retry` / `--weld-reads <fa>` / `--weld-glue-factor` / `--cluster-max-size`：机制探索旗标（详见 `docs/opt-log.md` 2026-09-03/04 各节），QM4/dev1 评估后均未达转正线，保留供复现实验。
 
 ## 验证
 
-- `cargo test --workspace`：681 项单测/组件对拍全绿。
+- `cargo test --workspace`：682 项单测/组件对拍全绿。
 - 三层交叉验证（`cargo xtask`）：
   - `xcheck-kmer / xcheck-inchworm / xcheck-chrysalis / xcheck-butterfly`——第 1、2 层（单元/管线级，对拍原版二进制或黄金）；
   - `xcheck-trinity [--full]`——第 3 层端到端：截断（默认 50000 PE reads）/全量双侧全管线对拍 + eval 统计 + both.fa 互喂抽查 + SS(RF) 合成小集；判定阈值与校准依据见 `docs/xcheck-trinity-report.md`。

@@ -2928,3 +2928,109 @@ contig 恒齐备——竞态分裂量实测 ±2。容差 +1→+2 并显式断言
 
 | 2026-09-05 | qm4-purge0 全程 | wall **34:57**（重负载） | exit=0 峰值 85GB | mimalloc+PURGE_DELAY=0+分片归一化 |
 | 2026-09-05 | 切片分配器 A/B | mimalloc 375s vs glibc 483s（**-22%**） | n 带内一致 | 2M PE 交错两轮 |
+
+## 内存战役: QM4 峰值 83GB → 目标 <32GB（2026-09-05 深夜起）
+
+**目标（用户指令）**: 100GB 级峰值太夸张, 压到 32GB 以下才有实用性。
+
+**画像方法**: timer 增设 `.stage_memory`（阶段边界 VmHWM/VmRSS, 与
+.stage_timings 同边界）+ CNT/GFF_PROFILE 行尾 VmHWM + 进程 2s 采样器
+（memwatch.log）+ stderr 时间戳对齐。全程产物落 test_data/work/tmp（/tmp
+禁写, 用户指令）。
+
+**mem1 画像（旧二进制, 标准口径+--no_cleanup, wall 35:51 重负载）——
+峰值 83GB 的归属**:
+
+| 段 | 峰值 RSS | 主体 |
+|---|---|---|
+| diginorm count(shard) | **83.0**（全局） | 分片计数缓冲病（见刀M1）+ raw fq 13.8GB 常驻 |
+| k49 轮计数（locals+reduce） | 75.6 | 32 在飞局部表各收敛 ~0.44D（D=1.95 亿） |
+| k63 轮计数（locals+reduce） | 70.3 | 同上（D=2.05 亿） |
+| inchworm 贪心（k49） | ~26 | 宽表 7.8 + 种子排序列表 7.8 + 稳定排序暂存 7.4 |
+| **gff** | **47.0** | read_counts 分块稠密 partials（见刀M3）+ crossover 11.7GB 滞留 + lossy 拷贝 3.9GB + rc_cache×32 |
+| rtt+quantify | 17.4 | — |
+
+**刀M1（counter.rs）: 分片计数缓冲病——冲刷阈值按任务生效的隐式全量缓存**。
+`par_iter().fold(ShardBufs).collect()` 下 2M 键冲刷阈值对每个 rayon 任务
+独立判定: 21.5M 记录切出上千个细粒度任务, 单任务攒不满 2M 键**永不冲刷**,
+键滞留任务缓冲等 collect 终点——整个 k-mer 键流（63 亿实例 × 8B + Vec 倍增）
+被隐式缓存 ≈ 60GB 瞬时, 即 diginorm 段 83GB 峰的主体。刀2 时"分片峰值
+≈ D+缓冲"的推断未经实测, 实为灾难; **轮计数 +26% 的"Mutex 护航回退"
+裁定同样被污染（缓冲病让分配器狂奔）, 作废重裁**。修复: 冲刷阈值字节
+定界（1MB/键宽, 下限 16K 键）+ with_min_len(8192) 钳任务数 → 缓冲上界
+≈ 任务数×1MB（QM4 ~2.6GB）。
+同刀: diginorm raw fq（fa_direct+fq 且不 keep_fq 时 emit 不读 raw）prep 后
+提前释放（-13.8GB 常驻; --no_cleanup 形态 keep_fq=true 仍保留）;
+save_counts_bin 整表 7GB Vec 改 8MB BufWriter 流式（字节序不变）。
+
+**刀M2（counter.rs）: 轮计数分层入口统一切分片**（缓冲修复后旧裁定作废）。
+count_bench k49 32 线程: 旧二进制 layered(locals) 249.2s / wide 对照 418.3s;
+新二进制 layered(sharded) **87.0s** / wide 304.2s——wide 跨窗漂移 1.37×,
+负载归一后 sharded 仍 ≥2× 提速, 单段形态峰值 ~13-14GB（glibc example,
+含 wide 表对拍滞留基线）。
+**刀2 的"护航"理论证伪**: 时间回退全在缓冲病, 分片+有界缓冲是净赢。
+
+**刀M3（chrysalis）: gff 47GB 三连击**。
+① `add_counts_from_reads_par` 分块局部稠密表 partials: 每块 n×4B×collect
+全保留, n≈1.2 亿 × 128~512 块 → glibc example 实测瞬时 102.8GB（管线内
+mimalloc 47GB）——改回原版 NonRedKmerTable.cc 的 omp atomic 本义
+（共享 AtomicI32 fetch_add, 单份 n×4B, 整数累加恒等）;
+② phase1 crossover 候选序列（1.03 亿条 ≈ 11.7GB）在 set_up_templates 后
+无消费方——立即 drop; phase1/2 逐命中 clone/revcomp 物化改共享 rc_seqs
+表借用（一次性 174MB, 取代每任务独立缓存最坏 32×全量）;
+③ pipeline.rs `from_utf8_lossy(...).into_owned()` 无条件复制 both.fa 3.9GB
+——改 Cow 借用（fasta 恒 ASCII）, files 入口 text 同步 drop。
+gff_profile 复测（真输入 min100+both.fa, GFF_PROFILE+采样器）:
+**gff3(①未修) 301s/峰 102.8GB → gff4 198.3s/峰 24.1GB（hwm 25.05GB）,
+weld 图输出 47,426,460 字节逐字节一致**（原子化等价性实证）。
+
+**刀M4（inchworm）: 种子排序稳定排序暂存**。collect_nonzero_seeds 后
+sort_seeds_desc 用 sort_by（stable）——分配 n/2 暂存, QM4 1.95 亿种子
+实测排序 10s 内 RSS 27.7→35.1GB（+7.4GB）, 把 k49 inchworm 时代顶到
+33.5GB。计数表键唯一 → 比较器全序无并列 → sort_unstable_by 输出恒等,
+零暂存。
+
+**验证链**: mem2（刀M1/2, 旧 gff）exit=0 wall **24:38**（重负载+旁路基准
+穿插）, diginorm 432→207s（count(shard) 180→48s）, 两轮计数 490→100s,
+全局峰 46.6GB=旧 gff 段; mem3（+刀M3）与 mem4（+刀M4）终值见下表。
+682 项测试全绿（681+timer 内存行新测）。
+
+| 2026-09-05 | mem1 画像 | 旧二进制峰值 **83.0GB** | diginorm 缓冲病 83/k49 轮 75.6/gff 47 | 采样器+stage_memory 归因 |
+| 2026-09-05 | count_bench 交错 | layered locals 249.2s → sharded **87.0s** | 全表对拍一致 | wide 对照跨窗 1.37× |
+| 2026-09-05 | gff_profile | 301s/102.8GB → **198.3s/24.1GB** | weld 图逐字节一致 | 刀M3 三连击 |
+| 2026-09-05 | mem2 全程 | wall **24:38** | 峰 46.6GB（旧 gff 段） | 刀M1/2 验证 |
+| 2026-09-05 | mem3 全程 | wall 25:33 | 峰 33.8GB（k63 种子收集翻倍） | 刀M3 后 gff 段内 16.2GB 未创新高 |
+
+**刀M5（inchworm）: 种子列表收集的 Vec 倍增瞬态**。mem4 复测证实
+sort_unstable 杀掉排序暂存后, 峰值棘轮仍被 `iter_nonzero().collect()` 的
+末次容量翻倍顶到 33.5GB（k49 1.95 亿 × 40B, 新旧两份并存 +11.7GB;
+k63 侧 33.8GB）——改 `Vec::with_capacity(counter.size())` 精确预留
+（表长上界, 剪枝惰性零键占比 ~0.02%）, 值序不变仅分配方式变化。
+
+**刀M6（inchworm PARALLEL）: DashMap 整表重建的三叠瞬态**。mem5 复测
+（刀M4/5 后）k49/k63 inchworm 时代仍 33.5-33.8GB——`SyncKmerCounter::
+from_counter` 把整张 FxHashMap 重建进 DashMap（旧表 7.8GB + 新 DashMap
+~9.5GB 并存）, 且发生在亿级种子列表在场之后（采样器实测种子收集后
++9.5GB 两段阶梯、排序/贪心稳态后 -12.8GB 回落）。修复: 转换提前到种子
+收集前的空窗期执行（重建瞬时只剩两份表）, 种子改从 DashMap 快照且
+**只取键**（count 字段主循环不参与——实时重查 IRKE.cpp:546, 40B→32B/条）;
+种子收集序 FxHashMap 序 → DashMap 分片序（收集序本就是非确定源之一,
+平局序 backlog 已立案; smoke_vs_original 4 项过, 全量 682 绿）。
+
+**终审 mem6（六刀全上, QM4 标准口径, 晨间负载）**: exit=0,
+wall **25:23**, **全局峰值 RSS 28.69GB**（kernel VmHWM 棘轮 28.94GB,
+归属 diginorm 行/输出尾段 @09:37:00; gff 段内 16.2GB、inchworm 转换窗
+RSS 26GB 均未再创新高）, n=118,096（带内 117,722-118,195）。
+**83.0GB → 28.7GB（-65%）, 目标 <32GB 达成; 墙钟同步 34:57→25:23。**
+
+峰值残余构成（28.7GB 的下一层, 留档备后战）: diginorm 尾段 = fa 7.4GB +
+行集/TSV 往返 + 输出缓冲 + mimalloc 滞留; inchworm 稳态 ≈ 宽表 7.8 +
+DashMap 8.8 + 种子 6.5 + 滞留 ~4; 计数段棘轮 28.9。再往下砍需窄键化
+KmerCounter/DashMap（k≤64 用 u128, -6~7GB）与 diginorm 文本往返流式化。
+
+| 2026-09-06 | mem4 全程 | wall 27:47 | 峰 33.8GB（k63 种子收集翻倍） | 刀M4 验证, 靶点转刀M5 |
+| 2026-09-06 | mem5 全程 | wall 27:37 | 峰 33.82GB（DashMap 重建三叠） | 刀M5 验证, 靶点转刀M6 |
+| 2026-09-06 | mem6 终审 | wall **25:23** | **峰 28.69GB（<32 达成）** | n=118,096 带内; 682 测试绿 |
+
+
+

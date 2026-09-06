@@ -181,12 +181,35 @@ impl KmerCountTable {
 /// 分片位宽（2^8 = 256 片）: 每片表 ≈ D/256 条（D = distinct 键数）,
 /// 大表的随机插入变为片内局部插入; 片表 Mutex 下按缓冲批量冲刷摊薄锁开销。
 const COUNT_SHARD_BITS: usize = 8;
-/// 每线程缓冲的 k-mer 键数上限, 触发即整批冲刷进片表（u64 2M 键 = 16MB）。
-const COUNT_FLUSH_KEYS: usize = 1 << 21;
+/// 单任务分片缓冲的冲刷阈值（**字节**）: flush_keys = 该字节数 / 键宽,
+/// 下限 [`COUNT_FLUSH_MIN_KEYS`]。缓冲内存上界 = 任务数 × 阈值字节:
+/// 经 with_min_len 粒度控制后 QM4 级（~21.5M 记录 → ≤2.6K 任务）≈ 2.6GB。
+/// 2026-09-05 旧值 2M 键下细粒度任务（单任务 <2M 键）**永不触发冲刷**,
+/// 键滞留在任务缓冲里等 collect 终点统一冲刷——整个 k-mer 键流被隐式
+/// 缓存在内存（QM4 63 亿键 × 8B + Vec 倍增 ≈ 60GB 瞬时, 即实测阶段
+/// 峰值 86GB 的主体; 当时的"峰值 ≈ D + 缓冲"推断未经实测）。
+const COUNT_FLUSH_BYTES: usize = 1 << 20;
+/// 冲刷阈值键数下限（防宽键下字节数除出过小值——锁次数过多）。
+const COUNT_FLUSH_MIN_KEYS: usize = 1 << 14;
+/// 每任务最少处理记录数（with_min_len）: 任务数上界 = 记录数/该值,
+/// 与冲刷字节阈值共同构成缓冲内存界（2026-09-05 内存战役）。
+const COUNT_MIN_RANGES: usize = 8192;
+
+/// 当前键宽下的冲刷键数阈值。
+fn count_flush_keys_for<K>() -> usize {
+    (COUNT_FLUSH_BYTES / std::mem::size_of::<K>()).max(COUNT_FLUSH_MIN_KEYS)
+}
 
 fn cnt_profile_enabled() -> bool {
     static P: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *P.get_or_init(|| std::env::var_os("CNT_PROFILE").is_some())
+}
+
+/// CNT_PROFILE 行尾的进程峰值 RSS（MB; /proc 不可读 → x）。
+fn vm_hwm_mb() -> String {
+    trinity_common::timer::vm_field_kb("VmHWM:")
+        .map(|kb| format!("{}", kb / 1024))
+        .unwrap_or_else(|| "x".into())
 }
 
 /// 每线程分片缓冲: 键按片追加, 攒满上限（调用方传入）整批冲刷进片表。
@@ -234,22 +257,23 @@ fn shard_of<K: std::hash::Hash>(key: &K, shard_bits: usize) -> usize {
     (h.finish() >> (64 - shard_bits)) as usize
 }
 
-/// 并行计数泛型核心（分片共享表, 压时间战役 2026-09-05 刀2）:
-/// rayon 按记录分片 → 每线程按片缓冲键 → 批量冲刷进 256 张 Mutex 片表
+/// 并行计数泛型核心（分片共享表, 压时间战役 2026-09-05 刀2; 2026-09-05
+/// 内存战役缓冲修复 + 轮计数并入）:
+/// rayon 按记录分片（with_min_len 钳任务数）→ 每任务分片缓冲攒键
+/// （字节定界冲刷, 内存有界）→ 批量冲刷进 256 张 Mutex 片表
 /// （片表 ≈ D/256 条, 局部性好）→ 终点按精确容量把片表一次折叠回单表。
 ///
-/// **适用面（2026-09-05 交错 A/B 实测裁定）**: 对 diginorm 形态（u64 键,
-/// 双侧各自计数 → 每调用 ~CPU/2 线程, 旧路径合并实测 221~282s ≥ 计数
-/// 本体）大赢: 同负载 dn_bench 677.6→516.0s, 合并坍缩至 ~15s; 对
-/// inchworm 轮形态（u128 键单次 32 线程, 分层入口）真回退: count_bench
-/// k49 layered 240.5→303.6s——32 冲刷线程 × 256 片表的 Mutex 在共享机
-/// 高负载下有护航效应。故本变体仅供 diginorm 计数表构建调用, 轮计数
-/// 维持 [`count_fasta_data_of`] 的局部表+reduce。
+/// **适用面沿革**: 刀2 交错 A/B（缓冲病未修时分片 k49 240.5→303.6s）
+/// 曾裁定轮计数维持局部表+reduce; 2026-09-05 内存战役定位该 A/B 的分片侧
+/// 带着未修的键流隐式全量缓存（见 [`COUNT_FLUSH_BYTES`]）, 且局部表形态
+/// 峰值 = 线程数 × 0.4~0.7×D（QM4 数十 GB）不可接受 → 缓冲修复后分层
+/// 入口（diginorm 与轮计数）统一走本路径, 旧 A/B 作废重裁。
 ///
-/// 相对旧路径的机制收益: reads 随机分布下各线程局部表收敛到近全量
-/// distinct 集（合并 ≈ 线程数×D 次随机插入, 局部表叠加把 RSS 顶到
-/// 2~3×D）; 分片后合并工作量恰为 D 次精确容量插入, 峰值内存 ≈ D + 缓冲。
-/// 键值多重集与任何计数路径等价（片间键不交, 片内 += 可交换）。
+/// 相对局部表+reduce 的机制收益: reads 随机分布下各线程局部表收敛到近
+/// 全量 distinct 集（合并 ≈ 线程数×D 次随机插入, 局部表叠加把 RSS 顶到
+/// 2~3×D×线程数）; 分片后合并工作量恰为 D 次精确容量插入, 峰值内存
+/// ≈ 2D + 有界缓冲。键值多重集与任何计数路径等价（片间键不交,
+/// 片内 += 可交换）。
 pub fn count_fasta_data_of_sharded<K>(
     data: &[u8],
     k: usize,
@@ -259,13 +283,23 @@ pub fn count_fasta_data_of_sharded<K>(
 where
     K: RollingKey + Send,
 {
-    count_fasta_data_sharded::<K>(data, k, ds, per_thread_capacity, COUNT_SHARD_BITS, COUNT_FLUSH_KEYS)
+    count_fasta_data_sharded::<K>(
+        data,
+        k,
+        ds,
+        per_thread_capacity,
+        COUNT_SHARD_BITS,
+        count_flush_keys_for::<K>(),
+    )
 }
 
-/// 并行计数泛型核心: rayon 按记录分片 → 每线程局部 FxHashMap<K,u32> →
-/// reduce 合并（jellyfish 同型策略）。K = u64（k≤32）/u128（k≤64 紧凑键）
-/// 或 KmerId。inchworm 轮计数（分层入口）与公共 API 走本路径; diginorm
-/// 形态走 [`count_fasta_data_of_sharded`]（适用面裁定见其文档）。
+/// 并行计数泛型核心（局部表+reduce, jellyfish 同型策略）: rayon 按记录
+/// 分片 → 每任务局部 FxHashMap<K,u32> → reduce 合并。K = u64（k≤32）/
+/// u128（k≤64 紧凑键）或 KmerId。**峰值内存 = 在飞任务数 × 局部表大小
+/// （随机 reads 下每表收敛到 ~0.4-0.7×D）——QM4 k49 实测数十 GB**, 故
+/// 管线热路径（diginorm 与轮计数分层入口）2026-09-05 起统一走
+/// [`count_fasta_data_of_sharded`]; 本路径保留给 k>64 全宽层与公共 API
+/// （等价性对拍基准）。
 pub fn count_fasta_data_of<K>(
     data: &[u8],
     k: usize,
@@ -310,8 +344,9 @@ where
     };
     if cnt_profile_enabled() {
         eprintln!(
-            "[cnt] k={k} ds={ds}: locals+reduce 合计 {:.1}s",
-            t0.elapsed().as_secs_f64()
+            "[cnt] k={k} ds={ds}: locals+reduce 合计 {:.1}s, VmHWM {}MB",
+            t0.elapsed().as_secs_f64(),
+            vm_hwm_mb()
         );
     }
     merged
@@ -353,10 +388,12 @@ where
         }
     };
     // fold 携带每 rayon 任务的缓冲跨记录复用, collect 收回残余（collect 后
-    // 逐个冲刷, 不丢尾部）; multiline 记录粒度同型
+    // 逐个冲刷, 不丢尾部）; multiline 记录粒度同型。with_min_len 钳任务数
+    // 上界 → 缓冲内存界 = 任务数 × COUNT_FLUSH_KEYS（2026-09-05 内存战役）
     let bufs: Vec<ShardBufs<K>> = if multiline {
         split_fasta_sequences(data)
             .par_iter()
+            .with_min_len(COUNT_MIN_RANGES)
             .fold(
                 || ShardBufs::new(shards),
                 |mut buf, rec| {
@@ -368,6 +405,7 @@ where
     } else {
         ranges
             .par_iter()
+            .with_min_len(COUNT_MIN_RANGES)
             .fold(
                 || ShardBufs::new(shards),
                 |mut buf, &(s, e)| {
@@ -394,9 +432,10 @@ where
     }
     if cnt_profile_enabled() {
         eprintln!(
-            "[cnt] k={k} ds={ds}: count(shard) {:.1}s, merge(final-fold {total} 键) {:.1}s",
+            "[cnt] k={k} ds={ds}: count(shard) {:.1}s, merge(final-fold {total} 键) {:.1}s, VmHWM {}MB",
             t_count.as_secs_f64(),
-            t1.elapsed().as_secs_f64()
+            t1.elapsed().as_secs_f64(),
+            vm_hwm_mb()
         );
     }
     out
@@ -414,23 +453,29 @@ fn widen_to_count_map<K: RollingKey>(m: FxHashMap<K, u32>) -> CountMap {
 }
 
 /// inchworm 轮计数的分层入口: k≤32 用 u64 键、k≤64 用 u128 键在窄键空间
-/// 完成 per-thread 计数与 reduce 合并（键带宽与槽位减半~四分之一, 大表
-/// cache miss 与 FxHash 输入同步缩）, 终点一次 widen 回 CountMap——管线
-/// 既有消费方（trusted 注入 / counts_bin 落盘 / KmerCounter::from_count_map）
-/// 接口与语义不变。等价性: 各窄键层与 KmerId 层走同一泛型代码, 键数值
-/// 域内恒等 → 计数多重集相等（单测 count_layered_matches_wide 全 k 对拍）。
-/// 迭代序差异不构成回归: 并行 reduce 的合并序本就非确定（inchworm 并行
-/// 平局序非确定, backlog 已立案）。
+/// 完成分片共享表计数（终点一次 widen 回 CountMap）——管线既有消费方
+/// （trusted 注入 / counts_bin 落盘 / KmerCounter::from_count_map）接口与
+/// 语义不变。等价性: 各窄键层与 KmerId 层走同一泛型代码, 键数值域内恒等
+/// → 计数多重集相等（单测 count_layered_matches_wide 全 k 对拍）。
+/// 迭代序差异不构成回归: 并行合并序本就非确定（inchworm 并行平局序
+/// 非确定, backlog 已立案）。
+///
+/// 路径选择（2026-09-05 内存战役重裁）: 刀2 曾按"32 线程单调用交错 A/B
+/// k49 240.5→303.6s 回退"裁定轮计数维持局部表+reduce——但该 A/B 的分片
+/// 侧带着未修的缓冲病（细粒度任务永不冲刷, 键流隐式全量缓存, 分配器
+/// 狂奔——见 [`COUNT_FLUSH_BYTES`] 注记）, 回退归因被污染。局部表形态
+/// 的峰值 = 线程数 × 0.4~0.7×D（QM4 k49 实测数十 GB, 内存战役不可接受）;
+/// 缓冲修复后的分片形态峰值 ≈ D×2 + 有界缓冲。重 A/B 见 opt-log。
 pub fn count_fasta_data_layered(data: &[u8], k: usize, ds: bool, per_thread_capacity: usize) -> CountMap {
     if k <= 32 {
-        widen_to_count_map(count_fasta_data_of::<u64>(
+        widen_to_count_map(count_fasta_data_of_sharded::<u64>(
             data,
             k,
             ds,
             per_thread_capacity,
         ))
     } else if k <= 64 {
-        widen_to_count_map(count_fasta_data_of::<u128>(
+        widen_to_count_map(count_fasta_data_of_sharded::<u128>(
             data,
             k,
             ds,
@@ -486,21 +531,30 @@ pub fn inject_trusted_kmers(counts: &mut CountMap, trusted_fasta: &[u8], k: usiz
 /// `TRM2` + 16B key（20B/条）; U256 扩容（2026-09-02）升 `TRM3` + 32B key。
 /// 键宽变化后旧文件静默错位解析的风险不可接受 → 每次魔数升版硬拒绝
 /// （"bad header" 报错）, 不做双格式读（counts_bin 是易失缓存, 重算即可）。
+///
+/// 流式写（8MB BufWriter）: QM4 级 ~2 亿键 × 36B ≈ 7GB——旧整表 Vec 物化
+/// 与计数表叠加成 15GB 瞬时（2026-09-05 内存战役）; 字节序与逐条顺序不变。
 pub fn save_counts_bin(
     path: &std::path::Path,
     counts: &CountMap,
     k: usize,
     ds: bool,
 ) -> Result<(), trinity_common::error::CommonError> {
-    let mut buf: Vec<u8> = Vec::new();
-    buf.extend_from_slice(b"TRM3");
-    buf.extend_from_slice(&(k as u32).to_le_bytes());
-    buf.push(ds as u8);
+    use std::io::Write;
+    let fh = std::fs::File::create(path)?;
+    let mut w = std::io::BufWriter::with_capacity(1 << 23, fh);
+    w.write_all(b"TRM3")?;
+    w.write_all(&(k as u32).to_le_bytes())?;
+    w.write_all(&[ds as u8])?;
+    let mut kb = [0u8; 32];
+    let mut cb = [0u8; 4];
     for (&key, &c) in counts.iter() {
-        buf.extend_from_slice(&key.to_le_bytes());
-        buf.extend_from_slice(&c.to_le_bytes());
+        kb.copy_from_slice(&key.to_le_bytes());
+        w.write_all(&kb)?;
+        cb.copy_from_slice(&c.to_le_bytes());
+        w.write_all(&cb)?;
     }
-    std::fs::write(path, buf)?;
+    w.flush()?;
     Ok(())
 }
 

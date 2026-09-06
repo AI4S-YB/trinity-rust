@@ -33,8 +33,10 @@ impl SyncKmerCounter {
     /// 单线程 KmerCounter（装载+剪枝完成态）整表转入——转移后原目录不可再写，
     /// 此结构即 PARALLEL 组装期目录的唯一定义点。
     ///
-    /// 迭代序：本结构从不迭代（种子列表在转入前已从 KmerCounter 快照），
-    /// 分片/桶布局只影响性能不影响语义。
+    /// 迭代序：种子快照走 [`SyncKmerCounter::nonzero_keys`]（DashMap 分片序，
+    /// 2026-09-06 刀M6 起转入先于种子收集执行——from_counter 整表重建的
+    /// 双表并存瞬时需避开亿级种子列表在场）, 分片/桶布局只影响性能与
+    /// 种子收集序（非确定源之一, 平局序 backlog 已立案）不影响键值语义。
     pub fn from_counter(counter: KmerCounter) -> Self {
         let (kmer_length, ds_mode, map) = counter.into_parts();
         let counter = DashMap::with_capacity_and_hasher(map.len(), FxBuildHasher);
@@ -46,6 +48,19 @@ impl SyncKmerCounter {
             ds_mode,
             counter,
         }
+    }
+
+    /// count > 0 的键快照（PARALLEL 种子列表, 刀M6）。只取键——count 主循环
+    /// 不参与（实时重查, IRKE.cpp:546）; `with_capacity` 精确预留免倍增
+    /// （末次翻倍 +11.7GB 瞬时, 见 collect_nonzero_seeds 注记）。
+    pub fn nonzero_keys(&self) -> Vec<KmerId> {
+        let mut out = Vec::with_capacity(self.counter.len());
+        self.counter.iter().for_each(|item| {
+            if *item.value() > 0 {
+                out.push(*item.key());
+            }
+        });
+        out
     }
 
     /// DS canonical（KC:369-372 find_kmer 前置折叠的镜像）
