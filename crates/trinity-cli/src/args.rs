@@ -131,6 +131,29 @@ pub struct TrinityArgs {
     /// 锚唯一性 + 端唯一化 + 并查集禁环防误连, 机制见 stitch 模块文档）。
     /// **默认关**; `--stitch` 开启。
     pub stitch: bool,
+    /// **Rust 版扩展**: 输出层严格家族拆分（Trinity.fasta/gene_trans_map 落盘
+    /// 后: 基因内纯序列证据区分旁系同源与 isoform——锚门控 + 多对角带状比对,
+    /// iso 边贪心合并 + para cannot-link, 每家族最长代表; 机制见 regroup 模块
+    /// 文档）。**默认关**; `--regroup` 开启。主产物不动, 另落同名侧车
+    /// `<name>.principal.fa` + `<name>.family_map`。
+    pub regroup: bool,
+    /// **Rust 版扩展**: `--regroup-cov`（iso 边双侧覆盖下限, 默认 0.7 = 原型
+    /// sp_d 档; 调低合并更激进、家族更少）。仅在 --regroup 下生效。
+    pub regroup_cov: f32,
+    /// **Rust 版扩展**: regroup 的 reads 支持度通道（分组规则不变, 代表改为
+    /// argmax(支持度[<3 视为无证据], 长度, id)——用原始 reads 的 k-mer 投票
+    /// 压"长但无人读"的脏延伸, 机制见 regroup 模块文档）。**默认关**;
+    /// `--regroup-reads` 开启, 隐含 --regroup。reads 取管线输入
+    /// （--left/--right/--single 原始文件, fq/fa/gz 均可）。
+    pub regroup_reads: bool,
+    /// **Rust 版扩展**: `--principal-min-len N`（转正默认 500; 0 = 关）——
+    /// principal 输出截断, 代表长度 < N 的家族不落 principal.fa（family_map
+    /// 照旧全量, 分组与代表选择不变）。仅在 --regroup 下生效。
+    pub regroup_principal_min_len: usize,
+    /// **Rust 版扩展**: `--principal-min-supp M`（转正默认 10; 0 = 关）——
+    /// principal 输出截断, 代表 read 票数 < M 的家族不落 principal.fa。票数
+    /// 与代表选择同源（一 read 一票, 无 mapq 语义）; >0 隐含 --regroup-reads。
+    pub regroup_principal_min_supp: u64,
     /// **Rust 版扩展**: rnaSPAdes 式多 k 迭代的生效值（`--multi-k auto|k1,...` /
     /// `--no-multi-k` 经 [`resolve_multi_k`] 解析后的结果）。None = 单 k classic
     /// （k = --KMER_SIZE）; 缺省（无任何相关 flag）= Some(Auto)（2026-08-30 转正）。
@@ -367,6 +390,36 @@ pub fn parse_args(argv: &[String]) -> Result<TrinityArgs, CliError> {
     let gtasm_frag_merge = cli.bool_flag("--gtasm-frag-merge");
     // --stitch（Rust 版扩展, 默认关）: 输出层 split-read 缝合
     let stitch = cli.bool_flag("--stitch");
+    // --regroup（Rust 版扩展, 默认关）: 输出层严格家族拆分
+    let regroup_flag = cli.bool_flag("--regroup");
+    // --regroup-cov（iso 边双侧覆盖下限; 默认 0.7）
+    let regroup_cov = cli.float_flag("--regroup-cov", 0.7f32)?;
+    // --regroup-reads（Rust 版扩展, 默认关）: regroup 的 reads 支持度通道,
+    // 隐含开启 --regroup（分组照旧, 只改代表选择）
+    let mut regroup_reads = cli.bool_flag("--regroup-reads");
+    // --principal-min-len / --principal-min-supp（Rust 版扩展; 转正默认 500/10）:
+    // principal 输出层截断（见 regroup 模块文档）。min-supp 需要票数, 在用户
+    // 已 opt-in regroup（--regroup / --regroup-reads / 显式 min-supp 任一）时
+    // 隐含 --regroup-reads（沿其隐含 --regroup 先例）——无 reads 时 supp=0 会
+    // 剔空; 全关时不动, regroup 保持整体零副作用。转正依据（opt-log「principal
+    // 截断旗标落地」）: len500+supp10 组合保留 44,522（vs 106,065 全量）,
+    // P/F1 净升; 显式传 0/0 可关回旧行为
+    let regroup_principal_min_len = cli.uint_flag("--principal-min-len", 500usize)?;
+    let regroup_principal_min_supp = cli.uint_flag("--principal-min-supp", 10u64)?;
+    let regroup_opted =
+        regroup_flag || regroup_reads || cli.was_given("--principal-min-supp");
+    if regroup_opted && regroup_principal_min_supp > 0 && !regroup_reads {
+        if cli.was_given("--principal-min-supp") {
+            eprintln!("NOTE: --principal-min-supp 隐含开启 --regroup-reads（票数来自 reads 通道）");
+        }
+        regroup_reads = true;
+    }
+    let regroup = if regroup_reads && !regroup_flag {
+        eprintln!("NOTE: --regroup-reads 隐含开启 --regroup（分组规则不变, 代表改为支持度优先）");
+        true
+    } else {
+        regroup_flag
+    };
     // --multi-k auto | k1,k2,...（Rust 版扩展, rnaSPAdes 式多 k 迭代; 显式值）
     let multi_k_explicit = match cli.value_flag("--multi-k")?.as_deref() {
         None => None,
@@ -527,6 +580,21 @@ pub fn parse_args(argv: &[String]) -> Result<TrinityArgs, CliError> {
     } else {
         gap_close_spades
     };
+    // regroup 的 cov 旋钮仅在 --regroup 下生效（沿 --gt-weights 先例只警告）;
+    // 开启时值域钳制 0..=1（覆盖比例）。
+    if !regroup && cli.was_given("--regroup-cov") {
+        eprintln!("WARNING: --regroup-cov 仅在 --regroup 下生效, 忽略");
+    }
+    // principal 截断门同理: 仅在 --regroup 下生效（min-supp 已隐含 regroup,
+    // 真正能走到这里的只剩 min-len 显式给出且未开 --regroup 的情形）
+    if !regroup && cli.was_given("--principal-min-len") {
+        eprintln!("WARNING: --principal-min-len 仅在 --regroup 下生效, 忽略");
+    }
+    if regroup && !(0.0..=1.0).contains(&regroup_cov) {
+        return Err(CliError::usage(format!(
+            "invalid --regroup-cov value: {regroup_cov} (must be 0..=1)"
+        )));
+    }
 
     Ok(TrinityArgs {
         seq_type,
@@ -558,6 +626,11 @@ pub fn parse_args(argv: &[String]) -> Result<TrinityArgs, CliError> {
         bfly_empty_retry,
         gtasm_frag_merge,
         stitch,
+        regroup,
+        regroup_cov,
+        regroup_reads,
+        regroup_principal_min_len,
+        regroup_principal_min_supp,
         multi_k,
         graph_clean_rnaspades,
         rtt_multi_kmer,
@@ -616,6 +689,74 @@ mod tests {
         assert_eq!(a.weld_min_glue, 1);
         let a = parse_args(&argv(&["--weld-min-glue", "2"])).unwrap();
         assert_eq!(a.weld_min_glue, 2);
+    }
+
+    #[test]
+    fn regroup_flags_default_off_and_parse() {
+        // 默认关 + cov 0.7; 截断门转正默认 500/10（门仅在 --regroup 下生效）
+        let a = parse_args(&argv(&[])).unwrap();
+        assert!(!a.regroup);
+        assert!(!a.regroup_reads);
+        assert!((a.regroup_cov - 0.7).abs() < 1e-6);
+        assert_eq!(a.regroup_principal_min_len, 500);
+        assert_eq!(a.regroup_principal_min_supp, 10);
+        // 开启 + 显式 cov
+        let a = parse_args(&argv(&["--regroup", "--regroup-cov", "0.5"])).unwrap();
+        assert!(a.regroup);
+        assert!((a.regroup_cov - 0.5).abs() < 1e-6);
+        // --regroup-reads 隐含开启 regroup
+        let a = parse_args(&argv(&["--regroup-reads"])).unwrap();
+        assert!(a.regroup);
+        assert!(a.regroup_reads);
+        // 值域外 → usage 报错
+        assert!(parse_args(&argv(&["--regroup", "--regroup-cov", "1.5"])).is_err());
+    }
+
+    #[test]
+    fn principal_gates_parse_and_implications() {
+        // --regroup 下显式解析
+        let a = parse_args(&argv(&[
+            "--regroup",
+            "--principal-min-len",
+            "300",
+            "--principal-min-supp",
+            "5",
+        ]))
+        .unwrap();
+        assert_eq!(a.regroup_principal_min_len, 300);
+        assert_eq!(a.regroup_principal_min_supp, 5);
+        assert!(a.regroup_reads, "min-supp>0 一律隐含 reads 通道（票数来源）");
+        // 转正默认: 默认 supp 10 > 0 → 裸 --regroup 也隐含 reads 通道
+        let a = parse_args(&argv(&["--regroup"])).unwrap();
+        assert!(a.regroup);
+        assert!(a.regroup_reads, "默认 supp=10 隐含 --regroup-reads");
+        assert_eq!(a.regroup_principal_min_len, 500);
+        assert_eq!(a.regroup_principal_min_supp, 10);
+        // --principal-min-supp 单独给出 → 隐含 --regroup-reads → 隐含 --regroup
+        let a = parse_args(&argv(&["--principal-min-supp", "3"])).unwrap();
+        assert!(a.regroup);
+        assert!(a.regroup_reads);
+        assert_eq!(a.regroup_principal_min_supp, 3);
+        // opt-out: 显式 0/0 关回旧行为（裸分组 + 最长代表, 不扫 reads）
+        let a = parse_args(&argv(&[
+            "--regroup",
+            "--principal-min-len",
+            "0",
+            "--principal-min-supp",
+            "0",
+        ]))
+        .unwrap();
+        assert!(a.regroup);
+        assert!(!a.regroup_reads, "supp=0 不隐含 reads");
+        assert_eq!(a.regroup_principal_min_len, 0);
+        assert_eq!(a.regroup_principal_min_supp, 0);
+        // --regroup 关时 min-len 只警告不报错（沿 --regroup-cov 先例）
+        let a = parse_args(&argv(&["--principal-min-len", "300"])).unwrap();
+        assert!(!a.regroup);
+        assert_eq!(a.regroup_principal_min_len, 300);
+        // 非法值 → usage 报错
+        assert!(parse_args(&argv(&["--regroup", "--principal-min-len", "abc"])).is_err());
+        assert!(parse_args(&argv(&["--regroup", "--principal-min-supp", "-1"])).is_err());
     }
 
     #[test]

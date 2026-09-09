@@ -30,6 +30,7 @@ use crate::checkpoint::{checkpoint_exists, run_with_checkpoint};
 use crate::harvest::harvest;
 use crate::prep::prep_reads;
 use crate::recursive::{harvest_mini, run_partition_pool};
+use crate::regroup::maybe_regroup;
 
 /// 原版 L2556 `SR_flag`（super_read_mode 关闭时为 "asm"）。
 const SR_FLAG: &str = "asm";
@@ -812,6 +813,9 @@ pub fn run_trinity(args: &TrinityArgs) -> Result<PathBuf, CommonError> {
             final_fa.file_name().unwrap_or_default().to_string_lossy()
         )),
     )?;
+    // ---- 7.6 输出层严格家族拆分（Rust 版扩展, --regroup 开启; 旗标关时
+    // 零副作用, 默认路径逐字节不变）----
+    maybe_regroup(&final_fa, args, &round_dir)?;
 
     // ---- 8. 收尾清理（原版 unlink both.fa/left.fa/right.fa 与 jellyfish
     // 中间物; `--no_cleanup` 保留全部）。保守集合: 只删明确知道的中间物,
@@ -1192,6 +1196,8 @@ fn run_recursive(
             final_fa.file_name().unwrap_or_default().to_string_lossy()
         )),
     )?;
+    // 输出层严格家族拆分（Rust 版扩展, --regroup 开启; 与 classic 尾段同一接线）
+    maybe_regroup(&final_fa, args, workdir)?;
 
     // 收尾清理与 classic 相同集合（mini.fa 与 chrysalis 产物保留——断点依赖）。
     if !args.no_cleanup {
@@ -1234,7 +1240,8 @@ pub(crate) fn write_gene_trans_map(fasta: &Path, map_path: &Path) -> Result<(), 
 }
 
 /// 正则 `^(.*c\d+_g\d+)(_i\d+)`（贪婪 gene 前缀; trans = 整体匹配）的手工展开。
-fn split_gene_trans(acc: &str) -> Option<(String, String)> {
+/// regroup 模块复用（基因分组主规则）。
+pub(crate) fn split_gene_trans(acc: &str) -> Option<(String, String)> {
     let b = acc.as_bytes();
     // 边界 i 从大到小（`.*` 贪婪）: acc[i..] = "_i<digits>"（≥1 位, 尽量长）,
     // acc[..i] 以 `c<digits>_g<digits>` 结尾。
