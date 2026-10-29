@@ -68,6 +68,21 @@ Five crates plus an orchestrating CLI; the data flow mirrors the upstream pipeli
                        seqtk read renaming, etc.
 ```
 
+## Multi-k iterative assembly (default since v0.5.0)
+
+Upstream Trinity builds the graph with a single k-mer (k=25): k-mers of low-coverage transcripts fall below pruning thresholds and are lost, while high-coverage regions suffer from excessive branching. This port adopts the rnaSPAdes multi-k strategy: `--multi-k auto` picks the k sequence from the read length (`lower=int(RL/3)`, `upper=int(RL/2)-1`, rounded down to odd, clamped to the supported domain k≤63), runs the lower-k rounds first (graph building only, no transcript output), and injects all k-mers of their inchworm contigs into the next round's count table in presence-only form (count=1, leaving depth-pruning semantics untouched). `--no-multi-k` restores the upstream single-k behavior; an explicit `--multi-k 29,49,63` overrides the sequence (2–3 values recommended).
+
+Companion change: k-mer keys widened from u64 to u128 (`KmerId`), supporting k≤63 (was 32); the counts_bin cache format is versioned as TRM2 (old TRMC files are rejected and recomputed — do not reuse workdirs across versions).
+
+Measured recall gains (R_full = fraction of reference transcripts assembled at ≥95% coverage and ≥95% identity; see `docs/opt-log.md`):
+
+| Data | single k=25 | two-k | three-k |
+|---|---|---|---|
+| Arabidopsis simulated (76bp, cross-validated on multiple datasets) | baseline | +1.3~2.0pp, P −0.1~−2.2pp | — |
+| Real RNA-seq (150bp, 21.35M PE pairs, ~436Mb-genome species) | 31.5% | **43.9%** ([49,63], +12.4pp) | **45.3%** ([29,49,63], another +1.4pp) |
+
+Longer reads and more complex transcriptomes benefit more; on 150bp real data the recall gain is +44% relative.
+
 ## Differences from upstream (established list)
 
 **Not ported (explicitly unsupported)**: salmon abundance estimation, bowtie (`--no_bowtie` semantics always hold), jaccard-clip read clustering, long reads (`--long_read`), DNA mode (DNA assembly outside `--genome_guided`). These entry points either error out directly or are ignored with a warning.
@@ -75,6 +90,10 @@ Five crates plus an orchestrating CLI; the data flow mirrors the upstream pipeli
 **Option aliases**: `__KMER_SIZE` → `--KMER_SIZE`, `--min_kmer_cov` → `--min_kmer_count` (both spellings accepted, compatible with the upstream main program).
 
 **Extension**: `--bfly_stack_mb` explicitly controls the Butterfly worker thread stack limit (upstream derives this implicitly from the JVM `-Xss` setting). `--multi-k` (rnaSPAdes-style multi-k iteration + trusted contig injection) **is the default since 2026-08-30** (absent any flag it resolves to `auto`); `--no-multi-k` falls back to classic single-k. Special case: with `--path-engine gtasm` and no explicit `--multi-k`, the run is forced to single-k with a warning (gtasm has only been validated on k=25 graphs; an explicit `--multi-k` overrides, also with a warning). The pipeline logs the effective k sequence at startup (`multi-k: auto → [29, 37]` / `single-k: 25`).
+
+**Intermediate layout (performance, accepted difference)**: `chrysalis/Component_bins/Cbin*/` no longer holds per-component `cN.graph.out` / `cN.graph.reads` / `cN.graph.allProbPaths.fasta` files (28k components ≈ 85k small files — prohibitive metadata round-trips on NFS). Instead each Cbin has two packed stores: `graphs.pack`/`graphs.idx` (QuantifyGraph output) and `butterfly.pack`/`butterfly.idx` (Butterfly output); the `.idx` is a fixed-size 32-byte record stream (component id / kind / offset / len, little-endian). The normalization `left.norm.*` convenience names are hard links to the long-named files (upstream uses symlinks) instead of physical duplicate writes.
+
+**Normalization output format (fq input)**: fq input now yields normalized **fa** directly (`left.norm.fa` / `{name}.normalized_K….fa`), skipping the full materialization of `norm.fq` and the downstream fq→fa pass — normalization already converts fq→fa internally, so selected records are extracted from the in-memory fa, byte-identical to "write fq then convert" (locked by tests). Upstream leaves the normalized fq for the user; this port **no longer keeps norm.fq by default** — use `--no_cleanup` if you need it (both fq and fa are then written).
 
 **Intermediate layout (performance, accepted difference)**: `chrysalis/Component_bins/Cbin*/` no longer holds per-component `cN.graph.out` / `cN.graph.reads` / `cN.graph.allProbPaths.fasta` files (28k components ≈ 85k small files — prohibitive metadata round-trips on NFS). Instead each Cbin has two packed stores: `graphs.pack`/`graphs.idx` (QuantifyGraph output) and `butterfly.pack`/`butterfly.idx` (Butterfly output); the `.idx` is a fixed-size 32-byte record stream (component id / kind / offset / len, little-endian). The normalization `left.norm.*` convenience names are hard links to the long-named files (upstream uses symlinks) instead of physical duplicate writes.
 

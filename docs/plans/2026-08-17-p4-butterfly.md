@@ -10,8 +10,6 @@
 > 丢弃之，黄金序列全覆盖（PASS-WARN）；c0/em 仅 header/输出顺序差（Java HashMap
 > 迭代序）。基准（docs/benchmarks.md）：c0 ~40×/RSS 1/27、c1/c2 ~2.5×/RSS 持平。
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]` syntax for tracking.
-
 **Goal:** 实现 trinity-butterfly crate：TransAssembly_allProbPaths（15,920 行 Java 上帝类）+ 内嵌 jaligner 的完整移植，按 9 层依赖链推进；每层用原版 jar 的 8 个 DOT 检查点与组件级 allProbPaths 输出对拍，最终在 fixtures/p3 的 Chrysalis 产物上端到端复现 Butterfly 的转录本输出。
 
 **Architecture:** 镜像式移植。图结构自研有向图（JUNG DirectedSparseGraph 语义：禁平行边、O(1) findEdge）；全部静态全局收进 `BflyContext`；f32 打分贯穿比对器；read 穿线递归保留（组件线程大栈）。Oracle：原版 Butterfly.jar（DOT 检查点 + 样本组件 allProbPaths）+ 小 Java driver 直调 jar 内 jaligner 类产黄金向量。
