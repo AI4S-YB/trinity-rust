@@ -15,6 +15,19 @@ target/release/trinity-cli \
 #        + out.Trinity.principal.fa + out.Trinity.family_map（去冗余交付链, 默认开）
 ```
 
+### 默认产物说明（组装 + 去冗余一条链，v0.7.0 起）
+
+**注意：默认流程产出的交付结果就是去过冗余的。** 一次运行在 `--output` 旁产出四个文件：
+
+| 文件 | 内容 | 什么时候用 |
+|---|---|---|
+| `out.Trinity.principal.fa` | **去冗余交付集（默认推荐）**：严格家族拆分后每家族一条代表转录本（reads 支持度选代表 + 代表长 ≥500 且 read 票数 ≥10 截断） | 基因集统计、BUSCO、功能注释、提交入库等"每基因一条"口径 |
+| `out.Trinity.fasta` | 全量转录本（全部 isoform/旁系候选，未去冗余） | 定量、差异表达等需要完整 isoform 集合的下游 |
+| `out.Trinity.family_map` | 全量转录本 → 家族（rgXXXXXX）映射 | 从交付集代表回溯其家族全部成员 |
+| `out.Trinity.fasta.gene_trans_map` | Trinity 组件 → 转录本映射（与原版同名同义） | 原版下游工具兼容 |
+
+只想要经典行为（纯组装、不去冗余）：加 `--no-regroup`，只产出 `Trinity.fasta` + `gene_trans_map` 两个文件，与 v0.6.0 及以前一致。
+
 常用参数（与原版 `Trinity` 同名）：
 
 | 参数 | 说明 |
@@ -61,6 +74,9 @@ target/release/trinity-cli \
    trinity-butterfly   每组件图搜索 + EM + 路径输出（allProbPaths）
                                     |
    harvest             <out>.Trinity.fasta + gene_trans_map
+                                    |
+   regroup（默认开）    去冗余交付链 → principal.fa + family_map
+                       （--no-regroup 关闭, 见「默认产物说明」）
                                     |
    trinity-common      2-bit k-mer 编码 / FASTA·FASTQ 读 / sdbm seq_hash /
                        drand48 / seqtk 读名改写 等底层原语

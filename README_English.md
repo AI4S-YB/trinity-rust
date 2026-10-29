@@ -15,6 +15,19 @@ target/release/trinity-cli \
 #        + out.Trinity.principal.fa + out.Trinity.family_map (de-redundancy delivery chain, on by default)
 ```
 
+### Default outputs (assembly + de-redundancy in one pass, since v0.7.0)
+
+**Note: by default the delivered result IS de-redundant.** A single run writes four files next to `--output`:
+
+| File | Content | Use it for |
+|---|---|---|
+| `out.Trinity.principal.fa` | **De-redundancy delivery set (recommended default)**: one representative transcript per family (strict family splitting + read-support representative + truncation at representative length ≥500 and ≥10 read votes) | Gene-set counts, BUSCO, functional annotation, database submission — any "one per gene" usage |
+| `out.Trinity.fasta` | Full transcript set (all isoform/paralog candidates, not de-redundant) | Quantification, differential expression, anything needing the complete isoform set |
+| `out.Trinity.family_map` | Every transcript → family (rgXXXXXX) mapping | Tracing a delivery representative back to all members of its family |
+| `out.Trinity.fasta.gene_trans_map` | Trinity component → transcript map (same as upstream) | Compatibility with upstream downstream tools |
+
+Classic behavior (pure assembly, no de-redundancy): pass `--no-regroup`; only `Trinity.fasta` + `gene_trans_map` are produced, identical to v0.6.0 and earlier.
+
 Common options (same names as the upstream `Trinity` script):
 
 | Option | Description |
@@ -63,6 +76,10 @@ Five crates plus an orchestrating CLI; the data flow mirrors the upstream pipeli
                                     |
    harvest             <out>.Trinity.fasta + gene_trans_map
                                     |
+   regroup (on by default)  de-redundancy delivery chain
+                       → principal.fa + family_map
+                       (disable with --no-regroup; see "Default outputs")
+                                    |
    trinity-common      low-level primitives: 2-bit k-mer encoding /
                        FASTA·FASTQ reading / sdbm seq_hash / drand48 /
                        seqtk read renaming, etc.
@@ -89,11 +106,7 @@ Longer reads and more complex transcriptomes benefit more; on 150bp real data th
 
 **Option aliases**: `__KMER_SIZE` → `--KMER_SIZE`, `--min_kmer_cov` → `--min_kmer_count` (both spellings accepted, compatible with the upstream main program).
 
-**Extension**: `--bfly_stack_mb` explicitly controls the Butterfly worker thread stack limit (upstream derives this implicitly from the JVM `-Xss` setting). `--multi-k` (rnaSPAdes-style multi-k iteration + trusted contig injection) **is the default since 2026-08-30** (absent any flag it resolves to `auto`); `--no-multi-k` falls back to classic single-k. Special case: with `--path-engine gtasm` and no explicit `--multi-k`, the run is forced to single-k with a warning (gtasm has only been validated on k=25 graphs; an explicit `--multi-k` overrides, also with a warning). The pipeline logs the effective k sequence at startup (`multi-k: auto → [29, 37]` / `single-k: 25`).
-
-**Intermediate layout (performance, accepted difference)**: `chrysalis/Component_bins/Cbin*/` no longer holds per-component `cN.graph.out` / `cN.graph.reads` / `cN.graph.allProbPaths.fasta` files (28k components ≈ 85k small files — prohibitive metadata round-trips on NFS). Instead each Cbin has two packed stores: `graphs.pack`/`graphs.idx` (QuantifyGraph output) and `butterfly.pack`/`butterfly.idx` (Butterfly output); the `.idx` is a fixed-size 32-byte record stream (component id / kind / offset / len, little-endian). The normalization `left.norm.*` convenience names are hard links to the long-named files (upstream uses symlinks) instead of physical duplicate writes.
-
-**Normalization output format (fq input)**: fq input now yields normalized **fa** directly (`left.norm.fa` / `{name}.normalized_K….fa`), skipping the full materialization of `norm.fq` and the downstream fq→fa pass — normalization already converts fq→fa internally, so selected records are extracted from the in-memory fa, byte-identical to "write fq then convert" (locked by tests). Upstream leaves the normalized fq for the user; this port **no longer keeps norm.fq by default** — use `--no_cleanup` if you need it (both fq and fa are then written).
+**Extension**: `--bfly_stack_mb` explicitly controls the Butterfly worker thread stack limit (upstream derives this implicitly from the JVM `-Xss` setting). The output-layer de-redundancy delivery chain (regroup: strict family splitting + read-support representative + principal truncation) **is on by default since v0.7.0** — see "Default outputs" above; `--no-regroup` turns it off with zero side effects. `--multi-k` (rnaSPAdes-style multi-k iteration + trusted contig injection) **is the default since 2026-08-30** (absent any flag it resolves to `auto`); `--no-multi-k` falls back to classic single-k. Special case: with `--path-engine gtasm` and no explicit `--multi-k`, the run is forced to single-k with a warning (gtasm has only been validated on k=25 graphs; an explicit `--multi-k` overrides, also with a warning). The pipeline logs the effective k sequence at startup (`multi-k: auto → [29, 37]` / `single-k: 25`).
 
 **Intermediate layout (performance, accepted difference)**: `chrysalis/Component_bins/Cbin*/` no longer holds per-component `cN.graph.out` / `cN.graph.reads` / `cN.graph.allProbPaths.fasta` files (28k components ≈ 85k small files — prohibitive metadata round-trips on NFS). Instead each Cbin has two packed stores: `graphs.pack`/`graphs.idx` (QuantifyGraph output) and `butterfly.pack`/`butterfly.idx` (Butterfly output); the `.idx` is a fixed-size 32-byte record stream (component id / kind / offset / len, little-endian). The normalization `left.norm.*` convenience names are hard links to the long-named files (upstream uses symlinks) instead of physical duplicate writes.
 
