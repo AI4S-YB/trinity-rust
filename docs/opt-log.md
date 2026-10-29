@@ -3457,3 +3457,12 @@ reads/opt-out 0-0/裸 argv 全关）。
 - **转正档几乎无损**: 106k→44,522 只再花 C −0.8pp（S 持平 72.4, F 反降）,
   再次确认截掉的短货不含完整基因——与画像战役"ST 盲区真内容 ≤1%"互证。
 - 剩余 D 8.8 = 真旁系同源（BUSCO 家族内多拷贝）, 正是严格拆分要保的货。
+
+## regroup 转正为管线默认（2026-10-29, 打包裁定）
+
+承接 09-09 转正档（len500+supp10 默认门 + BUSCO 对照 C 81.3 近乎无损）, 把去冗余交付链从 opt-in 抬为**默认开**——默认流程 = 组装 + 去冗余一条链交付:
+
+- **行为**: 裸 argv = 严格家族拆分 + reads 支持度代表 + len500/supp10 截断（产物 `*.Trinity.principal.fa` + `*.Trinity.family_map` 侧车, 主 fasta/gene_trans_map 不动）。`--regroup`/`--regroup-reads` 保留为幂等兼容; `--no-regroup` 整链回退（零副作用, 沿 --no-rtt-multi-kmer 先例）; `--principal-min-len 0 --principal-min-supp 0` 只关截断门。
+- **互斥（防歧义, 沿 --no-multi-k × --multi-k 先例）**: --no-regroup 与 --regroup/--regroup-reads/显式 supp>0 同给 → usage 报错; 显式 supp=0 不算开启, 不冲突。
+- **实现**: 仅 args.rs 解析层改默认值与蕴含链（regroup = !no_regroup; regroup∧supp>0 ⇒ reads）, regroup.rs 机制与 RegroupParams 原语 0/0 不动; 版本号 0.3.0 → 0.4.0。
+- **测试**: args 两个 regroup 测试改写为默认开语义（裸 argv 全链、--no-regroup 回退、幂等兼容、互斥报错、显式 0 不冲突）, trinity-cli 78 测全绿。

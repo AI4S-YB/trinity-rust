@@ -12,6 +12,7 @@ target/release/trinity-cli \
   --seqType fq --left reads.left.fq.gz --right reads.right.fq.gz \
   --CPU 8 --max_memory 2G --output out
 # outputs: out.Trinity.fasta + out.Trinity.fasta.gene_trans_map
+#        + out.Trinity.principal.fa + out.Trinity.family_map (de-redundancy delivery chain, on by default)
 ```
 
 Common options (same names as the upstream `Trinity` script):
@@ -29,6 +30,7 @@ Common options (same names as the upstream `Trinity` script):
 | `--normalize_max_read_cov` / `--no_normalize_reads` | Normalization cap / skip normalization |
 | `--bfly_stack_mb` | Butterfly thread stack (extension of this port; defaults to match upstream JVM stack behavior) |
 | `--no_cleanup` | Keep intermediate files (both.fa / left.fa / right.fa, normalized norm.fq, etc.; located in the scratch directory) |
+| `--no-regroup` (extension) | Disable the output-layer de-redundancy delivery chain (**on by default**: strict family splitting + read-support representative + principal truncation len≥500/supp≥10, writing `*.principal.fa`/`*.family_map` sidecars; the main fasta is untouched). Tune with `--principal-min-len/--principal-min-supp`; explicit 0/0 disables the gates |
 | `--scratch <dir>` | Write intermediates to `<scratch>/<output dir name>/` (no space check when given explicitly) |
 
 Resume: each stage writes an `.ok` checkpoint file; rerunning with the same `--output` skips completed stages automatically.

@@ -12,6 +12,7 @@ target/release/trinity-cli \
   --seqType fq --left reads.left.fq.gz --right reads.right.fq.gz \
   --CPU 8 --max_memory 2G --output out
 # 产出: out.Trinity.fasta + out.Trinity.fasta.gene_trans_map
+#        + out.Trinity.principal.fa + out.Trinity.family_map（去冗余交付链, 默认开）
 ```
 
 常用参数（与原版 `Trinity` 同名）：
@@ -32,6 +33,7 @@ target/release/trinity-cli \
 | `--gt-weights <path>`（扩展） | gtasm 引擎的 GTW1 模型权重（`--path-engine gtasm` 时必填） |
 | `--no-gtasm-visited-walk`（扩展） | 关闭 gtasm 解码的 visited 穿越（默认开：walk 可穿越已 visited 节点救回共享外显子的弱势 isoform，完全重复产出自动丢弃）；给此旗标回退 python 原型语义 |
 | `--no_cleanup` | 保留中间产物（both.fa / left.fa / right.fa、归一化 norm.fq 等；位置在 scratch 目录） |
+| `--no-regroup`（扩展） | 关闭输出层去冗余交付链（**默认开**：严格家族拆分 + reads 支持度代表 + principal 截断 len≥500/supp≥10，落 `*.principal.fa`/`*.family_map` 侧车，主 fasta 不动；`--principal-min-len/--principal-min-supp` 调档，显式 0/0 关截断门） |
 | `--scratch <dir>` | 中间产物写到 `<scratch>/<output 目录名>/`（显式指定时不做空间检查） |
 
 断点续跑：各阶段 `.ok` checkpoint 文件，重跑同 `--output` 自动跳过已完成阶段。
@@ -71,6 +73,8 @@ target/release/trinity-cli \
 **参数别名**：`__KMER_SIZE` → `--KMER_SIZE`、`--min_kmer_cov` → `--min_kmer_count`（两个名字都收，与原版主程序名兼容）。
 
 **扩展**：`--bfly_stack_mb` 显式控制 butterfly 工作线程栈上限（原版由 JVM `-Xss` 隐式决定）。`--path-engine gtasm` + `--gt-weights` 启用 GT 打分解图引擎（python GTasm 原型产品化；chrysalis 之后多一个原始 reads 边支持 pass，产物 `gtasm_edge_support.bin` 随 scratch 落盘并受 `.gtasm_support.ok` checkpoint 保护；gtasm 与 `--recursive` 互斥）。`--multi-k auto|k1,k2,...` 启用 rnaSPAdes 式多 k 迭代 + trusted contig 注入（中间轮 `iter_k<k>/` 只构图、最终轮完整管线，三数据集交叉验证为净增益）——**自 2026-08-30 起为默认行为（缺省 = `auto`）**；`--no-multi-k` 回退 classic 单 k；单独 `--KMER_SIZE` = 隐式单 k + 提示警告；显式 `--multi-k` 与 `--KMER_SIZE`/`--no-multi-k`/`--recursive` 互斥。**gtasm 特例**：`--path-engine gtasm` 未显式给 `--multi-k` 时强制单 k 并警告（gtasm 只在 k=25 图上验证过），显式给则放行并警告组合未验证；`--path-engine rnaspades` 为 rnaSPAdes MultiExtender 规则复刻引擎（高精度低召回，默认多 k 下可正常组合）。管线启动时打印生效 k 序列（`multi-k: auto → [29, 37]` / `single-k: 25`）便于确认模式。
+
+**输出层去冗余交付链（regroup，2026-10-29 起默认开）**：Trinity.fasta 落盘后做基因内严格家族拆分（纯序列证据区分旁系同源/isoform：锚门控 + 多对角带状比对，iso 边贪心合并 + para 边 cannot-link，split-only 不跨基因并），reads 支持度选代表（原始 reads k-mer 投票压"长但无人读"的脏延伸），principal 截断（默认代表长 ≥500 且票数 ≥10）——`<out>.Trinity.principal.fa`（每家族一条代表）+ `<out>.Trinity.family_map`（全量转录本→家族映射）随主产物落盘，主 fasta 与 gene_trans_map 不动。QM4 BUSCO 对照：全集 D 41.0→9.5、转正档 44,522 条 C 81.3 近乎无损（详见 docs/opt-log.md 末节）。`--no-regroup` 整体回退（零副作用）；`--principal-min-len 0 --principal-min-supp 0` 只关截断门（分组+代表照旧）；`--regroup-cov` 调拆分阈值。
 
 **中间产物布局（性能优化，既定差异）**：`chrysalis/Component_bins/Cbin*/` 下不再逐组件写 `cN.graph.out` / `cN.graph.reads` / `cN.graph.allProbPaths.fasta` 小文件（2.8 万组件 ≈ 8.5 万个文件，NFS 上元数据往返极贵），改为每个 Cbin 两个打包文件 `graphs.pack`/`graphs.idx`（QuantifyGraph 产物）与 `butterfly.pack`/`butterfly.idx`（Butterfly 产物）；`.idx` 为定长 32B 记录（component id / kind / offset / len，小端）。归一化的 `left.norm.*` 便捷名是长名文件的硬链接（原版为符号链接），不再物理双写。
 
